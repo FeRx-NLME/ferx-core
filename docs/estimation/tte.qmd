@@ -702,6 +702,11 @@ time) restarts the hazard clock at each event (`Σ_k log h(Δ_k) − Σ_k H(Δ_k
 inter-event gaps). For a time-homogeneous hazard the two coincide. See
 [Repeated events](../model-file/event-model.qmd#rtte) for the DSL details.
 
+A drug-driven [ODE-accumulated hazard](#joint-pk-tte) (`hazard = H0 * exp(BETA * (central / V))`,
+joint PK-RTTE) fits under `clock = forward`: each gap scores `H(tₖ) − H(tₖ₋₁)` off the one
+integrated cumulative hazard ([#3152](https://github.com/FeRx-NLME/ferx-core/issues/3152)).
+Under `clock = reset` it is rejected.
+
 Both clocks accept **left truncation** (a `TENTRY` column; see [above](#left-truncation-delayed-entry)).
 Under `clock = forward` the cumulative hazard integrates from `H(TENTRY)`. Under
 `clock = reset` the *first* sojourn is measured from the time origin and conditioned on
@@ -756,8 +761,8 @@ in `tests/reference/rtte_exponential/expected.md`.
 ### Simulating repeated events
 
 `simulate()` draws a **recurrent event stream** per subject up to the administrative
-`[simulation] horizon` (analytic hazard families; RTTE with a drug-driven ODE hazard is
-a later slice). Under `clock = forward` each next event is drawn *conditional on
+`[simulation] horizon` (analytic hazard families; a drug-driven ODE hazard, which fits under
+`clock = forward`, is refused with `E_TTE_NOT_SIMULATABLE`). Under `clock = forward` each next event is drawn *conditional on
 survival past the previous one* — the closed-form inverse of `H(t) − H(t_{k−1}) = −log u`
 — so a time-varying hazard keeps accumulating across the window; under `clock = reset`
 each inter-event gap is a fresh draw from zero. Every subject emits its events (`DV = 1`)

@@ -146,8 +146,9 @@ Notes:
   are rejected at the fit boundary (the clock-forward likelihood telescopes the
   cumulative hazard across a subject's records).
 - `clock` is only valid with `type = rtte`.
-- A **drug-driven ODE hazard** (`hazard =`) with `type = rtte` is a later slice and is
-  rejected for now — use an analytic `family` for repeated events.
+- A **drug-driven ODE hazard** (`hazard =`) with `type = rtte` fits under `clock = forward`
+  (#3152). Under `clock = reset` it is rejected, and `simulate()` refuses it under either
+  clock (`E_TTE_NOT_SIMULATABLE`); use an analytic `family` for those.
 - Left truncation (`TENTRY`) applies to the subject's first record.
 - **`simulate()` draws a recurrent stream** per subject to the administrative
   `[simulation] horizon` (both clocks; analytic families). See

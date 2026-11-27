@@ -140,13 +140,22 @@ fn tte_ode_curves(
 fn tte_ode_nll_from_curves(
     records: &[ObsRecord], times: &[f64], cum: &[f64], haz: &[f64], tol: crate::survival::MonoTol,
 ) -> f64 {
-    tte_ode_nll_from_curves_visit(records, times, cum, haz, tol, &mut |_| {})
+    tte_ode_nll_from_curves_visit(
+        records,
+        crate::types::TteRecurrence::Single,
+        times,
+        cum,
+        haz,
+        tol,
+        &mut |_| {},
+    )
 }
 
 /// `tte_ode_nll_from_curves` handing each scored record's term to `visit` (#901).
 #[cfg(feature = "survival")]
 fn tte_ode_nll_from_curves_visit(
-    records: &[ObsRecord], times: &[f64], cum: &[f64], haz: &[f64], tol: crate::survival::MonoTol,
+    records: &[ObsRecord], recurrence: crate::types::TteRecurrence, times: &[f64], cum: &[f64],
+    haz: &[f64], tol: crate::survival::MonoTol,
     visit: &mut impl FnMut(crate::survival::RecordTerm<f64>),
 ) -> f64 {
     let cumhaz_at = |t: f64| -> f64 {
@@ -155,7 +164,7 @@ fn tte_ode_nll_from_curves_visit(
     let hazard_at = |t: f64| -> f64 {
         times.binary_search_by(|x| x.partial_cmp(&t).unwrap()).map_or(f64::NAN, |i| haz[i])
     };
-    crate::survival::tte_nll_from_curves_g(records, cumhaz_at, hazard_at, tol, visit)
+    crate::survival::ode_curves_nll_visit_g(records, recurrence, cumhaz_at, hazard_at, tol, visit)
 }
 
 /// #570: a single augmented PK+CHZ integration reused for both endpoints of a joint
@@ -351,7 +360,8 @@ fn tte_endpoint_nll(
 /// Each scored record's term goes to `visit`; the return is their fold. Every caller
 /// (objective, FD perturbations, [`non_gaussian_terms`], residuals via
 /// [`tte_endpoint_record_terms`]) goes through here, so residuals and objective share
-/// one engine. The ODE path is Single-only (RTTE + drug hazard rejected at parse).
+/// one engine. Every arm scores `recurrence` through `survival::curves_nll_visit_g`; the ODE
+/// arms take single events and clock-forward RTTE (#3152; clock-reset is refused at parse).
 #[cfg(feature = "survival")]
 #[allow(clippy::too_many_arguments)]
 fn tte_endpoint_nll_visit(
@@ -380,11 +390,14 @@ fn tte_endpoint_nll_visit(
                 Some(s) => {
                     let ode = model.ode_spec.as_ref().expect("joint share ⟹ ode_spec");
                     let (cum, haz, tol) = shared_tte_curves(ode, s, *chz_state);
-                    tte_ode_nll_from_curves_visit(records, &s.times, &cum, &haz, tol, visit)
+                    tte_ode_nll_from_curves_visit(
+                        records, recurrence, &s.times, &cum, &haz, tol, visit,
+                    )
                 }
                 None => {
                     let c = tte_ode_curves(model, subject, *chz_state, records, theta, eta);
-                    tte_ode_nll_from_curves_visit(records, &c.times, &c.cum, &c.haz, c.tol, visit)
+                    let (t, h) = (&c.times, &c.haz);
+                    tte_ode_nll_from_curves_visit(records, recurrence, t, &c.cum, h, c.tol, visit)
                 }
             }
         }
@@ -5999,6 +6012,62 @@ mod tests {
     fn walk_scope_straddle(s: &Subject) -> (bool, bool) {
         let in_scope = crate::sens::ode_provider::adjoint::ode_hazard_walk_in_scope;
         (in_scope(&joint_pktte_ode_model(), s), in_scope(&walk_declined_joint_pktte_model(), s))
+    }
+
+    /// #3152: a clock-forward RTTE endpoint on [`joint_pktte_ode_model`]'s drug-driven hazard
+    /// scores the same on the walk, the dedicated solve and the #570 share. The non-walk arms
+    /// once scored each record on its own (`H(t) − H(entry)`), so a subject outside the walk's
+    /// scope got another objective with nothing said: `single` is that objective.
+    #[cfg(feature = "survival")]
+    #[test]
+    fn rtte_forward_ode_hazard_scores_the_same_on_every_arm() {
+        use crate::types::{EventType, ObsRecord};
+        let src =
+            crate::test_models::ODE_9.replace("  cmt    = 2\n", "  cmt    = 2\n  type = rtte\n");
+        let walk = crate::parser::model_parser::parse_model_string(&src).unwrap();
+        let mut declined = crate::parser::model_parser::parse_model_string(&src).unwrap();
+        declined.ode_spec.as_mut().unwrap().rhs_program = None;
+        let mut s = ebe_pktte_subject("A", 0.0, false);
+        let rec = |time, event_type| ObsRecord::Event { time, event_type, entry_time: 0.0, cmt: 2 };
+        s.obs_records = vec![
+            rec(8.0, EventType::Exact),
+            rec(20.0, EventType::Exact),
+            rec(30.0, EventType::RightCensored),
+        ];
+        let in_scope = crate::sens::ode_provider::adjoint::ode_hazard_walk_in_scope;
+        assert!(in_scope(&walk, &s) && !in_scope(&declined, &s), "the straddle");
+        let Some(EndpointLikelihood::Tte { hazard, recurrence, .. }) = walk.endpoints.get(&2)
+        else {
+            panic!("a TTE endpoint on CMT 2");
+        };
+        let (theta, eta) = (&walk.default_params.theta, [0.3]);
+        let score = |m: &CompiledModel, r, share: Option<&JointPkTteSolve>| {
+            tte_endpoint_nll_visit(
+                m,
+                &s,
+                hazard,
+                r,
+                &s.obs_records,
+                theta,
+                &eta,
+                share,
+                &mut |_| {},
+            )
+        };
+        let share = try_joint_pktte_shared_solve(&declined, &s, theta, &eta).expect("shared");
+        let on_walk = score(&walk, *recurrence, None);
+        let dedicated = score(&declined, *recurrence, None);
+        let shared = score(&declined, *recurrence, Some(&share));
+        let single = score(&walk, crate::types::TteRecurrence::Single, None);
+        eprintln!(
+            "walk {on_walk:.12} dedicated {dedicated:.12} shared {shared:.12} single {single:.12}"
+        );
+        assert!([on_walk, dedicated, shared, single].iter().all(|v| v.is_finite() && *v < 1e19));
+        // Measured (Linux x86_64): dedicated 0 to 12 digits; the share 1.6e-4, its own solve's
+        // gap (2.5e-4 on the same subject scored as single events).
+        assert!((dedicated - on_walk).abs() < 1e-8, "dedicated {dedicated} vs walk {on_walk}");
+        assert!((shared - on_walk).abs() < 1e-3, "shared {shared} vs walk {on_walk}");
+        assert!((single - on_walk).abs() > 0.1, "premise: the records couple");
     }
 
     /// #1885's ODE fixture (the plan's M4): [`joint_pktte_ode_model`]'s subject on oral

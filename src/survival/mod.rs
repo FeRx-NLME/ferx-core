@@ -98,25 +98,39 @@ pub(crate) fn analytic_tte_nll_visit_g<T: PkNum>(
     let hazard_at = |t| hazard_and_cum_hazard_g(family, t, params).0;
     // Analytic families carry only f64 round-off (no ODE solver error), so every
     // recurrence path uses the tight analytic monotone floor (#633).
+    curves_nll_visit_g(records, recurrence, cumhaz_at, hazard_at, MonoTol::analytic(), visit)
+}
+
+/// `records` scored off their `H` / `h` curves under `recurrence`, each record's term handed to
+/// `visit`: per-record terms (`Single`), one cumulative hazard across the risk window, so the
+/// records couple (clock-forward RTTE, Andersen–Gill), or each gap on its own duration
+/// (clock-reset, §3.3). The one dispatch every hazard and every engine takes (#3152).
+pub(crate) fn curves_nll_visit_g<T: PkNum>(
+    records: &[ObsRecord], recurrence: TteRecurrence, cumhaz_at: impl Fn(f64) -> T,
+    hazard_at: impl Fn(f64) -> T, tol: MonoTol, visit: &mut impl FnMut(RecordTerm<T>),
+) -> T {
     match recurrence {
-        // Standard TTE / competing risks: per-record independent terms.
-        TteRecurrence::Single => {
-            tte_nll_from_curves_g(records, cumhaz_at, hazard_at, MonoTol::analytic(), visit)
+        TteRecurrence::Single => tte_nll_from_curves_g(records, cumhaz_at, hazard_at, tol, visit),
+        TteRecurrence::Repeated { clock: RtteClock::Forward } => {
+            rtte_forward_nll_from_curves_g(records, cumhaz_at, hazard_at, tol, visit)
         }
-        // Clock-forward RTTE (Andersen–Gill): the cumulative hazard is integrated
-        // once across the subject's whole risk window (§3.3), so the records couple.
-        TteRecurrence::Repeated { clock: RtteClock::Forward } => rtte_forward_nll_from_curves_g(
-            records,
-            cumhaz_at,
-            hazard_at,
-            MonoTol::analytic(),
-            visit,
-        ),
-        // Clock-reset RTTE: each inter-event gap is scored on its own duration `Δ_k` (§3.3).
         TteRecurrence::Repeated { clock: RtteClock::Reset } => {
-            rtte_reset_nll_from_curves_g(records, cumhaz_at, hazard_at, MonoTol::analytic(), visit)
+            rtte_reset_nll_from_curves_g(records, cumhaz_at, hazard_at, tol, visit)
         }
     }
+}
+
+/// [`curves_nll_visit_g`] over an ODE-accumulated hazard's curves, which run on absolute time.
+/// Clock-reset needs each gap's own solve from its renewal state, so the parser refuses it
+/// with an ODE hazard and it is the repel sentinel here (#3152).
+pub(crate) fn ode_curves_nll_visit_g<T: PkNum>(
+    records: &[ObsRecord], recurrence: TteRecurrence, cumhaz_at: impl Fn(f64) -> T,
+    hazard_at: impl Fn(f64) -> T, tol: MonoTol, visit: &mut impl FnMut(RecordTerm<T>),
+) -> T {
+    if matches!(recurrence, TteRecurrence::Repeated { clock: RtteClock::Reset }) {
+        return T::from_f64(SUBJECT_SENTINEL_NLL);
+    }
+    curves_nll_visit_g(records, recurrence, cumhaz_at, hazard_at, tol, visit)
 }
 
 /// A subject's whole non-Gaussian term (TTE, binary and CTMM summed, θ fixed) with its
@@ -213,24 +227,10 @@ pub(crate) fn ode_tte_nll_from_states<T: crate::sens::num::vm::VmNum>(
         model, subject, chz_state, times, solved,
     )?;
     let tol = MonoTol::from_solver(&model.ode_spec.as_ref()?.effective_solver_opts());
-    // The cumulative-hazard curve is indexed by absolute time, not gap time.
     let at = |curve: &[T], t: f64| -> T {
         times.binary_search_by(|x| x.total_cmp(&t)).map_or(T::from_f64(f64::NAN), |i| curve[i])
     };
-    // Clock-reset RTTE with an ODE-accumulated hazard would need a fresh ODE solve from
-    // each renewal state, integrating over gap time — a later slice (#3152).
-    match recurrence {
-        TteRecurrence::Single => {
-            Some(tte_nll_from_curves_g(records, |t| at(&cum, t), |t| at(&haz, t), tol, visit))
-        }
-        TteRecurrence::Repeated { clock: RtteClock::Forward } => Some(
-            rtte_forward_nll_from_curves_g(records, |t| at(&cum, t), |t| at(&haz, t), tol, visit),
-        ),
-        TteRecurrence::Repeated { clock: RtteClock::Reset } => {
-            // The parser rejects this combination at parse time; defense in depth.
-            Some(T::from_f64(SUBJECT_SENTINEL_NLL))
-        }
-    }
+    Some(ode_curves_nll_visit_g(records, recurrence, |t| at(&cum, t), |t| at(&haz, t), tol, visit))
 }
 
 /// A subject's non-Gaussian data term as a function of `(θ, η)` on any VM number type —
@@ -1082,12 +1082,12 @@ fn rtte_cause(
         else {
             continue;
         };
-        // The parser rejects `type = rtte` with an ODE-accumulated hazard, so only
-        // the analytic closed form reaches simulation.
+        // `validate_tte_simulatable` refuses `type = rtte` with an ODE-accumulated hazard
+        // (#3152), so only the analytic closed form reaches simulation.
         let HazardSpec::Analytic { family, param_fn, .. } = hazard else {
             panic!(
-                "RTTE endpoint on CMT={cmt} carries a non-analytic hazard; the parser rejects \
-                 `type = rtte` with an ODE-accumulated `hazard = ...`, so this is unreachable"
+                "RTTE endpoint on CMT={cmt} carries a non-analytic hazard; \
+                 `validate_tte_simulatable` refuses it, so this is unreachable"
             );
         };
         match &found {
@@ -3742,6 +3742,72 @@ mod ode_hazard_exact_tests {
         eprintln!("TIME-reading ODE hazard: value {worst_v:.2e}, gradients {worst_g:.2e}");
         assert!(worst_v < 1e-8, "value {worst_v:.2e}");
         assert!(worst_g < 1e-6, "gradient {worst_g:.2e}");
+    }
+
+    /// #3152: clock-forward RTTE on a drug-driven hazard is exact too. The η-gradient and the
+    /// θ-score of the telescoped `H(tₖ) − H(tₖ₋₁)` terms, carried across three records over
+    /// three doses, match Richardson differences of production's non-Gaussian term.
+    #[test]
+    fn a_clock_forward_rtte_ode_hazard_is_exact() {
+        let src =
+            crate::test_models::ODE_9.replace("  cmt    = 2\n", "  cmt    = 2\n  type = rtte\n");
+        let mut model = crate::parser::model_parser::parse_model_string(&src).unwrap();
+        if let Some(ode) = model.ode_spec.as_mut() {
+            ode.solver_opts.reltol = 1e-12;
+            ode.solver_opts.abstol = 1e-14;
+        }
+        let model = &model;
+        let rec = |time, event_type| ObsRecord::Event { time, event_type, entry_time: 0.0, cmt: 2 };
+        let s = Subject {
+            id: "1".into(),
+            doses: [0.0, 12.0, 24.0]
+                .map(|t| crate::types::DoseEvent::new(t, 100.0, 1, 0.0, false, 0.0))
+                .to_vec(),
+            obs_records: vec![
+                rec(8.0, EventType::Exact),
+                rec(20.0, EventType::Exact),
+                rec(30.0, EventType::RightCensored),
+            ],
+            ..Default::default()
+        };
+        assert!(tte_record_served(model, &s, 2), "served");
+        let (theta, eta) = (model.default_params.theta.clone(), vec![0.3]);
+        let nll = |th: &[f64], e: &[f64]| {
+            let mut acc = 0.0;
+            crate::stats::likelihood::accumulate_non_gaussian_nll(
+                model, &s, th, e, None, 1.0, &mut acc,
+            );
+            acc
+        };
+        let rich = |f: &dyn Fn(f64) -> f64, x: f64| {
+            let h = 1e-3 * x.abs().max(1e-2);
+            let d = |h: f64| (f(x + h) - f(x - h)) / (2.0 * h);
+            (4.0 * d(h / 2.0) - d(h)) / 3.0
+        };
+        let (v, g) = tte_subject_eta_grad(model, &s, &theta, &eta).expect("exact");
+        let mut worst_g = (g[0] - rich(&|x| nll(&theta, &[x]), eta[0])).abs();
+        let (_, gt) =
+            crate::sens::ode_provider::adjoint::non_gaussian_theta_score(model, &s, &theta, &eta)
+                .expect("θ-score");
+        for i in 0..theta.len() {
+            let fd = rich(
+                &|x| {
+                    let mut th = theta.clone();
+                    th[i] = x;
+                    nll(&th, &eta)
+                },
+                theta[i],
+            );
+            assert!(gt[i].is_finite() && fd.is_finite(), "θ {i}: {} vs {fd}", gt[i]);
+            worst_g = worst_g.max((gt[i] - fd).abs() / (1.0 + fd.abs()));
+        }
+        let worst_v = (v - nll(&theta, &eta)).abs();
+        eprintln!("clock-forward RTTE ODE hazard: value {worst_v:.2e}, gradients {worst_g:.2e}");
+        assert!(worst_v.is_finite() && worst_g.is_finite());
+        // Measured (Linux x86_64): the value bit-identical to production's, the gradients
+        // 1.6e-10 off Richardson; 2e-9 is ~12× that.
+        assert!(worst_v < 1e-12, "value {worst_v:.2e}");
+        assert!(worst_g < 2e-9, "gradient {worst_g:.2e}");
     }
 
     /// #1575's fixture (`tests/one_snapshot_dose_reads_survival.rs`) on the exact route: a

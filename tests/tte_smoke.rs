@@ -291,18 +291,6 @@ mod survival_smoke {
         );
     }
 
-    /// RTTE with a drug-driven ODE hazard (joint PK-RTTE) is a later slice — reject
-    /// rather than silently fitting a single-event likelihood.
-    #[test]
-    fn rtte_with_ode_hazard_is_rejected() {
-        let src = ODE_TTE_MODEL.replace("cmt    = 3", "cmt    = 3\n  type   = rtte");
-        let err = parse_model_string(&src).expect_err("rtte + ODE hazard must be rejected");
-        assert!(
-            err.contains("rtte") && err.contains("hazard"),
-            "error should explain RTTE + ODE hazard is unsupported, got: {err}"
-        );
-    }
-
     /// Compact RTTE model with a capped iteration count for a fast fit-path smoke.
     const RTTE_EXP_FIT_MODEL: &str = r"
 [parameters]

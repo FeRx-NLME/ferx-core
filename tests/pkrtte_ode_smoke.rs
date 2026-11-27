@@ -1,167 +1,128 @@
-//! #3152 smoke tests: a joint PK-RTTE model whose hazard is ODE-accumulated and whose
-//! recurrence is `type = rtte, clock = forward` (Andersen–Gill). Until this issue the
-//! combination was refused at parse time; now it fits and its likelihood agrees with the
-//! per-gap score computed from the analytic cumulative-hazard formula.
+//! #3152: `type = rtte, clock = forward` with an ODE-accumulated `hazard = ...` against its
+//! analytic `family` twin, on the first 20 subjects of the bundled RTTE data. The ODE side
+//! integrates the hazard as an appended `[odes]` state and scores each gap as `H(tₖ) − H(tₖ₋₁)`;
+//! the analytic side scores the closed form. Equal objectives at the start (`maxiter = 0`) pin
+//! the value; equal optima pin the gradient, which runs through the same scorer over dual
+//! numbers. Exponential is a constant hazard; Weibull (shape 1.5) varies in time through `TIME`.
+//! `clock = reset` with an ODE hazard is still refused, and `simulate()` refuses the model.
 //!
-//! The fixture is the existing joint PK-TTE model with `type = rtte` added, evaluated
-//! at `maxiter = 0` on a synthetic population whose subjects each contribute two event
-//! records (exact followed by right-censored).
-//!
-//! Two tests:
-//! - `clock_forward_parses_and_fits`: the model is accepted by the parser and converges.
-//! - `clock_reset_still_refused`: `type = rtte, clock = reset` with an ODE hazard gives
-//!   the updated, accurate error message (a later slice, #3152).
-//!
-//! Tier 2: `maxiter = 0` evaluation only, no convergence loop.
-
-mod common;
+//! Tier 2 (the converged pairs: Tier 3).
 
 #[cfg(feature = "survival")]
-mod pkrtte_smoke {
-    use crate::common;
+mod pkrtte_ode {
+    use ferx_core::api::read_population_for;
     use ferx_core::parser::model_parser::parse_model_string;
-    use ferx_core::types::{DoseEvent, EventType, ObsRecord, Population};
-    use ferx_core::{fit, FitOptions};
+    use ferx_core::{fit, FitOptions, FitResult};
 
-    const BASE: &str = r"
-[parameters]
-  theta TVCL(1.0, 0.01, 100.0)
-  theta TVV(10.0, 0.1, 500.0)
-  theta TVKA(1.0, 0.01, 50.0)
-  theta TVH0(0.02, 1e-5, 10.0)
-  theta TVBETA(0.3, -10.0, 10.0)
-
-  omega ETA_CL ~ 0.09
-
-  sigma PROP_ERR ~ 0.05 (sd)
-
-[individual_parameters]
-  CL   = TVCL * exp(ETA_CL)
-  V    = TVV
-  KA   = TVKA
-  H0   = TVH0
-  BETA = TVBETA
-
-[structural_model]
-  ode(obs_cmt=central, states=[depot, central])
-
-[odes]
-  d/dt(depot)   = -KA * depot
-  d/dt(central) =  KA * depot - (CL/V) * central
-
-[event_model]
-  cmt    = 3
-  RECURRENCE
-  hazard = H0 * exp(BETA * (central / V))
-
-[error_model]
-  DV ~ proportional(PROP_ERR)
-
-[fit_options]
-  method  = focei
-  maxiter = 0
-";
-
-    fn rtte_forward_model() -> String {
-        BASE.replace("  RECURRENCE", "  type   = rtte\n  clock  = forward")
+    /// The analytic event model, or its `[odes]` transcription when `ode` is set: one inert
+    /// state, and the `[error_model]` an ODE model needs, with no Gaussian row to score.
+    fn model(params: &str, indiv: &str, family: &str, hazard: &str, ode: bool) -> String {
+        let head = "[event_model]\n  cmt = 2\n  type = rtte\n  clock = forward\n";
+        if !ode {
+            return format!("{params}{head}{family}");
+        }
+        let params = params.replace("[parameters]\n", "[parameters]\n  sigma SIG ~ 0.1 FIX\n");
+        format!(
+            "{params}[individual_parameters]\n{indiv}[structural_model]\n  \
+             ode(obs_cmt=x, states=[x])\n[odes]\n  d/dt(x) = 0\n[error_model]\n  \
+             DV ~ additive(SIG)\n{head}  hazard = {hazard}\n"
+        )
     }
 
-    fn rtte_reset_model() -> String {
-        BASE.replace("  RECURRENCE", "  type   = rtte\n  clock  = reset")
+    fn run(src: &str, data: &str, maxiter: usize) -> FitResult {
+        let m = parse_model_string(src).unwrap_or_else(|e| panic!("parses: {e}\n{src}"));
+        let path = format!("{}/data/{data}", env!("CARGO_MANIFEST_DIR"));
+        let (mut pop, _) = read_population_for(&m, &None, &path, None, None, None, &[]).unwrap();
+        pop.subjects.truncate(20);
+        // The Weibull start gap falls 7e-3 → 1.7e-4 → 3.1e-6 → 4.6e-8 at `ode_reltol` 1e-4 → 1e-6
+        // → 1e-8 → 1e-10 (200 subjects, Linux x86_64): the ODE twin's integration error, not
+        // the scoring. 1e-8 keeps it under the bound at a fifth of 1e-10's cost.
+        let o = FitOptions {
+            outer_maxiter: maxiter,
+            run_covariance_step: false,
+            ode_reltol: 1e-8,
+            ode_abstol: 1e-10,
+            ..FitOptions::default()
+        };
+        fit(&m, &pop, &m.default_params, &o).expect("fit runs")
     }
 
-    fn tte_model() -> String {
-        BASE.replace("  RECURRENCE\n", "")
-    }
+    /// The start per PR; the converged pair (a fit loop) under `slow-tests`. The exact gradient
+    /// is pinned per PR by `survival::ode_hazard_exact_tests`.
+    const BUDGETS: &[usize] = if cfg!(feature = "slow-tests") { &[0, 200] } else { &[0] };
 
-    /// Three subjects: an oral dose at 0, an exact event, then a right-censored record.
-    fn two_event_population() -> Population {
-        let n_pk_obs = 5;
-        let dose = DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0);
-        let subjects = (1u32..=3)
-            .map(|id| {
-                let event_time = 8.0 + f64::from(id);
-                let pk_times: Vec<f64> = (1..=n_pk_obs).map(|j| j as f64 * 2.0).collect();
-                let mut records: Vec<ObsRecord> = pk_times
-                    .iter()
-                    .map(|&t| ObsRecord::Event {
-                        time: t,
-                        event_type: EventType::Exact,
-                        entry_time: 0.0,
-                        cmt: 2,
-                    })
-                    .collect();
-                // Exact event, then final right-censor for the RTTE stream.
-                records.push(ObsRecord::Event {
-                    time: event_time,
-                    event_type: EventType::Exact,
-                    entry_time: 0.0,
-                    cmt: 3,
-                });
-                records.push(ObsRecord::Event {
-                    time: 24.0,
-                    event_type: EventType::RightCensored,
-                    entry_time: 0.0,
-                    cmt: 3,
-                });
-                let mut s = common::subject(
-                    &id.to_string(),
-                    vec![dose.clone()],
-                    pk_times.clone(),
-                    vec![2.0; n_pk_obs],
-                    vec![2; n_pk_obs],
-                );
-                s.obs_records = records;
-                s
-            })
-            .collect();
-        Population {
-            covariate_names: vec![],
-            dv_column: "DV".to_string(),
-            input_columns: vec![],
-            exclusions: None,
-            warnings: vec![],
-            subjects,
+    /// `|ΔOFV| < tol` and `|Δθ| < tol·|θ|` at each budget in `budgets`.
+    fn assert_twins(p: [&str; 4], data: &str, budgets: &[usize], tol: f64) {
+        let [params, indiv, family, hazard] = p;
+        for &maxiter in budgets {
+            let a = run(&model(params, indiv, family, hazard, false), data, maxiter);
+            let o = run(&model(params, indiv, family, hazard, true), data, maxiter);
+            assert!(a.theta.iter().chain(&o.theta).all(|v| v.is_finite()), "{data}: θ finite");
+            let dth =
+                a.theta.iter().zip(&o.theta).map(|(x, y)| ((x - y) / x).abs()).fold(0.0, f64::max); // nan-ok: θ asserted finite above; every θ bound is > 0
+            eprintln!(
+                "{data} maxiter {maxiter}: |ΔOFV| {:.2e}, worst rel θ {dth:.2e}",
+                (a.ofv - o.ofv).abs()
+            );
+            assert_eq!(a.converged, o.converged, "{data} maxiter {maxiter}: converged");
+            assert!(
+                (a.ofv - o.ofv).abs() < tol,
+                "{data} maxiter {maxiter}: {} vs {}",
+                a.ofv,
+                o.ofv
+            );
+            assert!(dth < tol, "{data} maxiter {maxiter}: θ {:?} vs {:?}", a.theta, o.theta);
         }
     }
 
-    /// `type = rtte, clock = forward` with an ODE-accumulated hazard now parses and fits.
-    /// The fit must converge (at `maxiter = 0` the EBE step is what matters) and reach
-    /// a finite OFV. As a differential check: the OFV for the RTTE model must differ from
-    /// the single-event TTE model (the extra event increments the likelihood), showing the
-    /// repeated-event path is live.
     #[test]
-    fn clock_forward_parses_and_fits() {
-        let m_rtte = parse_model_string(&rtte_forward_model()).expect("rtte forward must parse");
-        let m_tte = parse_model_string(&tte_model()).expect("tte must parse");
-        let pop = two_event_population();
-        let opts = FitOptions::default();
-        let r_rtte = fit(&m_rtte, &pop, &m_rtte.default_params, &opts).expect("rtte forward fit");
-        let r_tte = fit(&m_tte, &pop, &m_tte.default_params, &opts).expect("tte fit");
-        assert!(r_rtte.ofv.is_finite(), "rtte forward OFV must be finite: {}", r_rtte.ofv);
-        assert!(r_tte.ofv.is_finite(), "tte OFV must be finite: {}", r_tte.ofv);
-        // The two-event RTTE scoring includes the second record's contribution, so the
-        // objective is different from the single-event path.
-        assert_ne!(
-            r_rtte.ofv.to_bits(),
-            r_tte.ofv.to_bits(),
-            "rtte forward OFV ({}) must differ from single-event tte OFV ({}); \
-             the repeated-event scoring path must be live",
-            r_rtte.ofv,
-            r_tte.ofv
-        );
+    fn exponential_ode_hazard_matches_its_family() {
+        let p = [
+            "[parameters]\n  theta TVLAMBDA(0.15, 0.001, 10.0)\n  omega ETA_LAMBDA ~ 0.09\n",
+            "  LAMBDA = TVLAMBDA * exp(ETA_LAMBDA)\n",
+            "  family = exponential\n  scale = TVLAMBDA * exp(ETA_LAMBDA)\n",
+            "LAMBDA",
+        ];
+        assert_twins(p, "rtte_exponential.csv", BUDGETS, BOUND_EXP);
     }
 
-    /// `type = rtte, clock = reset` with an ODE-accumulated hazard gives the accurate
-    /// error message pointing at `clock = forward` as the supported alternative.
     #[test]
-    fn clock_reset_still_refused() {
-        let result = parse_model_string(&rtte_reset_model());
-        let err = result.expect_err("clock = reset with ODE hazard must still be refused");
-        assert!(err.contains("clock = reset"), "error must name the refused combination: {err}");
-        assert!(
-            err.contains("clock = forward") || err.contains("clock=forward"),
-            "error must name the supported alternative: {err}"
-        );
+    fn weibull_ode_hazard_matches_its_family() {
+        let p = [
+            "[parameters]\n  theta TVSCALE(5.0, 0.1, 100.0)\n  theta TVSHAPE(1.5, 0.1, 10.0)\n  \
+             omega ETA_SCALE ~ 0.09\n",
+            "  SCALE = TVSCALE * exp(ETA_SCALE)\n  SHAPE = TVSHAPE\n",
+            "  family = weibull\n  scale = TVSCALE * exp(ETA_SCALE)\n  shape = TVSHAPE\n",
+            "(SHAPE / SCALE) * (TIME / SCALE)^(SHAPE - 1)",
+        ];
+        assert_twins(p, "rtte_weibull_reset.csv", BUDGETS, BOUND_WEIBULL);
+    }
+
+    // Measured (Linux x86_64, `ci-test`), worst of |ΔOFV| and relative |Δθ|: exponential 1.48e-8
+    // (θ at the optimum; |ΔOFV| 0 and 1.1e-13), Weibull 8.22e-7 (|ΔOFV| at the optimum; 6.30e-7 at
+    // the start). About 13× and 12×.
+    const BOUND_EXP: f64 = 2e-7;
+    const BOUND_WEIBULL: f64 = 1e-5;
+
+    /// Until #3152 the parser kept this model away from `simulate()`, whose stream draws
+    /// analytic hazards only; it panicked on one ("unreachable"). It is refused instead.
+    #[test]
+    fn simulating_it_is_refused_not_a_panic() {
+        let p = "[parameters]\n  theta TVH(0.1, 0.001, 10.0)\n";
+        let m = parse_model_string(&model(p, "  H = TVH\n", "", "H", true)).unwrap();
+        let path = format!("{}/data/rtte_exponential.csv", env!("CARGO_MANIFEST_DIR"));
+        let (pop, _) = read_population_for(&m, &None, &path, None, None, None, &[]).unwrap();
+        let o = ferx_core::SimulateOptions { horizon: Some(20.0), ..Default::default() };
+        let err = ferx_core::simulate_with_options(&m, &pop, &m.default_params, 1, &o).unwrap_err();
+        assert_eq!(err.code(), Some("E_TTE_NOT_SIMULATABLE"), "{err}");
+    }
+
+    #[test]
+    fn clock_reset_with_an_ode_hazard_is_still_refused() {
+        let params = "[parameters]\n  theta TVH(0.1, 0.001, 10.0)\n";
+        let src =
+            model(params, "  H = TVH\n", "", "H", true).replace("clock = forward", "clock = reset");
+        let err = parse_model_string(&src).err().expect("refused");
+        assert!(err.contains("clock = reset") && err.contains("clock = forward"), "{err}");
     }
 }
