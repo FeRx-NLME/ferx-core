@@ -2959,6 +2959,12 @@ fn fit_inner(
     // subjects (#1329) and `SolverStatsScope` is thread-local — a scope held on this thread
     // would have reported zero of everything. The `bool` is what the `.then()` used to decide.
     let ode_model = integrates_odes(model);
+    // A quadrature objective's own `(n_agq, anchor)`, so each subject's contribution is its
+    // term (#3149). Not a mixture's: its class-marginal is not split by subject.
+    let agq_term = objective_stage_opts
+        .as_ref()
+        .filter(|_| mixest_classes.is_none())
+        .and_then(|o| Some((o.agq_nodes()?, o.hessian_anchor())));
     // The SS non-convergence notes this fit reports are this pass's, at its estimates (#1522).
     let ((mut subjects, ode_solver_stats), ss_notes) = crate::dosing::ss_notes_at_estimates(|| {
         compute_subject_results(
@@ -2970,6 +2976,7 @@ fn fit_inner(
             &result.kappas,
             options.interaction,
             mixest_classes.as_deref(),
+            agq_term,
             ode_model,
         )
     });
@@ -3460,9 +3467,9 @@ fn fit_inner(
         // subjects (#2038) and rereads the label from them (#2265) — after the
         // de-duplication, which matches the estimator's copy on the sentence both
         // share before any reread.
-        // The contributions are the post-hoc FOCE/FOCEI score whatever produced the
-        // objective, so the source says which, and the scorer splits out the terms the
-        // predictions cannot describe (#2267).
+        // The source says what the contributions score, and the scorer splits out the terms
+        // the predictions cannot describe (#2267): under quadrature only the data terms, as
+        // the FOCE/FOCEI curvature parts are not parts of its term (#3149).
         let source =
             ContributionSource::of(objective_stage, options, mixest_classes.is_some(), ofv_prior);
         let scorer = |i: usize, data: &Subject, s: &SubjectResult| {
@@ -3471,7 +3478,7 @@ fn fit_inner(
                 data,
                 &result.params,
                 &s.eta,
-                result.h_matrices.get(i),
+                result.h_matrices.get(i).filter(|_| agq_term.is_none()),
                 options.interaction,
                 result.kappas.get(i).map_or(&[][..], |k| k.as_slice()),
                 mixest_classes.as_ref().and_then(|m| m.get(i).copied()),

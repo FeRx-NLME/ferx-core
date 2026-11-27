@@ -1503,6 +1503,47 @@ fn a_negative_covariate_on_every_record_names_its_subject() {
     );
 }
 
+/// **N5q — the same subject under quadrature carries no FOCE/FOCEI curvature part** (#3149,
+/// #3166 review). N5's fit names `Gaussian residual term = NaN, curvature (H̃ not positive
+/// definite) = NaN` for subject 3; under `laplace` the contribution is the quadrature term,
+/// whose parts those are not, so the subject is still named (its predictions are `NaN`) and
+/// `failed_terms` is empty. A differential pair on one population: FOCEI names the parts and
+/// Laplace does not, so a gate that is always open or always shut fails one half.
+///
+/// Mutation (run): drop the `.filter(|_| agq_term.is_none())` on the scorer's `h_matrices` →
+/// the Laplace half names the FOCEI parts.
+#[test]
+fn a_quadrature_fits_unusable_subject_names_no_focei_curvature_part() {
+    let model = wt_power_model(false);
+    let pop = warfarin_with_wt(NegativeWt::EveryRecord);
+    let run = |method: EstimationMethod| {
+        let opts = FitOptions {
+            method,
+            outer_maxiter: 0,
+            run_covariance_step: false,
+            threads: Some(1),
+            ..Default::default()
+        };
+        fit(&model, &pop, &model.default_params, &opts).expect("fit")
+    };
+    let focei = run(EstimationMethod::FoceI);
+    let (_, subjects) = named_subjects(&focei);
+    assert_eq!(subjects.len(), 1, "{subjects:?}");
+    assert_eq!(
+        subjects[0]["failed_terms"].as_array().map(Vec::len),
+        Some(2),
+        "premise: FOCEI names its Gaussian and curvature parts: {subjects:?}"
+    );
+
+    let laplace = run(EstimationMethod::Laplace);
+    let (message, subjects) = named_subjects(&laplace);
+    assert_eq!(subjects.len(), 1, "only subject 3 is named: {subjects:?}");
+    assert_eq!(subjects[0]["id"], "3");
+    assert_eq!(subjects[0]["nonfinite_predictions"], 11, "{subjects:?}");
+    assert_eq!(subjects[0]["failed_terms"], serde_json::json!([]), "{subjects:?}");
+    assert!(!message.contains("failed term"), "{message}");
+}
+
 /// **N6 — end to end, one bad record, on both engines.** A negative `WT` on subject
 /// 3's fourth observation only: each engine carries the `NaN` into that record and
 /// every later one, and the sentence names the first of them.
@@ -1863,6 +1904,7 @@ fn a_mixture_subject_is_selected_under_its_fitted_class() {
             &[Vec::new()],
             true,
             Some(&[class]),
+            None,
             false,
         );
         let c = subjects[0].ofv_contribution;
@@ -2043,12 +2085,13 @@ fn the_sentence_names_the_term_that_failed() {
 /// **T2 — which objectives the post-hoc score is a term of.** Classified by the
 /// objective published, not the estimator: every `2·pop_nll` objective (FOCE family,
 /// SAEM, IMP, IMPMAP, VI's Laplace final OFV) sums the contributions
-/// `compute_subject_results` scores; quadrature, BAYES's posterior-mean NLL, a mixture
-/// marginal and an interaction mismatch are named, with node count and mixture.
+/// `compute_subject_results` scores, and so does quadrature, scored with its own term
+/// (#3149); BAYES's posterior-mean NLL, a mixture marginal and an interaction mismatch
+/// are named, with node count and mixture.
 ///
-/// Mutation (run): drop any clause of `same` → its row fires; drop the `n_agq`, BAYES
-/// or mixture suffix → its row fires; go back to a FOCE-family method list → the
-/// SAEM/IMP/IMPMAP/VI rows fire.
+/// Mutation (run): drop any clause of `same` → its row fires; drop the BAYES or mixture
+/// suffix, or the `n_agq` suffix of the quadrature `score` → its row fires; go back to a
+/// FOCE-family method list → the SAEM/IMP/IMPMAP/VI rows fire.
 #[test]
 fn the_contribution_source_names_every_objective_it_is_not_a_term_of() {
     use EstimationMethod::*;
@@ -2057,14 +2100,16 @@ fn the_contribution_source_names_every_objective_it_is_not_a_term_of() {
         n_agq,
         ..FitOptions::default()
     };
-    let cases: [(EstimationMethod, bool, usize, bool, &str, Option<&str>); 15] = [
+    let cases: [(EstimationMethod, bool, usize, bool, &str, Option<&str>); 16] = [
         (Foce, false, 1, false, "FOCE", None),
         (FoceI, true, 1, false, "FOCEI", None),
         (FoceGn, true, 1, false, "FOCEI", None),
         (FoceGnHybrid, false, 1, false, "FOCE", None),
-        (FoceI, true, 3, false, "FOCEI", Some("FOCEI (n_agq = 3)")),
-        (Laplace, true, 1, false, "FOCEI", Some("LAPLACE")),
-        (Laplace, true, 5, false, "FOCEI", Some("LAPLACE (n_agq = 5)")),
+        // A non-mixture quadrature objective is scored with its own term (#3149).
+        (FoceI, true, 3, false, "FOCEI (n_agq = 3)", None),
+        (Laplace, true, 1, false, "LAPLACE", None),
+        (Laplace, true, 5, false, "LAPLACE (n_agq = 5)", None),
+        (Laplace, true, 1, true, "FOCEI", Some("LAPLACE mixture")),
         // SAEM, IMP, IMPMAP and VI's `vi_final_ofv = laplace` publish `2·pop_nll`,
         // the sum of these scores (review r1).
         (Saem, true, 1, false, "FOCEI", None),
@@ -2081,7 +2126,7 @@ fn the_contribution_source_names_every_objective_it_is_not_a_term_of() {
     for (method, interaction, n_agq, mixture, score, objective) in cases {
         let got = ContributionSource::of(method, &opts(interaction, n_agq), mixture, 0.0);
         assert_eq!(
-            (got.score, got.objective.as_deref()),
+            (got.score.as_str(), got.objective.as_deref()),
             (score, objective),
             "{method:?}, interaction {interaction}, n_agq {n_agq}, mixture {mixture}"
         );
@@ -2089,25 +2134,24 @@ fn the_contribution_source_names_every_objective_it_is_not_a_term_of() {
 }
 
 /// **T3 — an objective the contributions are not terms of says so, and says why it
-/// names nobody.** The same subjects under the FOCEI source and a Laplace one: with no
+/// names nobody.** The same subjects under the FOCEI source and a BAYES one: with no
 /// unusable contribution the FOCEI warning gives N2's sum sentence, and the
-/// Laplace one the sentence saying its objective is not split; with one, the
-/// Laplace list is followed by the caveat.
+/// BAYES one the sentence saying its objective is not split; with one, the
+/// BAYES list is followed by the caveat.
 ///
-/// Without unusable contributions the Laplace sentence says the scores cannot locate the
+/// Without unusable contributions the BAYES sentence says the scores cannot locate the
 /// failure and reports their sum on both sides of the cutoff (review r6: it used to
-/// attribute the failure to a part of Laplace the score does not share, which does not
+/// attribute the failure to a part of the objective the score does not share, which does not
 /// follow when the scores themselves sum past the cutoff).
 ///
 /// Mutation (run): restore the unconditional `named.is_empty()` return → the "No
 /// subject can be named" assertion fires; drop the caveat → the second assertion
 /// fires; append either under the FOCEI source → the two controls fire; swap the sum's
-/// two arms → both Laplace sentences fire.
+/// two arms → both BAYES sentences fire.
 #[test]
 fn a_non_foce_objective_says_whose_contributions_it_lists_or_why_it_names_nobody() {
     let pop = population_of(vec![shifted_subject("A"), shifted_subject("B")]);
-    let laplace =
-        ContributionSource::of(EstimationMethod::Laplace, &FitOptions::default(), false, 0.0);
+    let bayes = ContributionSource::of(EstimationMethod::Bayes, &FitOptions::default(), false, 0.0);
     let healthy = [
         crate::types::test_helpers::dummy_subject("A", 1, 4),
         crate::types::test_helpers::dummy_subject("B", 1, 4),
@@ -2129,7 +2173,7 @@ fn a_non_foce_objective_says_whose_contributions_it_lists_or_why_it_names_nobody
         &no_terms,
     );
     assert!(
-        !control.contains("LAPLACE") && !control.contains("not split by subject"),
+        !control.contains("BAYES") && !control.contains("not split by subject"),
         "a FOCEI objective's contributions are its terms: {control}"
     );
 
@@ -2142,18 +2186,18 @@ fn a_non_foce_objective_says_whose_contributions_it_lists_or_why_it_names_nobody
         &one_cpt_model(),
         &one_cpt_model().default_params,
         None,
-        &laplace,
+        &bayes,
         &no_terms,
     );
     assert_eq!(
         nobody.strip_prefix(&msg).expect("kept"),
         " No subject can be named: every subject's post-hoc FOCEI contribution at these \
-         estimates is usable, but the LAPLACE objective is not their sum and ferx does not \
-         split it by subject, so these scores cannot locate its failure; their sum (24.68) \
-         is usable."
+         estimates is usable, but the BAYES posterior-mean objective is not their sum and \
+         ferx does not split it by subject, so these scores cannot locate its failure; their \
+         sum (24.68) is usable."
     );
     // The other side of the sum (review r6): scores each usable whose sum is past the
-    // cutoff are reported as such, not as evidence the failure is Laplace's own.
+    // cutoff are reported as such, not as evidence the failure is the objective's own.
     let large: Vec<SubjectResult> = ["A", "B"]
         .iter()
         .map(|id| {
@@ -2171,7 +2215,7 @@ fn a_non_foce_objective_says_whose_contributions_it_lists_or_why_it_names_nobody
         &one_cpt_model(),
         &one_cpt_model().default_params,
         None,
-        &laplace,
+        &bayes,
         &no_terms,
     );
     assert!(
@@ -2185,6 +2229,26 @@ fn a_non_foce_objective_says_whose_contributions_it_lists_or_why_it_names_nobody
     assert_eq!(details["unusable_subjects"], serde_json::json!([]), "{details}");
     assert_eq!(details["contributions_are_objective_terms"], false, "{details}");
     assert_eq!(entry.message, nobody);
+
+    // A quadrature objective's usable contributions are its own terms (#3149).
+    let quadrature =
+        ContributionSource::of(EstimationMethod::Laplace, &FitOptions::default(), false, 0.0);
+    let (msg, mut entry) = sentinel_warning();
+    let own = name_nonfinite_subjects(
+        msg,
+        &mut entry,
+        &healthy,
+        &pop,
+        &one_cpt_model(),
+        &one_cpt_model().default_params,
+        None,
+        &quadrature,
+        &no_terms,
+    );
+    assert!(
+        own.contains("every subject's LAPLACE contribution at these estimates is usable, and"),
+        "{own}"
+    );
 
     let (msg, mut entry) = sentinel_warning();
     let control = name_nonfinite_subjects(
@@ -2209,15 +2273,15 @@ fn a_non_foce_objective_says_whose_contributions_it_lists_or_why_it_names_nobody
         &one_cpt_model(),
         &one_cpt_model().default_params,
         None,
-        &laplace,
+        &bayes,
         &no_terms,
     );
     assert!(
         listed.ends_with(
             "B (contribution 2e20, every observation's likelihood term usable on its own; \
              every IPRED and PRED finite). These are post-hoc FOCEI \
-             contributions at the EBEs, not terms of the LAPLACE objective, which ferx does \
-             not split by subject."
+             contributions at the EBEs, not terms of the BAYES posterior-mean objective, which \
+             ferx does not split by subject."
         ),
         "{listed}"
     );
@@ -2269,13 +2333,13 @@ fn overflowing_tte(overflow: bool) -> (CompiledModel, Population) {
 /// **T4 — end to end, the issue's TTE reproduction, on a FOCE-family objective and a
 /// Laplace one.** Subject 3 of a TTE-only population has an overflowing hazard. Before
 /// #2267 it was named "every IPRED and PRED finite", which it meets trivially: it has
-/// no Gaussian prediction. Now the sentence names the TTE term at its sentinel, and
-/// under Laplace says the contributions are FOCEI ones. The control (`Z = 0`) pins that
+/// no Gaussian prediction. Now the sentence names the TTE term at its sentinel, under
+/// Laplace too, whose contributions are its own terms (#3149). The control (`Z = 0`) pins that
 /// the naming is caused by the overflow and that a healthy fit stays silent.
 ///
 /// Mutation (run): pass a scorer returning no term in `fit_inner` → the "failed
-/// term" clause is missing; pass `ContributionSource::of(EstimationMethod::FoceI, …)`
-/// there → the Laplace caveat is missing.
+/// term" clause is missing; pass `ContributionSource::of(EstimationMethod::Bayes, …)`
+/// there → a caveat follows the list.
 #[cfg(feature = "survival")]
 #[test]
 fn an_overflowing_hazard_names_its_time_to_event_term() {
@@ -2292,15 +2356,9 @@ fn an_overflowing_hazard_names_its_time_to_event_term() {
     };
     let subject_3 = "3 (contribution 2e20, no Gaussian observation, failed term: \
                      time-to-event on CMT 2 = 1e20).";
-    for (method, tail) in [
-        (EstimationMethod::FoceI, String::new()),
-        (
-            EstimationMethod::Laplace,
-            " These are post-hoc FOCEI contributions at the EBEs, not terms of the LAPLACE \
-             objective, which ferx does not split by subject."
-                .to_string(),
-        ),
-    ] {
+    for (method, tail) in
+        [(EstimationMethod::FoceI, String::new()), (EstimationMethod::Laplace, String::new())]
+    {
         let control = run(method, false);
         assert!(
             crate::estimation::outer_optimizer::ofv_is_valid(control.ofv),
@@ -2330,12 +2388,12 @@ fn an_overflowing_hazard_names_its_time_to_event_term() {
 
 /// **T5 — the prior penalty is named, before and after a list.** An unusable prior
 /// alongside a named subject is appended after the list; alongside none it is the
-/// reason given, ahead of the Laplace and sum explanations; and a usable prior enters
+/// reason given, ahead of the BAYES and sum explanations; and a usable prior enters
 /// the sum, so `6e13 + 6e13 + 5` reads as the sum past the cutoff with the prior
 /// quoted. The end-to-end form is G5's last assertion.
 ///
 /// Mutation (run): drop the `prior_failed` arm → the second assertion reads the
-/// Laplace sentence; drop the post-list clause → the first fires; leave the prior out
+/// BAYES sentence; drop the post-list clause → the first fires; leave the prior out
 /// of `total` or of the clause → the third fires.
 #[test]
 fn an_unusable_prior_penalty_is_named_as_a_population_level_term() {
@@ -2381,7 +2439,7 @@ fn an_unusable_prior_penalty_is_named_as_a_population_level_term() {
         &one_cpt_model(),
         &one_cpt_model().default_params,
         None,
-        &source(EstimationMethod::Laplace, f64::INFINITY),
+        &source(EstimationMethod::Bayes, f64::INFINITY),
         &no_terms,
     );
     assert_eq!(
@@ -2993,7 +3051,7 @@ fn warning_at(ofv: f64, method: EstimationMethod) -> (String, crate::types::Warn
 /// | `1.44e20` under `1.44e20·(1 + 1e-10)` | sentinel | too large | yes: rounding | too large |
 /// | `1.99e20` under a `2e20` objective | sentinel | — | no: 0.5% out | sentinel |
 /// | `NaN` objective | `NaN` | — | no: not finite | `NaN` |
-/// | `1.44e20` under Laplace | sentinel | — | no: not its terms | sentinel |
+/// | `1.44e20` under BAYES | sentinel | — | no: not its terms | sentinel |
 /// | `9.99e13` under `1e14` | too large | — | no: sum usable | too large |
 ///
 /// The first and the third straddle the term check: the same kind of finite subject
@@ -3009,7 +3067,7 @@ fn warning_at(ofv: f64, method: EstimationMethod) -> (String, crate::types::Warn
 /// * drop the agreement check → the "another point" and "0.5% out" rows read "too large";
 /// * `REREAD_AGREEMENT = 1e-2` (the first version) → the "0.5% out" row reads "too large";
 ///   `1e-11` → the "rounding" row reads `total`;
-/// * drop `source.objective.is_none()` → the Laplace row reads "too large";
+/// * drop `source.objective.is_none()` → the BAYES row reads "too large";
 /// * drop `!ofv_is_valid(total)` → the last row reads `subjects`;
 /// * rebuild the message without the reread → every relabelled row's prefix fires;
 /// * keep `details["reason"]` from the total → the first two rows' `reason` fires.
@@ -3049,7 +3107,7 @@ fn the_label_is_read_from_the_subjects_when_they_are_the_objective() {
             "not its terms",
             1.44e20,
             1.44e20 + 12.34,
-            EstimationMethod::Laplace,
+            EstimationMethod::Bayes,
             &no_terms,
             sentinel,
             "total",
