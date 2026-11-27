@@ -3584,36 +3584,31 @@ fn fit_inner(
             // The check re-records every subject at a tighter solver override, which a plan
             // carries (`Plan::ode_override`): it starts from no plans of the phases before it
             // (SIR's draws, the output columns) and leaves none behind (#3077).
-            let applies = otc::tightened_override(model, &stage).is_some();
-            let t_check = std::time::Instant::now();
-            if applies && !stage.ode_ofv_check {
+            let shift = if otc::tightened_override(model, &stage).is_none() {
+                None
+            } else if !stage.ode_ofv_check {
                 let (msg, entry) = super::postfit::ode_ofv_check_off_warning();
                 warnings.push(msg);
                 native_warnings.push(entry);
-            }
-            let check_on = applies && stage.ode_ofv_check;
-            if check_on {
+                None
+            } else {
+                let t_check = std::time::Instant::now();
                 release_fit_plans();
-            }
-            let shift = if check_on {
-                otc::ofv_tolerance_shift(
+                let shift = otc::ofv_tolerance_shift(
                     model,
                     population,
                     &result.params,
                     &result.eta_hats,
                     &result.kappas,
                     &stage,
-                )
-            } else {
-                None
-            };
-            if check_on {
+                );
                 release_fit_plans();
                 // A check cancelled mid-pass did not run: its time stays `0.0`.
                 if shift.is_some() {
                     ofv_settlement_wall_time_secs = t_check.elapsed().as_secs_f64();
                 }
-            }
+                shift
+            };
             match shift {
                 Some(Ok(shift)) => {
                     if let Some((msg, entry)) = super::postfit::ode_ofv_not_settled_warning(&shift)

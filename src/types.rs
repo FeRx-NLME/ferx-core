@@ -8906,9 +8906,8 @@ pub struct FitResult {
     #[serde(default)]
     pub ofv_settlement_wall_time_secs: f64,
     /// Wall-clock time spent building the per-subject results (IPRED, PRED, the CWRES
-    /// linearisation) after the estimates, in seconds. About one evaluation's worth on an ODE
-    /// model, which is the bulk of a `maxiter = 0` run's time after the evaluation. `0.0` for a
-    /// fit restored from a `.fitrx` bundle (#3157).
+    /// linearisation) after the estimates, in seconds. `0.0` for a fit restored from a `.fitrx`
+    /// bundle (#3157).
     #[serde(default)]
     pub subject_results_wall_time_secs: f64,
     /// Model name (from the `.ferx` file or "Unnamed").
