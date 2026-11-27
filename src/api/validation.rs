@@ -7169,9 +7169,10 @@ pub(crate) fn check_model_data_warnings_rule(
         }
     }
 
-    // EVID=3/4 resets are not honoured on the EKF/SDE path.
+    // EVID=3/4 resets are not honoured on the EKF/SDE path. Ignoring one on the first record
+    // changes nothing, so it does not count (#3094).
     if model.is_sde() {
-        let n_reset_sde = population.subjects.iter().filter(|s| s.has_resets()).count();
+        let n_reset_sde = population.subjects.iter().filter(|s| s.has_effective_resets()).count();
         if n_reset_sde > 0 {
             diags.push(Diagnostic::warning(
                 "W_SDE_RESET",

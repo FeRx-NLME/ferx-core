@@ -235,7 +235,7 @@ equivalence:
 
 | Dataset feature | Code | What the SDE path does instead |
 |---|---|---|
-| `EVID=3`/`4` system reset | `W_SDE_RESET` | the reset is ignored; compartment amounts carry through |
+| `EVID=3`/`4` system reset after the subject's first record | `W_SDE_RESET` | the reset is ignored; compartment amounts carry through (one on the first record, such as an `EVID=4` first dose, changes nothing and does not warn) |
 | `lagtime` / `ALAGn` | `W_SDE_LAGTIME` | every dose is applied at its record time |
 
 One more gap raises no warning: **where the filter starts**. The ODE path starts each

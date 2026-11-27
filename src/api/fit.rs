@@ -3178,14 +3178,16 @@ fn fit_inner(
         ));
         // Analytical model with EVID=3/4 resets: superposition is invalid across
         // reset boundaries. Per-obs compartment states are empty (→ NaN) and the
-        // grid-integral path also returns NaN for affected sessions.
+        // grid-integral path also returns NaN for affected sessions. A reset on the first
+        // record (an `EVID=4` first dose) is a no-op, so it neither warns nor blanks (#3094).
         // ODE models with resets are handled correctly (ode_dense_solve_states applies
         // the reset as a break-point); this warning is analytical-only.
         //
         // An `[odes] init(...)` re-seeded at a reset reads the reset row's own snapshot
         // in the state pass, as `ipred` does (#1133, #2133); only the disposition stays
         // at the first-observation snapshot, which W_DERIVED_CMT_TV_ODE above covers.
-        if model.ode_spec.is_none() && all_records.subjects.iter().any(|s| s.has_resets()) {
+        if model.ode_spec.is_none() && all_records.subjects.iter().any(|s| s.has_effective_resets())
+        {
             warnings.push(
                 "W_DERIVED_CMT_RESET_ANALYTICAL: analytical model with EVID=3/4 \
                  reset events — compartment states and compartment-based integrals \

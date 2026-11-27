@@ -371,6 +371,17 @@ mod sde_unsupported_dosing_warnings {
         );
     }
 
+    /// `W_SDE_RESET` counts only a reset that can change the state (#3094): one on the first
+    /// record re-seeds the state the filter starts from anyway.
+    #[test]
+    fn a_first_record_reset_under_diffusion_does_not_warn() {
+        let mut pop = make_sde_population();
+        pop.subjects[0].reset_times = vec![0.0];
+        assert!(!codes(SDE_MODEL_SRC, &pop).contains(&"W_SDE_RESET".to_string()));
+        pop.subjects[0].reset_times = vec![4.0];
+        assert!(codes(SDE_MODEL_SRC, &pop).contains(&"W_SDE_RESET".to_string()));
+    }
+
     /// `W_SDE_STEADY_STATE` was retired on #1260: an `SS=1` record under `[diffusion]` is
     /// equilibrated by the filter (`ode::ekf::equilibrate_ss_ekf`), so the check must not
     /// tell the user to expand it into a dose train any more. Pinned against the lagtime

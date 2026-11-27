@@ -2084,7 +2084,7 @@ pub fn analytical_state_at_times(
     pk_model: PkModel, subject: &Subject, pk_params: &PkParams, times: &[f64],
 ) -> Vec<Vec<f64>> {
     debug_assert!(
-        subject.reset_times.is_empty(),
+        !subject.has_effective_resets(),
         "analytical_state_at_times called on a subject with EVID=3/4 resets — \
          superposition is invalid across reset boundaries; the caller should \
          return empty states for analytical+reset subjects instead"
@@ -2169,8 +2169,9 @@ pub fn predict_all_states(
 
 /// Compute predictions AND full compartment states for all observations:
 /// `(ipred_vec, compartment_states_vec)`. ODE states come from the same integration;
-/// analytical states from superposition. Analytical subjects with resets, and IOV models,
-/// get empty states (→ NaN in `[derived]`, `W_DERIVED_CMT_RESET_ANALYTICAL`).
+/// analytical states from superposition. Analytical subjects with a reset that can change
+/// the state (`has_effective_resets`, #3094), and IOV models, get empty states (→ NaN in
+/// `[derived]`, `W_DERIVED_CMT_RESET_ANALYTICAL`).
 pub fn compute_predictions_with_states(
     model: &crate::types::CompiledModel, subject: &Subject, theta: &[f64], eta: &[f64],
 ) -> (Vec<f64>, Vec<Vec<f64>>) {
@@ -2220,7 +2221,7 @@ pub fn compute_predictions_with_states(
             // [initial_conditions] baseline (#521): superposition states don't seed it, so
             // return NaN rather than disagree with ipred (W_DERIVED_INIT_ANALYTICAL).
             vec![]
-        } else if subject.has_resets() {
+        } else if subject.has_effective_resets() {
             // Superposition is invalid across resets; return outer-empty vec so
             // compartments[i] → NaN via the .unwrap_or(&[]) fallback. Consistent
             // with the IOV convention. W_DERIVED_CMT_RESET_ANALYTICAL explains why.

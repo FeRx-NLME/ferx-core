@@ -4601,7 +4601,7 @@ fn find_ebe_iov_seeded(
         EBE_MULTISTARTS_STARTED.with(|n| n.set(n.get() + 1));
         let mut nll = obj(&x);
         let prior = iov_prior_diag(n_eta, n_kappa, k_occasions, nested, params);
-        let scan_all = subject.has_resets() || subject.has_tv_covariates();
+        let scan_all = subject.has_effective_resets() || subject.has_tv_covariates();
         let sds: Vec<f64> = prior.iter().map(|p| p.var.max(0.0).sqrt()).collect();
         let mut centre = vec![0.0; n_flat];
         centre[..n_eta].copy_from_slice(&mu);

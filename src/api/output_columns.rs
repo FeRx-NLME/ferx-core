@@ -617,7 +617,7 @@ pub(crate) fn compute_extra_output_columns(
                                 // being empty for baseline models. W_DERIVED_INIT_ANALYTICAL
                                 // in fit_inner tells the user why.
                                 vec![]
-                            } else if subject.has_resets() {
+                            } else if subject.has_effective_resets() {
                                 // Analytical model + EVID=3/4 reset: superposition is invalid
                                 // across reset boundaries. Return empty so every grid point
                                 // evaluates to NaN, consistent with per-obs compartment_states

@@ -61,7 +61,7 @@
 //! | `W_THETA_INIT_OUTSIDE_BOUNDS` | the evaluation-only half of `E_THETA_INIT_OUTSIDE_BOUNDS`: the same `theta` start outside its own declared range on a run that does not search (`maxiter = 0`), which is clamped and **scored at the bound** — the message names the declared start and the value scored (#2865) |
 //! | `W_STEADY_STATE_II`       | SS=1 dose with missing / non-positive II |
 //! | `W_STEADY_STATE_ABSOLUTE_TIME` | SS=1 dose on an `[odes]` PK block reading an absolute clock (`TAFD`, or `T` / `TIME`) — the run-in expands the train on a cycle-local clock, so there is no periodic limit to converge to: `TAFD` reads `NaN`, `T` / `TIME` return NONMEM's value (#1139) |
-//! | `W_SDE_RESET`             | EVID=3/4 resets under an SDE model are not honoured |
+//! | `W_SDE_RESET`             | EVID=3/4 resets under an SDE model are not honoured (one on the subject's first record is a no-op and does not count, #3094) |
 //! | `W_SDE_LAGTIME`           | an absorption lag time under an SDE model is not honoured |
 //! | `W_EXPERIMENTAL_SDE`      | an SDE (`[diffusion]`) model uses an experimental feature; the filter is covariance-only, so the state mean is never corrected by the data (see Feature Maturity and the SDE page) |
 //! | `W_EXPERIMENTAL_NN`       | a neural-network (`[covariate_nn]`) model uses an experimental feature (see Feature Maturity docs) |
@@ -263,7 +263,7 @@
 //! | `W_DERIVED_CMT_TV_ANALYTICAL` | analytical model with a `[derived]` expression reading `compartments[i]` and subject(s) with time-varying covariates, or individual parameters that read `TIME` (#1855); compartment states are not built for those subjects, so the expression is NaN |
 //! | `W_DERIVED_CMT_TV_ODE` | `[odes]` model with a `[derived]` expression reading `compartments[i]` and subject(s) with time-varying covariates, or individual parameters that read `TIME` (#1855); their compartment states come from first-observation parameters and are approximate |
 //! | `W_DERIVED_CMT_TWIN_ANALYTICAL` | closed-form transit/IG model with a `[derived]` expression reading `compartments[i]` and subject(s) its ODE twin serves (SS or infusion dose, `TIME`-reading parameters, flip-flop); the twin's states are not in the closed form's layout, so the expression is NaN (#1580) |
-//! | `W_DERIVED_CMT_RESET_ANALYTICAL` | a `[derived]` `compartments[i]` read on an analytical model where some subject has an EVID=3/4 reset; those subjects get NaN states and compartment-based integrals |
+//! | `W_DERIVED_CMT_RESET_ANALYTICAL` | a `[derived]` `compartments[i]` read on an analytical model where some subject has an EVID=3/4 reset after its first record (a first-record reset is a no-op, #3094); those subjects get NaN states and compartment-based integrals |
 //! | `W_DERIVED_CMT_ORAL_DEPOT_INFUSION_ANALYTICAL` | a `[derived]` `compartments[i]` read on an analytical model with a dose superposition cannot place (infusion outside central, bolus outside CMT 1); those subjects get NaN states (#400, #375) |
 //! | `W_DERIVED_INIT_ANALYTICAL` | analytical model with an `[initial_conditions]` baseline and a `[derived]` expression reading `compartments[i]`; compartment states are not available, so the expression is NaN (#521) |
 //! | `E_RUV_MAGNITUDE_NONPOSITIVE` | a custom residual-error magnitude (e.g. a `weight = ...` modifier) or a `power(SIGMA, P)` exponent evaluates to zero, negative or non-finite at an observation, at the model's initial θ (#484, #1182); or, raised by `simulate_adaptive*`, at a `Dv` reading's decision (#2741) |
