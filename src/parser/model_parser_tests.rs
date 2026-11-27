@@ -36776,7 +36776,9 @@ fn a_zero_fix_block_goes_whole_and_a_zero_fix_kappa_stays() {
 /// `y` readout; a branch on time, a covariate or θ alone, one in `[derived]`, and an `[odes]`
 /// switch do not. Each mutation reddens its own rows: the predicate stuck at `true` reddens every
 /// negative, stuck at `false` every positive; dropping the dependence test reddens the TIME, WT
-/// and θ rows only; skipping block `if` conditions reddens the block-`if` row only.
+/// and θ rows only; skipping block `if` conditions reddens the block-`if` row only, and not
+/// recursing into an `if` body or an `else` body reddens its nested row only; a taint blind to
+/// κ slots reddens the κ row only.
 #[test]
 fn prediction_has_kink_flags_an_eta_or_state_branch_on_the_prediction_path() {
     let model = |indiv: &str, odes: &str, scaling: &str| {
@@ -36824,7 +36826,33 @@ fn prediction_has_kink_flags_an_eta_or_state_branch_on_the_prediction_path() {
                 ),
                 true,
             ),
-            ("if on TIME", model("  KI = K", decay, "if (TIME > 6) eff else 2 * eff"), false),
+            (
+            "nested block if on η",
+            model(
+                "  if (K > 1) {\n    if (ETA_BASE > 0) {\n      KI = K\n    } else {\n      KI = 2 * K\n    \
+                 }\n  } else {\n    KI = 3 * K\n  }",
+                decay,
+                "eff",
+            ),
+            true,
+        ),
+        (
+            "block if on η inside an else body",
+            model(
+                "  if (K > 1) {\n    KI = K\n  } else {\n    KI = 2 * K\n    if (ETA_BASE > 0) {\n      \
+                 KI = 3 * K\n    }\n  }",
+                decay,
+                "eff",
+            ),
+            true,
+        ),
+        (
+            "a branch on a κ alone",
+            model("  KI = if (KAPPA_TH > 0) K else 2 * K", decay, "eff")
+                .replace("  sigma ADD_ERR", "  kappa KAPPA_TH ~ 0.04\n  sigma ADD_ERR"),
+            true,
+        ),
+        ("if on TIME", model("  KI = K", decay, "if (TIME > 6) eff else 2 * eff"), false),
             ("if on WT", model("  KI = if (WT > 70) K else 2 * K", decay, "eff"), false),
             ("a branch on θ alone", model("  KI = if (K > 1) K else 2 * K", decay, "eff"), false),
             (
