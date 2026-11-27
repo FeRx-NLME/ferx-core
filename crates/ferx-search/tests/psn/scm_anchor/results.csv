@@ -1,0 +1,12 @@
+step,direction,relation,base_ofv,new_ofv,p_value,selected
+1,forward,CL-CRCL,-696.79434,-703.55245,0.009332,true
+1,forward,CL-WT,-696.79434,-703.38740,0.010238,false
+1,forward,V1-CRCL,-696.79434,-697.02773,0.629030,false
+1,forward,V1-WT,-696.79434,-698.37971,0.207990,false
+2,forward,CL-WT,-703.55245,-709.14359,0.018052,true
+2,forward,V1-CRCL,-703.55245,-703.79309,0.623740,false
+2,forward,V1-WT,-703.55245,-705.13444,0.208470,false
+3,forward,V1-CRCL,-709.14359,-709.38002,0.626800,false
+3,forward,V1-WT,-709.14359,-710.72213,0.208970,false
+4,backward,CL-CRCL,-709.14359,-703.38740,0.016431,false
+4,backward,CL-WT,-709.14359,-703.55245,0.018052,false

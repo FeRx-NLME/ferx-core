@@ -189,8 +189,8 @@ dataset (`data/two_cpt_oral_cov.csv`, 30 subjects), the same base model
 (two-compartment oral, η on CL and V1, FOCEI) and the same four test
 relations — `CL` and `V1` against `WT` and `CRCL`, PsN `valid_states = 1,5`
 (none / power) — were run through PsN 5.7.1 with NONMEM 7.6 and through ferx,
-forward then backward at `p = 0.05` in both directions. The inputs and PsN's
-`scmlog.txt` are committed under `crates/ferx-search/tests/psn/scm_anchor/`,
+forward then backward at `p = 0.05` in both directions. The inputs and the
+numbers PsN reported (`results.csv`) are committed under `crates/ferx-search/tests/psn/scm_anchor/`,
 and `tests/covsearch_psn_anchor.rs` replays the comparison.
 
 | step | candidate | NONMEM OFV | ferx OFV | ΔOFV | p | PsN | ferx |

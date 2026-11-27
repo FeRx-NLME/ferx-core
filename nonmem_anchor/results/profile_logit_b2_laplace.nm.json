@@ -1,0 +1,162 @@
+{
+ "nonmem_version": "7.6.0",
+ "data_file": "profile_logit_b2.csv",
+ "data_records": 80,
+ "observations": 80,
+ "individuals": 10,
+ "nmtran_warnings": [2, 87],
+ "markers": [
+  "MINIMIZATION SUCCESSFUL"
+ ],
+ "steps": [
+  {
+   "method": "Laplacian Conditional Estimation with Interaction",
+   "objv": -344.385,
+   "objv_without_constant": -344.3851003184754,
+   "objv_with_constant": -197.35493500572778,
+   "function_evaluations": 1720,
+   "significant_digits": 4.1,
+   "etabar": [
+    [0.00091777]
+   ],
+   "etabar_se": [
+    [0.095343]
+   ],
+   "p_val": [
+    [0.99232]
+   ],
+   "etashrinksd": [
+    [4.5503]
+   ],
+   "etashrinkvr": [
+    [8.8935]
+   ],
+   "ebvshrinksd": [
+    [4.1822]
+   ],
+   "ebvshrinkvr": [
+    [8.1895]
+   ],
+   "relativeinf": [
+    [91.811]
+   ],
+   "epsshrinksd": [
+    [5.8664]
+   ],
+   "epsshrinkvr": [
+    [11.389]
+   ],
+   "final": {
+    "theta": [-0.699, 0.931, -0.243, 0.00307, 0.433, -0.527, 0.3, 0.469, -0.65, 0.205, -0.0217, -0.829, 0.435, 0.114, -0.528, -0.254, 0.11, -0.27, -0.203, 0.412, -0.187, 0.141, 0.0437, -0.298, -0.0911, 0.116, 0.0833, 0.309, -0.52, -0.384, 0.176, 0.692],
+    "omega": {
+     "ETA1": [0.0998]
+    },
+    "sigma": {
+     "EPS1": [0.00363]
+    }
+   },
+   "standard_error": {
+    "theta": [0.11, 0.0614, 0.168, 0.161, 0.163, 0.163, 0.154, 0.161, 0.177, 0.16, 0.163, 0.173, 0.167, 0.159, 0.175, 0.167, 0.16, 0.155, 0.156, 0.167, 0.178, 0.162, 0.166, 0.151, 0.157, 0.158, 0.166, 0.163, 0.189, 0.18, 0.164, 0.17],
+    "omega": {
+     "ETA1": [0.0488]
+    },
+    "sigma": {
+     "EPS1": [0.000613]
+    }
+   },
+   "eigenvalues": [0.288, 0.291, 0.308, 0.313, 0.317, 0.327, 0.327, 0.357, 0.363, 0.386, 0.684, 0.967, 1.02, 1.18, 1.27, 1.29, 1.3, 1.3, 1.3, 1.3, 1.31, 1.31, 1.31, 1.31, 1.34, 1.34, 1.35, 1.36, 1.37, 1.38, 1.38, 1.39, 1.41, 1.54],
+   "markers": [
+    "MINIMIZATION SUCCESSFUL"
+   ]
+  }
+ ],
+ "control_stream_as_run": [
+  "$PROBLEM ferx #2111 anchor B2: bounded proportion, unstructured placebo inside inv_logit, LAPLACE",
+  "$INPUT ID STUDY TIME DV CMT EVID MDV TRT NARM",
+  "$DATA profile_logit_b2.csv IGNORE=@",
+  "$PRED",
+  " TVL  = THETA(1)",
+  " EMAX = THETA(2)",
+  " PLA = 0",
+  " IF (STUDY.EQ.1.AND.TIME.EQ.0) PLA = THETA(3)",
+  " IF (STUDY.EQ.1.AND.TIME.EQ.4) PLA = THETA(4)",
+  " IF (STUDY.EQ.1.AND.TIME.EQ.8) PLA = THETA(5)",
+  " IF (STUDY.EQ.1.AND.TIME.EQ.12) PLA = -(THETA(3)+THETA(4)+THETA(5))",
+  " IF (STUDY.EQ.2.AND.TIME.EQ.0) PLA = THETA(6)",
+  " IF (STUDY.EQ.2.AND.TIME.EQ.4) PLA = THETA(7)",
+  " IF (STUDY.EQ.2.AND.TIME.EQ.8) PLA = THETA(8)",
+  " IF (STUDY.EQ.2.AND.TIME.EQ.12) PLA = -(THETA(6)+THETA(7)+THETA(8))",
+  " IF (STUDY.EQ.3.AND.TIME.EQ.0) PLA = THETA(9)",
+  " IF (STUDY.EQ.3.AND.TIME.EQ.4) PLA = THETA(10)",
+  " IF (STUDY.EQ.3.AND.TIME.EQ.8) PLA = THETA(11)",
+  " IF (STUDY.EQ.3.AND.TIME.EQ.12) PLA = -(THETA(9)+THETA(10)+THETA(11))",
+  " IF (STUDY.EQ.4.AND.TIME.EQ.0) PLA = THETA(12)",
+  " IF (STUDY.EQ.4.AND.TIME.EQ.4) PLA = THETA(13)",
+  " IF (STUDY.EQ.4.AND.TIME.EQ.8) PLA = THETA(14)",
+  " IF (STUDY.EQ.4.AND.TIME.EQ.12) PLA = -(THETA(12)+THETA(13)+THETA(14))",
+  " IF (STUDY.EQ.5.AND.TIME.EQ.0) PLA = THETA(15)",
+  " IF (STUDY.EQ.5.AND.TIME.EQ.4) PLA = THETA(16)",
+  " IF (STUDY.EQ.5.AND.TIME.EQ.8) PLA = THETA(17)",
+  " IF (STUDY.EQ.5.AND.TIME.EQ.12) PLA = -(THETA(15)+THETA(16)+THETA(17))",
+  " IF (STUDY.EQ.6.AND.TIME.EQ.0) PLA = THETA(18)",
+  " IF (STUDY.EQ.6.AND.TIME.EQ.4) PLA = THETA(19)",
+  " IF (STUDY.EQ.6.AND.TIME.EQ.8) PLA = THETA(20)",
+  " IF (STUDY.EQ.6.AND.TIME.EQ.12) PLA = -(THETA(18)+THETA(19)+THETA(20))",
+  " IF (STUDY.EQ.7.AND.TIME.EQ.0) PLA = THETA(21)",
+  " IF (STUDY.EQ.7.AND.TIME.EQ.4) PLA = THETA(22)",
+  " IF (STUDY.EQ.7.AND.TIME.EQ.8) PLA = THETA(23)",
+  " IF (STUDY.EQ.7.AND.TIME.EQ.12) PLA = -(THETA(21)+THETA(22)+THETA(23))",
+  " IF (STUDY.EQ.8.AND.TIME.EQ.0) PLA = THETA(24)",
+  " IF (STUDY.EQ.8.AND.TIME.EQ.4) PLA = THETA(25)",
+  " IF (STUDY.EQ.8.AND.TIME.EQ.8) PLA = THETA(26)",
+  " IF (STUDY.EQ.8.AND.TIME.EQ.12) PLA = -(THETA(24)+THETA(25)+THETA(26))",
+  " IF (STUDY.EQ.9.AND.TIME.EQ.0) PLA = THETA(27)",
+  " IF (STUDY.EQ.9.AND.TIME.EQ.4) PLA = THETA(28)",
+  " IF (STUDY.EQ.9.AND.TIME.EQ.8) PLA = THETA(29)",
+  " IF (STUDY.EQ.9.AND.TIME.EQ.12) PLA = -(THETA(27)+THETA(28)+THETA(29))",
+  " IF (STUDY.EQ.10.AND.TIME.EQ.0) PLA = THETA(30)",
+  " IF (STUDY.EQ.10.AND.TIME.EQ.4) PLA = THETA(31)",
+  " IF (STUDY.EQ.10.AND.TIME.EQ.8) PLA = THETA(32)",
+  " IF (STUDY.EQ.10.AND.TIME.EQ.12) PLA = -(THETA(30)+THETA(31)+THETA(32))",
+  " LP = TVL + PLA + ETA(1) + EMAX * TRT",
+  " IPRED = 1/(1 + EXP(-LP))",
+  " Y = IPRED + EPS(1)",
+  "$THETA",
+  " (-5, -0.3, 5)  ; TVL",
+  " (-5, 0.5, 5)   ; EMAX",
+  " (-10, 0.01, 10)  ; PLACEBO s1 t0",
+  " (-10, 0.01, 10)  ; PLACEBO s1 t4",
+  " (-10, 0.01, 10)  ; PLACEBO s1 t8",
+  " (-10, 0.01, 10)  ; PLACEBO s2 t0",
+  " (-10, 0.01, 10)  ; PLACEBO s2 t4",
+  " (-10, 0.01, 10)  ; PLACEBO s2 t8",
+  " (-10, 0.01, 10)  ; PLACEBO s3 t0",
+  " (-10, 0.01, 10)  ; PLACEBO s3 t4",
+  " (-10, 0.01, 10)  ; PLACEBO s3 t8",
+  " (-10, 0.01, 10)  ; PLACEBO s4 t0",
+  " (-10, 0.01, 10)  ; PLACEBO s4 t4",
+  " (-10, 0.01, 10)  ; PLACEBO s4 t8",
+  " (-10, 0.01, 10)  ; PLACEBO s5 t0",
+  " (-10, 0.01, 10)  ; PLACEBO s5 t4",
+  " (-10, 0.01, 10)  ; PLACEBO s5 t8",
+  " (-10, 0.01, 10)  ; PLACEBO s6 t0",
+  " (-10, 0.01, 10)  ; PLACEBO s6 t4",
+  " (-10, 0.01, 10)  ; PLACEBO s6 t8",
+  " (-10, 0.01, 10)  ; PLACEBO s7 t0",
+  " (-10, 0.01, 10)  ; PLACEBO s7 t4",
+  " (-10, 0.01, 10)  ; PLACEBO s7 t8",
+  " (-10, 0.01, 10)  ; PLACEBO s8 t0",
+  " (-10, 0.01, 10)  ; PLACEBO s8 t4",
+  " (-10, 0.01, 10)  ; PLACEBO s8 t8",
+  " (-10, 0.01, 10)  ; PLACEBO s9 t0",
+  " (-10, 0.01, 10)  ; PLACEBO s9 t4",
+  " (-10, 0.01, 10)  ; PLACEBO s9 t8",
+  " (-10, 0.01, 10)  ; PLACEBO s10 t0",
+  " (-10, 0.01, 10)  ; PLACEBO s10 t4",
+  " (-10, 0.01, 10)  ; PLACEBO s10 t8",
+  "$OMEGA 0.25",
+  "$SIGMA 0.0064",
+  "$ESTIMATION METHOD=1 LAPLACE INTER MAXEVAL=9999 PRINT=5 NOABORT SIGL=12 NSIG=4 FORMAT=s1PE23.16",
+  "$COVARIANCE PRINT=E UNCONDITIONAL MATRIX=R SIGL=12"
+ ]
+}

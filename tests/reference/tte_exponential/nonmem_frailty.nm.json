@@ -1,0 +1,126 @@
+{
+ "nonmem_version": "7.6.0",
+ "data_file": "tte_exp.csv",
+ "data_records": 100,
+ "observations": 100,
+ "individuals": 100,
+ "nmtran_warnings": [2, 3],
+ "markers": [
+  "MINIMIZATION SUCCESSFUL"
+ ],
+ "steps": [
+  {
+   "method": "Laplacian Conditional Estimation with Interaction",
+   "objv": 588.931,
+   "objv_without_constant": 588.9311208796771,
+   "objv_with_constant": 588.9311208796771,
+   "function_evaluations": 35,
+   "significant_digits": 3.1,
+   "etabar": [
+    [0.018748]
+   ],
+   "etabar_se": [
+    [0.021208]
+   ],
+   "p_val": [
+    [0.3767]
+   ],
+   "etashrinksd": [
+    [60.191]
+   ],
+   "etashrinkvr": [
+    [84.153]
+   ],
+   "ebvshrinksd": [
+    [59.061]
+   ],
+   "ebvshrinkvr": [
+    [83.24]
+   ],
+   "relativeinf": [
+    [16.76]
+   ],
+   "epsshrinksd": [
+    [100.0]
+   ],
+   "epsshrinkvr": [
+    [100.0]
+   ],
+   "final": {
+    "theta": [-2.56],
+    "omega": {
+     "ETA1": [0.286]
+    },
+    "sigma": {
+     "EPS1": [1.0]
+    }
+   },
+   "standard_error": {
+    "theta": [0.126],
+    "omega": {
+     "ETA1": [0.16]
+    },
+    "sigma": {
+     "EPS1": [null]
+    }
+   },
+   "covariance": {
+    "TH 1": [0.0159],
+    "OM11": [0.00334, 0.0257],
+    "SG11": [null, null, null]
+   },
+   "eigenvalues": [0.835, 1.17],
+   "markers": [
+    "MINIMIZATION SUCCESSFUL"
+   ]
+  }
+ ],
+ "control_stream_as_run": [
+  "$PROBLEM    TTE Exponential (FRAILTY) \u2013 Phase 1 ferx validation",
+  "; Mixed-effects (frailty) fit via CONDITIONAL LAPLACIAN INTERACTION; fills the",
+  "",
+  "; \"NONMEM LAPLACIAN\" column of expected.md.",
+  "",
+  ";",
+  "",
+  "; KEY for F_FLAG=1 likelihood models: a dummy **$SIGMA 1 FIX is REQUIRED**. Without an",
+  "",
+  "; EPS/residual level, NM-TRAN infers the data are single-subject and rejects",
+  "",
+  "; CONDITIONAL/LAPLACIAN (\"350 METHOD=CONDITIONAL INVALID WITH SINGLE-SUBJECT DATA\").",
+  "",
+  "; The dummy gives NONMEM a residual-error level so the run is treated as population",
+  "",
+  "; data; it is fixed and unreferenced, so it does NOT affect the likelihood. (This \u2014",
+  "",
+  "; not records-per-subject \u2014 was the real blocker; the data is the plain 1-row/subject",
+  "",
+  "; file the other tools fit.)",
+  "",
+  ";",
+  "",
+  "; Also: HAZNOW (not the reserved $PRED name H); $TABLE without IPRED/PRED (undefined for",
+  "",
+  "; F_FLAG=1); IGNORE=@ (skip the header); NUMERICAL SLOW on $EST + SLOW on $COV (NONMEM",
+  "",
+  "; requires these with LAPLACIAN INTERACTION \u2014 given explicitly to silence the warning).",
+  "$INPUT      ID TIME DV EVID CMT MDV",
+  "$DATA      tte_exp.csv IGNORE=@",
+  "$PRED",
+  "  LAMBDA = EXP(THETA(1) + ETA(1))",
+  "  CHZ    = LAMBDA * TIME        ; H(t) = lambda * t  (Exponential)",
+  "  HAZNOW = LAMBDA               ; h(t) = lambda  (do NOT name this H \u2014 reserved $PRED arg)",
+  "  F_FLAG = 1",
+  "  IF (DV.EQ.0) Y = EXP(-CHZ)            ; right-censored: S(T)",
+  "  IF (DV.EQ.1) Y = HAZNOW * EXP(-CHZ)   ; exact event:    h(T)*S(T)",
+  "  DUMMY = EPS(1)",
+  "",
+  "$THETA  (-10,-2.3,5) ; log(lambda): init log(0.1) = -2.303",
+  "$OMEGA  0.25  ; var(eta.lambda): ESTIMATED frailty, init 0.25",
+  "$SIGMA  1  FIX  ; dummy EPS \u2014 required so NONMEM treats this as population data",
+  "$ESTIMATION METHOD=COND LAPLACIAN INTERACTION NUMERICAL SLOW",
+  "            MAXEVAL=9999 PRINT=5 NOABORT",
+  "$COVARIANCE PRINT=E SLOW",
+  "$TABLE      ID TIME DV NOPRINT NOAPPEND FILE=tte_exp_frailty.sdtab"
+ ]
+}

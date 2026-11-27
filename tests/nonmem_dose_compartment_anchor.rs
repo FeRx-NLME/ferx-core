@@ -9,8 +9,8 @@
 //! The control streams are one `$PROBLEM` per case, `ADVAN{1,2,3,4,11,12}` with
 //! `TRANS2`/`TRANS4`, differing only in the dose record's `CMT` (and `SS`/`II`
 //! or `RATE` where noted). The control streams, their matched datasets, and the
-//! verbatim NONMEM output are committed under `nonmem_anchor/` as
-//! `dose_cmt_*.{ctl,csv}` and `nonmem_anchor/results/dose_cmt_*.{lst,tab}`, so
+//! extracted NONMEM numbers and tables are committed under `nonmem_anchor/` as
+//! `dose_cmt_*.{ctl,csv}` and `nonmem_anchor/results/dose_cmt_*.{nm.json,tab}`, so
 //! every number below can be re-derived rather than taken on trust — they were
 //! re-run end-to-end on NONMEM 7.6.0 and reproduce at zero relative deviation.
 //! See `nonmem_anchor/README.md` for the case table.

@@ -1,0 +1,110 @@
+{
+ "nonmem_version": "7.5.1",
+ "data_file": "reset_clock_tte.csv",
+ "data_records": 640,
+ "observations": 520,
+ "individuals": 40,
+ "nmtran_warnings": [2, 66],
+ "markers": [
+  "MINIMIZATION SUCCESSFUL",
+  "PROBLEMS OCCURRED WITH THE MINIMIZATION"
+ ],
+ "steps": [
+  {
+   "method": "Laplacian Conditional Estimation with Interaction",
+   "objv": -113.991,
+   "objv_without_constant": -113.99094167098768,
+   "objv_with_constant": 768.1900502054981,
+   "function_evaluations": 84,
+   "significant_digits": 3.6,
+   "etabar": [
+    [-0.0036701]
+   ],
+   "etabar_se": [
+    [0.033394]
+   ],
+   "p_val": [
+    [0.91249]
+   ],
+   "etashrinksd": [
+    [28.947]
+   ],
+   "etashrinkvr": [
+    [49.515]
+   ],
+   "ebvshrinksd": [
+    [0.41189]
+   ],
+   "ebvshrinkvr": [
+    [0.82208]
+   ],
+   "relativeinf": [
+    [99.178]
+   ],
+   "epsshrinksd": [
+    [6.1074]
+   ],
+   "epsshrinkvr": [
+    [11.842]
+   ],
+   "final": {
+    "theta": [0.99, 9.87, 0.0198, 0.149, 0.0418],
+    "omega": {
+     "ETA1": [0.0884]
+    },
+    "sigma": {
+     "EPS1": [0.00997]
+    }
+   },
+   "markers": [
+    "MINIMIZATION SUCCESSFUL",
+    "PROBLEMS OCCURRED WITH THE MINIMIZATION"
+   ]
+  }
+ ],
+ "control_stream_as_run": [
+  "$PROBLEM #1978 reset clock: a joint PK-TTE hazard reading T/TIME after an EVID=4 restart (written)",
+  "; Period 1 is PK only; period 2 opens with an EVID=4 dose at TIME 0 and carries one TTE",
+  "; record on CMT 2. The Gompertz term exp(GAM*T) is read by $DES (integrated into the",
+  "; cumulative hazard) and exp(GAM*TIME) by $ERROR (the hazard at an exact event).",
+  "; ADVAN6, not ADVAN13: in the image these were measured with, ADVAN13 aborts with",
+  "; `ERROR IN LSODA: CODE -3` on the first record whenever an ETA is live (the committed",
+  "; evid_reset_lag_advan13.ctl does too once its $OMEGA is unfixed). T in $DES is passed",
+  "; by PREDPP, not by the solver; ADVAN14 (CVODES) gives the same OBJ to <= 2e-5 on every arm.",
+  "$INPUT ID TIME DV AMT EVID CMT MDV",
+  "$DATA reset_clock_tte.csv IGNORE=@",
+  "$SUBROUTINE ADVAN6 TOL=10",
+  "$MODEL COMP=(CENTRAL,DEFDOSE) COMP=(CHZ)",
+  "$PK",
+  "  CL   = THETA(1)*EXP(ETA(1))",
+  "  V    = THETA(2)",
+  "  H0   = THETA(3)",
+  "  BETA = THETA(4)",
+  "  GAM  = THETA(5)",
+  "$DES",
+  "  DADT(1) = -CL/V*A(1)",
+  "  DADT(2) = H0*EXP(GAM*T)*EXP(BETA*A(1)/V)",
+  "$ERROR",
+  "  CONC = A(1)/V",
+  "  HAZ  = H0*EXP(GAM*TIME)*EXP(BETA*CONC)",
+  "  CHZ  = A(2)",
+  "  SUR  = EXP(-CHZ)",
+  "  IPRED = CONC",
+  "  F_FLAG = 0",
+  "  IF (CMT.EQ.2) F_FLAG = 1",
+  "  Y = IPRED*(1 + EPS(1))",
+  "  IF (CMT.EQ.2.AND.DV.EQ.1) Y = SUR*HAZ",
+  "  IF (CMT.EQ.2.AND.DV.EQ.0) Y = SUR",
+  "$THETA",
+  "  (0.01, 1.0, 100)   ; TVCL",
+  "  (0.1, 10.0, 500)   ; TVV",
+  "  (0.0001, 0.02, 10) ; H0",
+  "  (-5, 0.15, 5)      ; BETA",
+  "  (-1, 0.05, 1)      ; GAM",
+  "$OMEGA 0.09",
+  "$SIGMA 0.01",
+  "$ESTIMATION METHOD=1 LAPLACE INTER MAXEVAL=9999 PRINT=5 NOABORT FORMAT=s1PE23.16",
+  "$TABLE ID TIME CMT EVID DV IPRED CHZ HAZ ETA1 NOPRINT ONEHEADER NOAPPEND FORMAT=s1PE23.16",
+  "       FILE=reset_clock_tte.tab"
+ ]
+}

@@ -13,7 +13,7 @@
 //! 4× spread in κ's effective SD, so a scaling applied wrongly (`/N` instead of
 //! `/√N`) or not at all cannot pass as a rounding difference.
 //!
-//! ## Reference values (`tests/nonmem/kappa_weight_iov.{ctl,lst,ext}`)
+//! ## Reference values (`tests/nonmem/kappa_weight_iov.{ctl,nm.json,ext}`)
 //!
 //! Converged FOCE fits from the same starting values:
 //!

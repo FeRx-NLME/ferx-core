@@ -1,0 +1,111 @@
+{
+ "nonmem_version": "7.5.1",
+ "data_file": "block_sigma_iov.csv",
+ "data_records": 1080,
+ "observations": 960,
+ "individuals": 40,
+ "nmtran_warnings": [2],
+ "markers": [
+  "MINIMIZATION TERMINATED",
+  "ROUNDING ERRORS"
+ ],
+ "steps": [
+  {
+   "method": "First Order Conditional Estimation with Interaction",
+   "objv": 250.401,
+   "objv_without_constant": 250.4011272062206,
+   "objv_with_constant": 2014.763110959192,
+   "function_evaluations": 2258,
+   "significant_digits": 0.6,
+   "etabar": [
+    [0.0015354, -0.029857, 0.063513, -0.033169]
+   ],
+   "etabar_se": [
+    [0.049726, 0.020747, 0.025121, 0.022049]
+   ],
+   "p_val": [
+    [0.97537, 0.15011, 0.011462, 0.13249]
+   ],
+   "etashrinksd": [
+    [5.3443, 29.903, 15.122, 25.503]
+   ],
+   "etashrinkvr": [
+    [10.403, 50.863, 27.957, 44.502]
+   ],
+   "ebvshrinksd": [
+    [5.1627, 19.371, 19.472, 19.354]
+   ],
+   "ebvshrinkvr": [
+    [10.059, 34.99, 35.153, 34.963]
+   ],
+   "relativeinf": [
+    [1e-10, 1e-10, 1e-10, 1e-10]
+   ],
+   "epsshrinksd": [
+    [5.6365, 5.6365]
+   ],
+   "epsshrinkvr": [
+    [10.955, 10.955]
+   ],
+   "final": {
+    "theta": [0.978, 9.97],
+    "omega": {
+     "ETA1": [0.11],
+     "ETA2": [0.0, 0.035],
+     "ETA3": [0.0, 0.0, 0.035],
+     "ETA4": [0.0, 0.0, 0.0, 0.035]
+    },
+    "sigma": {
+     "EPS1": [0.012],
+     "EPS2": [0.0143, 0.0446]
+    }
+   },
+   "markers": [
+    "MINIMIZATION TERMINATED",
+    "ROUNDING ERRORS"
+   ]
+  }
+ ],
+ "control_stream_as_run": [
+  "$PROBLEM block_sigma x IOV: total/unbound pair correlated via L2, kappa on CL (ferx #979)",
+  "; Twin of block_sigma_iov.ferx on block_sigma_iov.csv (simulate_block_sigma_iov_data.py).",
+  "; Each sample is a total (FREE = 0) / unbound (FREE = 1) pair sharing an L2 id;",
+  "; EPS(1) acts on the total row, EPS(2) on the unbound row, and $SIGMA BLOCK(2)",
+  "; correlates them across the pair. Three occasions, a dose opening each, so",
+  "; occasions 2 and 3 start on residual drug (the kappa boundary is live).",
+  "$INPUT ID TIME DV EVID AMT CMT MDV OCC FREE L2",
+  "$DATA block_sigma_iov.csv IGNORE=@",
+  "$SUBROUTINES ADVAN1 TRANS2",
+  "",
+  "$PK",
+  "  OCC1 = 0",
+  "  OCC2 = 0",
+  "  OCC3 = 0",
+  "  IF(OCC.EQ.1) OCC1 = 1",
+  "  IF(OCC.EQ.2) OCC2 = 1",
+  "  IF(OCC.EQ.3) OCC3 = 1",
+  "  KAPPA = OCC1*ETA(2) + OCC2*ETA(3) + OCC3*ETA(4)",
+  "  CL = THETA(1)*EXP(ETA(1) + KAPPA)",
+  "  V  = THETA(2)",
+  "  S1 = V",
+  "",
+  "$ERROR",
+  "  IPRED = F",
+  "  Y = F + F*((1 - FREE)*EPS(1) + FREE*EPS(2))",
+  "",
+  "$THETA",
+  "  (0.1, 1.2, 10)     ; TVCL",
+  "  (1, 12, 100)       ; TVV",
+  "",
+  "$OMEGA 0.1                ; ETA_CL",
+  "$OMEGA BLOCK(1) 0.03      ; KAPPA_CL occasion 1",
+  "$OMEGA BLOCK(1) SAME      ; occasion 2",
+  "$OMEGA BLOCK(1) SAME      ; occasion 3",
+  "",
+  "$SIGMA BLOCK(2) 0.0144 0.006 0.0324   ; PROP_TOTAL, PROP_UNBOUND (rho = 0.2778)",
+  "",
+  "$ESTIMATION METHOD=1 INTER MAXEVAL=9999 NSIG=3 SIGL=9 PRINT=5 NOABORT",
+  "$TABLE ID TIME OCC ETA1 ETA2 ETA3 ETA4 FIRSTONLY NOAPPEND NOPRINT ONEHEADER",
+  "       FORMAT=s1PE23.16 FILE=block_sigma_iov.tab"
+ ]
+}
