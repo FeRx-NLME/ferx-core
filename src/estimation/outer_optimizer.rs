@@ -1151,7 +1151,7 @@ pub fn optimize_population_warm(
 /// Before #3153, SLSQP was capped (gradient only) on every evaluation of every leg; now a
 /// verification, polish or basin-shift restart leg runs it uncapped, at `H = I`, on the raw
 /// gradient. L-BFGS legs were already uncapped past the first (#960), so they are unchanged.
-/// Whether to re-arm `c` for every leg, on both algorithms, is a design question (#____)
+/// Whether to re-arm `c` for every leg, on both algorithms, is a design question (#3198)
 /// outside this fix's scope: it changes the step every later leg takes, not only the first.
 pub(crate) fn cap_factor(g: &[f64], lower_s: &[f64], upper_s: &[f64]) -> f64 {
     debug_assert_eq!(g.len(), lower_s.len());
