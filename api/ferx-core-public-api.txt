@@ -30,7 +30,7 @@ pub ferx_core::api::AdaptiveSummaryMetric::SignalMax
 pub ferx_core::api::AdaptiveSummaryMetric::SignalMean
 pub ferx_core::api::AdaptiveSummaryMetric::SignalMin
 impl ferx_core::AdaptiveSummaryMetric
-pub const ferx_core::AdaptiveSummaryMetric::SCALARS: [ferx_core::AdaptiveSummaryMetric; 12]
+pub const ferx_core::AdaptiveSummaryMetric::SCALARS: &'static [ferx_core::AdaptiveSummaryMetric]
 pub fn ferx_core::AdaptiveSummaryMetric::from_label(label: &str) -> core::option::Option<Self>
 pub fn ferx_core::AdaptiveSummaryMetric::label(&self) -> &'static str
 #[non_exhaustive] pub enum ferx_core::api::AdaptiveSummaryStatistic
@@ -4254,7 +4254,7 @@ pub ferx_core::AdaptiveSummaryMetric::SignalMax
 pub ferx_core::AdaptiveSummaryMetric::SignalMean
 pub ferx_core::AdaptiveSummaryMetric::SignalMin
 impl ferx_core::AdaptiveSummaryMetric
-pub const ferx_core::AdaptiveSummaryMetric::SCALARS: [ferx_core::AdaptiveSummaryMetric; 12]
+pub const ferx_core::AdaptiveSummaryMetric::SCALARS: &'static [ferx_core::AdaptiveSummaryMetric]
 pub fn ferx_core::AdaptiveSummaryMetric::from_label(label: &str) -> core::option::Option<Self>
 pub fn ferx_core::AdaptiveSummaryMetric::label(&self) -> &'static str
 #[non_exhaustive] pub enum ferx_core::AdaptiveSummaryStatistic

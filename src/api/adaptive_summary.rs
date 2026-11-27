@@ -74,8 +74,8 @@ pub enum AdaptiveSummaryMetric {
 
 impl AdaptiveSummaryMetric {
     /// The scalar metrics (every variant but `Signal`), in output order: every one gets
-    /// rows, present or not.
-    pub const SCALARS: [AdaptiveSummaryMetric; 12] = [
+    /// rows, present or not. A slice, so adding a metric does not change its type.
+    pub const SCALARS: &'static [AdaptiveSummaryMetric] = &[
         AdaptiveSummaryMetric::CumulativeDose,
         AdaptiveSummaryMetric::NDoses,
         AdaptiveSummaryMetric::NIncreases,
@@ -116,7 +116,7 @@ impl AdaptiveSummaryMetric {
     /// The scalar metric whose [`label`](Self::label) is `label`; `None` otherwise,
     /// including `"SIGNAL"`, which needs an analyte and a decision to name one metric.
     pub fn from_label(label: &str) -> Option<Self> {
-        Self::SCALARS.into_iter().find(|m| m.label() == label)
+        Self::SCALARS.iter().find(|m| m.label() == label).cloned()
     }
 
     /// The label, with the analyte and decision of a `Signal`: for messages.
