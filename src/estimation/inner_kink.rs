@@ -2,7 +2,8 @@
 //!
 //! A prediction clipped at a threshold (`y = if (x − TH < 0) 0 else x − TH`) puts a kink in the
 //! individual objective wherever a record crosses it. Two things go wrong there, and each has
-//! its own remedy here:
+//! its own remedy here, both behind `[fit_options] inner_kick` (a smooth ODE objective can
+//! stall at a large gradient too, where the escape's moves made a BOBYQA fit non-smooth):
 //!
 //! * **A stall at a kink** ([`stall_escape`]). BFGS arrives on the kink's valley floor, where the
 //!   gradient is large and points *across* the valley, every step along it raises the objective

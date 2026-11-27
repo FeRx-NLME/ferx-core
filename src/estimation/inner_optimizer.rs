@@ -3353,7 +3353,9 @@ fn find_ebe_solve(
             stop_precond,
             &stall_at,
             short_line_search,
-            use_analytic,
+            // The stall escape rides on `inner_kick` (#3159 land): on by default it fired 390
+            // times in a smooth transit fit, and the EBEs it moved broke BOBYQA's convergence.
+            use_analytic && policy.kick,
         )
     };
 
@@ -4505,7 +4507,8 @@ fn find_ebe_iov_seeded(
         None,
         &stall_at,
         false,
-        analytic_iov_inner,
+        // The stall escape rides on `inner_kick`, as in `find_ebe_solve` (#3159 land).
+        analytic_iov_inner && kick,
     );
     // On BFGS failure, recover exactly as the non-IOV `find_ebe` does (cold seed = prior
     // mode `bsv_psi = μ`, κ = 0): keep the lower-objective of {BFGS partial, NM restart}
@@ -6983,7 +6986,7 @@ fn lbfgs_run(
             // the same solver noise `enable_stall` exists to tolerate — a model with no kink,
             // forced to `gradient = fd`, moved OFV -442.3578 to -438.8685 on a measured
             // example before this gate (#3159 review). `allow_kink_escape` is the caller's
-            // `analytic_inner_grad_supported` / `analytic_iov_inner_supported` verdict.
+            // `analytic_inner_grad_supported` / `analytic_iov_inner_supported` verdict, and `inner_kick`.
             if allow_kink_escape && escapes < kink::MAX_STALL_ESCAPES {
                 escapes += 1;
                 if let Some(e) = kink::stall_escape(obj, grad, x, f_cur, &g) {
@@ -7328,7 +7331,7 @@ fn dense_bfgs_run(
             // the same solver noise `enable_stall` exists to tolerate — a model with no kink,
             // forced to `gradient = fd`, moved OFV -442.3578 to -438.8685 on a measured
             // example before this gate (#3159 review). `allow_kink_escape` is the caller's
-            // `analytic_inner_grad_supported` / `analytic_iov_inner_supported` verdict.
+            // `analytic_inner_grad_supported` / `analytic_iov_inner_supported` verdict, and `inner_kick`.
             if allow_kink_escape && escapes < kink::MAX_STALL_ESCAPES {
                 escapes += 1;
                 if let Some(e) = kink::stall_escape(obj, grad, x, f_cur, &g) {

@@ -9637,7 +9637,9 @@ pub struct FitOptions {
     /// kick too: kicked in the final pass only, the #833 recovery reported the search's unkicked
     /// EBEs, which score lower on OFV. The kicks run whether or not the model has a kink
     /// (measured 2-20× on four fast ODE examples without one), so turn it on only for a model
-    /// with a clipped or thresholded prediction.
+    /// with a clipped or thresholded prediction. It also turns on the stall escape: a stall at
+    /// ‖∇‖ ≥ 1 is checked by gradient sampling, and left along the valley when the sampled
+    /// gradients' hull excludes zero (off by default: a smooth ODE objective stalls there too).
     pub inner_kick: bool,
     /// Size of the inner multi-start's quasi-random screen (`[fit_options] inner_screen`,
     /// default `100`; set `0` to disable, #2013). Runs inside the cold multi-start
