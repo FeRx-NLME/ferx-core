@@ -11109,6 +11109,9 @@ fn parse_adaptive_dosing_block(
         auc_target,
         rules,
     };
+    if spec.rules.is_empty() {
+        return Err(crate::sim::adaptive::NO_RULES.to_string());
+    }
     spec.validate()?;
     if let (Some(step), Some(ladder)) = (at_step, &spec.intervals) {
         check_intervals_on_every_grid(ladder, step)?;

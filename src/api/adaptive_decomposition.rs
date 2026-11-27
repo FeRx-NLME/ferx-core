@@ -160,16 +160,10 @@ pub struct AdaptiveDecompositionSkip {
 /// within-cell sum of squares, `sss` the between-sim sum of squares inside the unit
 /// (`R·Σ_s (m_s − m)²`; 0 for a sim unit, which is one cell), `mean` the unit mean.
 #[derive(Clone, Copy)]
-struct Unit {
+pub(super) struct Unit {
     sse: f64,
     sss: f64,
     mean: f64,
-}
-
-/// One subject's metric: its outer units, and whether its η was supplied.
-struct Cube {
-    units: Vec<Unit>,
-    supplied: bool,
 }
 
 /// The outer units of `y`, stored `y[(d·S + s)·R + r]`.
@@ -308,99 +302,191 @@ fn identifiability(d: usize, s: usize, r: usize, uncertain: bool) -> Result<(), 
 pub fn decompose_adaptive(
     result: &AdaptiveSimulationResult,
 ) -> Result<AdaptiveDecomposition, EngineError> {
-    let refuse =
-        |msg: String| crate::entry_refusals::adaptive_options(format!("decompose_adaptive: {msg}"));
-    if result.metrics.is_empty() {
-        return Err(refuse("the result has no metrics rows to decompose".to_string()));
-    }
-    let uncertain = !result.parameters.is_empty();
-    let d = result.parameters.len().max(1);
-    let s = result.metrics.iter().map(|m| m.sim).max().unwrap_or(0);
-    let r = result.metrics.iter().map(|m| m.rep).max().unwrap_or(0);
-    identifiability(d, s, r, uncertain).map_err(refuse)?;
-    let dims = (d, s, r);
-    let n_runs = d * s * r;
-    let unbalanced = |detail: String| {
-        refuse(format!(
-            "the rows are not one balanced set of {d} draw(s) × {s} sim(s) × {r} rep(s) per \
-             subject: {detail}"
-        ))
-    };
-    let index = |k: &RunKey<'_>| ((k.draw - 1) * s + (k.sim - 1)) * r + (k.rep - 1);
-
-    // Subjects in first-seen order, each with whether its η was supplied, and a balance
-    // check: every subject has each (draw, sim, rep) exactly once.
-    let mut subjects: Vec<(&str, bool)> = Vec::new();
-    let mut runs_of: BTreeMap<&str, usize> = BTreeMap::new();
-    let mut seen: BTreeSet<RunKey<'_>> = BTreeSet::new();
-    for m in &result.metrics {
-        let k = RunKey { subject: &m.subject, draw: m.draw, sim: m.sim, rep: m.rep };
-        if k.draw == 0 || k.draw > d || k.sim == 0 || k.rep == 0 || !seen.insert(k) {
-            return Err(unbalanced(format!(
-                "subject '{}' (draw {}, sim {}, rep {}) is out of range or repeated",
-                k.subject, k.draw, k.sim, k.rep
-            )));
-        }
-        let runs = runs_of.entry(&m.subject).or_insert(0);
-        if *runs == 0 {
-            subjects.push((&m.subject, m.eta_supplied));
-        }
-        *runs += 1;
-    }
-    if let Some((id, runs)) =
-        subjects.iter().map(|(id, _)| (id, runs_of[id])).find(|&(_, n)| n != n_runs)
-    {
-        return Err(unbalanced(format!("subject '{id}' has {runs} of {n_runs} runs")));
-    }
-
-    // Each (metric, subject)'s values in cube order; `None` marks a run without the metric.
-    let mut values: BTreeMap<AdaptiveSummaryMetric, BTreeMap<&str, Vec<Option<f64>>>> =
-        BTreeMap::new();
-    for (k, metric, v) in run_values(result) {
-        if !seen.contains(&k) {
-            return Err(unbalanced(format!(
-                "a decision of subject '{}' (draw {}, sim {}, rep {}) has no metrics row",
-                k.subject, k.draw, k.sim, k.rep
-            )));
-        }
-        let cube = values
-            .entry(metric)
-            .or_default()
-            .entry(k.subject)
-            .or_insert_with(|| vec![None; n_runs]);
-        cube[index(&k)] = Some(v);
-    }
-
-    let mut out = AdaptiveDecomposition {
-        n_draws: d,
-        n_sims: s,
-        n_reps: r,
-        components: Vec::new(),
-        skipped: Vec::new(),
-    };
-    for (metric, by_subject) in &values {
-        let mut cubes: Vec<(&str, Cube)> = Vec::new();
-        for &(id, supplied) in &subjects {
-            let slots = by_subject.get(id).map_or(&[][..], Vec::as_slice);
-            let present: Option<Vec<f64>> = slots.iter().copied().collect();
-            match present.filter(|y| y.len() == n_runs) {
-                Some(y) => cubes.push((id, Cube { units: units_of(&y, dims), supplied })),
-                None => out.skipped.push(AdaptiveDecompositionSkip {
-                    metric: metric.clone(),
-                    subject: id.to_string(),
-                    n_missing: n_runs - slots.iter().flatten().count(),
-                }),
-            }
-        }
-        push_metric(&mut out.components, metric, &cubes, dims);
-    }
-    Ok(out)
+    Ok(Design::of(result, "decompose_adaptive")?.decompose())
 }
 
-/// Every component row of one metric: each subject's layers, then the population's.
-fn push_metric(
+/// One result's balanced `D × S × R` design: its subjects in population order, each with
+/// whether its η was supplied, and each `(metric, subject)`'s values in cube order (`None`
+/// marks a run without the metric). Shared by [`decompose_adaptive`] and both arms of
+/// [`super::decompose_contrast`].
+pub(super) struct Design<'a> {
+    pub(super) dims: (usize, usize, usize),
+    pub(super) subjects: Vec<(&'a str, bool)>,
+    values: BTreeMap<AdaptiveSummaryMetric, BTreeMap<&'a str, Vec<Option<f64>>>>,
+}
+
+impl<'a> Design<'a> {
+    /// The design of `result`, refused (each message prefixed with `who`) when it cannot
+    /// separate a layer or its rows are not one balanced set.
+    pub(super) fn of(result: &'a AdaptiveSimulationResult, who: &str) -> Result<Self, EngineError> {
+        let refuse = |msg: String| crate::entry_refusals::adaptive_options(format!("{who}: {msg}"));
+        if result.metrics.is_empty() {
+            return Err(refuse("the result has no metrics rows to decompose".to_string()));
+        }
+        let uncertain = !result.parameters.is_empty();
+        let d = result.parameters.len().max(1);
+        let s = result.metrics.iter().map(|m| m.sim).max().unwrap_or(0);
+        let r = result.metrics.iter().map(|m| m.rep).max().unwrap_or(0);
+        identifiability(d, s, r, uncertain).map_err(refuse)?;
+        let n_runs = d * s * r;
+        let unbalanced = |detail: String| {
+            refuse(format!(
+                "the rows are not one balanced set of {d} draw(s) × {s} sim(s) × {r} rep(s) \
+                 per subject: {detail}"
+            ))
+        };
+        let index = |k: &RunKey<'_>| ((k.draw - 1) * s + (k.sim - 1)) * r + (k.rep - 1);
+
+        // Subjects in first-seen order, each with whether its η was supplied, and a balance
+        // check: every subject has each (draw, sim, rep) exactly once.
+        let mut subjects: Vec<(&str, bool)> = Vec::new();
+        let mut runs_of: BTreeMap<&str, usize> = BTreeMap::new();
+        let mut seen: BTreeSet<RunKey<'_>> = BTreeSet::new();
+        for m in &result.metrics {
+            let k = RunKey { subject: &m.subject, draw: m.draw, sim: m.sim, rep: m.rep };
+            if k.draw == 0 || k.draw > d || k.sim == 0 || k.rep == 0 || !seen.insert(k) {
+                return Err(unbalanced(format!(
+                    "subject '{}' (draw {}, sim {}, rep {}) is out of range or repeated",
+                    k.subject, k.draw, k.sim, k.rep
+                )));
+            }
+            let runs = runs_of.entry(&m.subject).or_insert(0);
+            if *runs == 0 {
+                subjects.push((&m.subject, m.eta_supplied));
+            }
+            *runs += 1;
+        }
+        if let Some((id, runs)) =
+            subjects.iter().map(|(id, _)| (id, runs_of[id])).find(|&(_, n)| n != n_runs)
+        {
+            return Err(unbalanced(format!("subject '{id}' has {runs} of {n_runs} runs")));
+        }
+
+        let mut values: BTreeMap<AdaptiveSummaryMetric, BTreeMap<&str, Vec<Option<f64>>>> =
+            BTreeMap::new();
+        for (k, metric, v) in run_values(result) {
+            if !seen.contains(&k) {
+                return Err(unbalanced(format!(
+                    "a decision of subject '{}' (draw {}, sim {}, rep {}) has no metrics row",
+                    k.subject, k.draw, k.sim, k.rep
+                )));
+            }
+            let cube = values
+                .entry(metric)
+                .or_default()
+                .entry(k.subject)
+                .or_insert_with(|| vec![None; n_runs]);
+            cube[index(&k)] = Some(v);
+        }
+        Ok(Design { dims: (d, s, r), subjects, values })
+    }
+
+    pub(super) fn n_runs(&self) -> usize {
+        let (d, s, r) = self.dims;
+        d * s * r
+    }
+
+    /// The metrics some run carries.
+    pub(super) fn metrics(&self) -> impl Iterator<Item = &AdaptiveSummaryMetric> {
+        self.values.keys()
+    }
+
+    /// `metric`'s values for subject `id` in cube order; empty when no run carries it.
+    pub(super) fn slots(&self, metric: &AdaptiveSummaryMetric, id: &str) -> &[Option<f64>] {
+        self.values.get(metric).and_then(|m| m.get(id)).map_or(&[][..], Vec::as_slice)
+    }
+
+    /// Subject `id`'s outer units of `metric`, or `None` when some run does not carry it.
+    pub(super) fn units(&self, metric: &AdaptiveSummaryMetric, id: &str) -> Option<Vec<Unit>> {
+        let present: Option<Vec<f64>> = self.slots(metric, id).iter().copied().collect();
+        present.filter(|y| y.len() == self.n_runs()).map(|y| units_of(&y, self.dims))
+    }
+
+    pub(super) fn decompose(&self) -> AdaptiveDecomposition {
+        let (n_draws, n_sims, n_reps) = self.dims;
+        let mut out = AdaptiveDecomposition {
+            n_draws,
+            n_sims,
+            n_reps,
+            components: Vec::new(),
+            skipped: Vec::new(),
+        };
+        let dims = self.dims;
+        for metric in self.metrics() {
+            let mut kept: Vec<(&str, bool)> = Vec::new();
+            let mut cubes: Vec<(Vec<Unit>, bool)> = Vec::new();
+            for &(id, supplied) in &self.subjects {
+                match self.units(metric, id) {
+                    Some(units) => {
+                        kept.push((id, supplied));
+                        cubes.push((units, supplied));
+                    }
+                    None => out.skipped.push(AdaptiveDecompositionSkip {
+                        metric: metric.clone(),
+                        subject: id.to_string(),
+                        n_missing: self.n_runs() - self.slots(metric, id).iter().flatten().count(),
+                    }),
+                }
+            }
+            push_rows(
+                &mut out.components,
+                metric,
+                dims,
+                &kept,
+                |i, drop| subject_estimates(&cubes[i].0, cubes[i].1, dims, drop),
+                |drop| population_estimates(&cubes, dims, drop),
+            );
+        }
+        out
+    }
+}
+
+/// A subject's estimates leaving out outer unit `drop`: parameter, BSV, within, total. A
+/// supplied subject's BSV is computed but never reported: the `Supplied` status in
+/// [`push_rows`] and `total_of`'s `reported` flag are the one gate.
+pub(super) fn subject_estimates(
+    units: &[Unit], supplied: bool, dims: (usize, usize, usize), drop: Option<usize>,
+) -> Vec<Option<f64>> {
+    let l = layers(units, dims, drop);
+    vec![l.param, l.bsv, l.within, subject_total(&l, supplied, dims.0)]
+}
+
+/// The population's estimates leaving out outer unit `drop`: each layer averaged over the
+/// subjects (BSV over the drawn ones), the between-subject variance of the subject means,
+/// and the pooled variance `mean_i Var(Y | i) + Var_i E[Y | i]` — the sum of the lines
+/// when no subject is supplied. Leaving out a draw leaves it out for every subject, which
+/// share it.
+pub(super) fn population_estimates(
+    cubes: &[(Vec<Unit>, bool)], dims: (usize, usize, usize), drop: Option<usize>,
+) -> Vec<Option<f64>> {
+    let ls: Vec<(Layers, bool)> =
+        cubes.iter().map(|(u, sup)| (layers(u, dims, drop), *sup)).collect();
+    let avg = |f: &dyn Fn(&(Layers, bool)) -> Option<Option<f64>>| {
+        let v: Vec<Option<f64>> = ls.iter().filter_map(f).collect();
+        let v: Option<Vec<f64>> = v.into_iter().collect();
+        v.filter(|v| !v.is_empty()).map(|v| v.iter().sum::<f64>() / v.len() as f64)
+    };
+    let param = avg(&|(l, _)| Some(l.param));
+    let bsv = avg(&|(l, sup)| (!sup).then_some(l.bsv));
+    let within = avg(&|(l, _)| Some(l.within));
+    let n = ls.len() as f64;
+    let grand = ls.iter().map(|(l, _)| l.mean).sum::<f64>() / n;
+    let between = ls.iter().map(|(l, _)| (l.mean - grand).powi(2)).sum::<f64>() / n;
+    let totals: Option<Vec<f64>> =
+        ls.iter().map(|(l, sup)| subject_total(l, *sup, dims.0)).collect();
+    let total = totals.map(|t| t.iter().sum::<f64>() / n + between);
+    vec![param, bsv, within, Some(between), total]
+}
+
+/// Every component row of one metric: each subject's layers, then the population's, from
+/// the estimators `subject(i, drop)` (for the `i`-th of `subjects`) and `population(drop)`.
+/// A row's standard error is the jackknife of its own estimator, so an estimator built
+/// from two arms (a contrast's difference) is jackknifed paired, unit by unit.
+pub(super) fn push_rows(
     rows: &mut Vec<AdaptiveVarianceComponent>, metric: &AdaptiveSummaryMetric,
-    cubes: &[(&str, Cube)], dims: (usize, usize, usize),
+    dims: (usize, usize, usize), subjects: &[(&str, bool)],
+    subject: impl Fn(usize, Option<usize>) -> Vec<Option<f64>>,
+    population: impl Fn(Option<usize>) -> Vec<Option<f64>>,
 ) {
     let (d, s, _) = dims;
     let n_units = if d > 1 { d } else { s };
@@ -417,54 +503,23 @@ fn push_metric(
     };
     use AdaptiveVarianceLayer::*;
 
-    // A subject: parameter, BSV, within, and their sum.
-    for (id, cube) in cubes {
-        let est = |drop: Option<usize>| {
-            let l = layers(&cube.units, dims, drop);
-            // A supplied subject's BSV is computed but never reported: the `Supplied`
-            // status below and `total_of`'s `reported` flag are the one gate.
-            vec![l.param, l.bsv, l.within, subject_total(&l, cube.supplied, d)]
-        };
+    for (i, &(id, supplied)) in subjects.iter().enumerate() {
+        let est = |drop: Option<usize>| subject(i, drop);
         let (full, se) = (est(None), jackknife(n_units, est));
         let scope = || AdaptiveVarianceScope::Subject(id.to_string());
         rows.push(row(scope(), Parameter, status(full[0], se[0]), 1));
-        let bsv =
-            if cube.supplied { AdaptiveComponentStatus::Supplied } else { status(full[1], se[1]) };
+        let bsv = if supplied { AdaptiveComponentStatus::Supplied } else { status(full[1], se[1]) };
         rows.push(row(scope(), Bsv, bsv, 1));
         rows.push(row(scope(), Within, status(full[2], se[2]), 1));
         rows.push(row(scope(), Total, status(full[3], se[3]), 1));
     }
-    if cubes.is_empty() {
+    if subjects.is_empty() {
         return;
     }
-
-    // The population: each layer averaged over the subjects (BSV over the drawn ones), the
-    // between-subject variance of the subject means, and the pooled variance
-    // `mean_i Var(Y | i) + Var_i E[Y | i]` — the sum of the lines when no subject is supplied.
-    // Leaving out a draw leaves it out for every subject, which share it.
-    let n_drawn = cubes.iter().filter(|(_, c)| !c.supplied).count();
-    let est = |drop: Option<usize>| {
-        let ls: Vec<(Layers, bool)> =
-            cubes.iter().map(|(_, c)| (layers(&c.units, dims, drop), c.supplied)).collect();
-        let avg = |f: &dyn Fn(&(Layers, bool)) -> Option<Option<f64>>| {
-            let v: Vec<Option<f64>> = ls.iter().filter_map(f).collect();
-            let v: Option<Vec<f64>> = v.into_iter().collect();
-            v.filter(|v| !v.is_empty()).map(|v| v.iter().sum::<f64>() / v.len() as f64)
-        };
-        let param = avg(&|(l, _)| Some(l.param));
-        let bsv = avg(&|(l, sup)| (!sup).then_some(l.bsv));
-        let within = avg(&|(l, _)| Some(l.within));
-        let n = ls.len() as f64;
-        let grand = ls.iter().map(|(l, _)| l.mean).sum::<f64>() / n;
-        let between = ls.iter().map(|(l, _)| (l.mean - grand).powi(2)).sum::<f64>() / n;
-        let totals: Option<Vec<f64>> =
-            ls.iter().map(|(l, sup)| subject_total(l, *sup, d)).collect();
-        let total = totals.map(|t| t.iter().sum::<f64>() / n + between);
-        vec![param, bsv, within, Some(between), total]
-    };
-    let (full, se) = (est(None), jackknife(n_units, est));
+    let n_drawn = subjects.iter().filter(|(_, sup)| !sup).count();
+    let (full, se) = (population(None), jackknife(n_units, &population));
     let pop = || AdaptiveVarianceScope::Population;
-    let n = cubes.len();
+    let n = subjects.len();
     rows.push(row(pop(), Parameter, status(full[0], se[0]), n));
     let bsv = if n_drawn == 0 { AdaptiveComponentStatus::Supplied } else { status(full[1], se[1]) };
     rows.push(row(pop(), Bsv, bsv, n_drawn));

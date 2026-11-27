@@ -1085,6 +1085,120 @@ the Monte Carlo error. IOV reaches the readings through
 Two cases need no tolerance. With no IOV and an `Ipred` monitor, within is exactly 0.
 With Ω = 0 as well, BSV is exactly 0. Each is paired with a live case.
 
+### Controller effect: a contrast against a reference regimen
+
+The controller is a deterministic map from the random inputs to doses, so it has no
+variance layer of its own. Its effect is a **contrast**
+([#946](https://github.com/FeRx-NLME/ferx-core/issues/946)). You run the same model and
+population twice, with the same seed: once under the controller (the adaptive arm) and
+once under a reference regimen. Then you report each outcome summary for both arms and
+for their difference, adaptive − reference.
+
+- `decompose_contrast(&adaptive, &reference, &labels)` returns the
+  [variance decomposition](#variance-decomposition) of both arms and of the difference,
+  per metric, scope and layer. It needs what `decompose_adaptive` needs (`n_reps ≥ 2`,
+  `n_sim ≥ 2`).
+- `summarize_contrast(&adaptive, &reference, &labels, &opts)` returns the
+  [population summary](#population-summary-and-bands) of both arms and of the per-run
+  differences: the mean effect per draw, its band across draws, and the prediction
+  interval of one patient's effect. It works on any design, including `n_reps = 1`.
+
+Both return an `AdaptiveContrast { labels, adaptive, reference, difference }`. Each arm's
+summary is exactly what that arm alone gives. `AdaptiveArmLabels` names both arms, and
+neither label may be empty: the reference is never implicit.
+
+#### Worked example: how much variability does the controller remove?
+
+```rust
+let opts = AdaptiveSimulateOptions { seed: Some(2026), n_reps: 2, ..Default::default() };
+let tdm = simulate_adaptive_from_spec(&model, &pop, &params, 200, &spec, &opts)?;
+let fixed = simulate_adaptive_from_spec(&model, &pop, &params, 200, &spec.fixed_reference(), &opts)?;
+let labels = AdaptiveArmLabels::new("TDM rule", "start dose every due point");
+
+let v = decompose_contrast(&tdm, &fixed, &labels)?;          // variance, per layer
+let m = summarize_contrast(&tdm, &fixed, &labels, &Default::default())?;  // mean effect
+```
+
+In `v.difference` a negative `Bsv` row at population scope is between-patient variance
+the controller removed; divide it by the reference arm's `Bsv` for the fraction. A
+positive `Within` row is variance it added by acting on noisy readings. `m.difference`'s
+`Mean` rows are the mean effect on each metric (on `PctReadingsInWindow`, the change in
+the fraction of readings in the window).
+
+A threshold in the summary options applies to each summary's own values. So on
+`m.difference` a `FractionAtLeast(a)` row is the fraction of runs whose **effect** is at
+least `a`, P(A − R ≥ a). The change in attainment, P(A ≥ a) − P(R ≥ a), is the `adaptive`
+row minus the `reference` row.
+
+On the analytic fixture below (a proportional controller acting on a `Dv` reading against
+the fixed dose it starts from), the controller removed about 26 % of the BSV and of the
+parameter layer, and added a within layer the fixed regimen does not have (exactly 0
+there). That pattern is typical: with `Ipred` monitors the controller compensates for
+patients, so BSV shrinks; with a `Dv` monitor, noise moves doses, so the within layer
+grows. The parameter layer is what the controller cannot see.
+
+#### Common random numbers
+
+The two runs share their random numbers when they have the same seed, parameters and
+decision grid. That holds whatever the controllers do. η is drawn once per
+`(draw, sim, subject)`, in population order, before the controller runs. κ and the assay
+noise are keyed by the decision's grid index, so a `Stop`, a hold, an interval change or
+an extra dose shifts no other draw. The run records these inputs in
+`AdaptiveSimulationResult::manifest` (`seed`, `point_parameters`, `decision_times`).
+Both functions refuse (`E_ADAPTIVE_OPTIONS`) a pair that does not share them, and name the
+first difference:
+
+| Difference | Why it breaks the pairing |
+|---|---|
+| A label is empty | The reference must be named |
+| An arm has no seed | Its random numbers came from entropy |
+| Different seeds | Every stream differs |
+| Different parameters, draw count, or a draw's values | Other η scales, other draws |
+| Different decision grid | κ occasions and assay draws are keyed by grid index |
+| Different `n_sim` or `n_reps` | The runs cannot be matched one to one |
+| Different subject count or order | η is drawn in population order |
+| A supplied η in one arm only | One arm's η is not drawn |
+
+The model, the covariates, the base regimen in the data and the supplied η values
+(`with_etas`) are not recorded, so they cannot be checked. Pass the same ones to both
+runs.
+
+#### The reference regimen
+
+On the spec entry, `AdaptiveDosingSpec::fixed_reference()` returns the block with its
+rules removed. With no rule to fire, the controller gives its start dose at every due
+point. The schedule, monitor, route and metric bands are unchanged, so the grid matches by
+construction. "The start dose" is what the adaptive arm itself starts from:
+
+| `start_dose` | The reference gives |
+|---|---|
+| A number | That number |
+| A covariate expression ([dose expressions](#dose-expressions)) | Each subject's own value |
+| A θ-only expression, under parameter uncertainty | Its value at θ̂, the prescriber's knowledge, as in the adaptive arm |
+| With `dose_knowledge = oracle` | Its value at the draw's θ |
+| With `round_to` | The start dose placed on the dose grid |
+
+A rule-free spec is allowed only in Rust. A `.ferx` block still needs a rule; a fixed
+regimen there belongs in the data's dose records. The reference is not a fair one for a
+controller with a loading dose. On the programmatic entry, pass any fixed controller as
+the reference, with the same options.
+
+#### Standard error and how it is checked
+
+The arms share their outer units (draws, or sims with one draw), so the difference's
+`mc_se` is a **paired** jackknife: the same unit is left out of both arms at once.
+Combining the arms' own SEs as `√(se_A² + se_R²)` ignores their correlation. Over 300
+seeds on the analytic fixture, the paired SE was 0.95 to 1.07 of the empirical SD of the
+difference, and the unpaired one 4.2 to 4.9.
+
+No NONMEM run exists for feedback dosing. Two cases need no tolerance: a controller
+contrasted with itself gives bit-identical runs and every difference exactly 0, and a
+fixed controller on the programmatic entry equals `fixed_reference()` on the spec entry
+bit for bit. The difference is then compared with quadrature at the run's own draws, on a
+one-compartment model with log-normal θ and a controller `100 − 0.5 × reading`, whose
+layers have closed forms. Each layer agrees within the test's tolerance of 4 SD of its
+Monte Carlo error (2.3 SD at the test's seed).
+
 ## Verification (on by default)
 
 Adaptive dosing is bookkeeping-heavy (event ordering, bioavailability/lag,

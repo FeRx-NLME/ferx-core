@@ -323,30 +323,55 @@ pub struct AdaptivePopulationSummary {
 pub fn summarize_adaptive(
     result: &AdaptiveSimulationResult, opts: &AdaptiveSummaryOptions,
 ) -> Result<AdaptivePopulationSummary, EngineError> {
+    check_summary_options(opts, "summarize_adaptive")?;
+    let values = run_values(result).map(|(run, metric, v)| (run.draw, metric, v));
+    Ok(summarize_values(&runs_per_draw(result), values, opts))
+}
+
+/// Refuse summary options a summary cannot use, naming the entry `who`.
+pub(super) fn check_summary_options(
+    opts: &AdaptiveSummaryOptions, who: &str,
+) -> Result<(), EngineError> {
     if !probs_valid(opts.probs) {
         return Err(crate::entry_refusals::adaptive_options(format!(
-            "summarize_adaptive: probabilities {:?} must be strictly inside (0, 1) and \
-             strictly increasing",
+            "{who}: probabilities {:?} must be strictly inside (0, 1) and strictly increasing",
             opts.probs
         )));
     }
     if let Some((m, a)) = opts.thresholds.iter().find(|(_, a)| !a.is_finite()) {
         return Err(crate::entry_refusals::adaptive_options(format!(
-            "summarize_adaptive: the threshold for {} is {a}; it must be finite",
+            "{who}: the threshold for {} is {a}; it must be finite",
             m.describe()
         )));
     }
+    Ok(())
+}
 
-    // Runs per draw, and the values present per (metric, draw).
+/// Runs per draw: one per metrics row.
+pub(super) fn runs_per_draw(result: &AdaptiveSimulationResult) -> BTreeMap<usize, usize> {
     let mut runs: BTreeMap<usize, usize> = BTreeMap::new();
-    let mut values: BTreeMap<AdaptiveSummaryMetric, BTreeMap<usize, Vec<f64>>> =
-        AdaptiveSummaryMetric::SCALARS.iter().map(|m| (m.clone(), BTreeMap::new())).collect();
     for row in &result.metrics {
         *runs.entry(row.draw).or_default() += 1;
     }
-    for (run, metric, v) in run_values(result) {
-        values.entry(metric).or_default().entry(run.draw).or_default().push(v);
+    runs
+}
+
+/// The summary kernel: per-draw statistics, bands and prediction intervals of `values`
+/// (`(draw, metric, value)`, at most one per run and metric) over `runs` runs per draw.
+/// [`summarize_adaptive`] feeds it one arm's values; the contrast feeds it the paired
+/// differences of two arms.
+pub(super) fn summarize_values(
+    runs: &BTreeMap<usize, usize>,
+    values: impl Iterator<Item = (usize, AdaptiveSummaryMetric, f64)>,
+    opts: &AdaptiveSummaryOptions,
+) -> AdaptivePopulationSummary {
+    // The values present per (metric, draw).
+    let mut by_metric: BTreeMap<AdaptiveSummaryMetric, BTreeMap<usize, Vec<f64>>> =
+        AdaptiveSummaryMetric::SCALARS.iter().map(|m| (m.clone(), BTreeMap::new())).collect();
+    for (draw, metric, v) in values {
+        by_metric.entry(metric).or_default().entry(draw).or_default().push(v);
     }
+    let mut values = by_metric;
 
     for (m, _) in &opts.thresholds {
         values.entry(m.clone()).or_default();
@@ -382,7 +407,7 @@ pub fn summarize_adaptive(
         );
         for &statistic in &stats {
             let mut across: Vec<f64> = Vec::with_capacity(n_draws);
-            for (&draw, &n_runs) in &runs {
+            for (&draw, &n_runs) in runs {
                 let vals = by_draw.get(&draw).map_or(&[][..], Vec::as_slice);
                 let value = draw_statistic(vals, statistic);
                 across.extend(value);
@@ -417,7 +442,7 @@ pub fn summarize_adaptive(
             n_missing: missing(total_runs, n_present),
         });
     }
-    Ok(out)
+    out
 }
 
 /// The run a value came from: `(subject, draw, sim, rep)`, the key of a metrics row.
