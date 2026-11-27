@@ -9629,18 +9629,17 @@ pub struct FitOptions {
     /// accepted — so `0` and the untriggered subjects stay bit-identical.
     pub inner_restarts: usize,
     /// Restart the final EBE pass from a small kick of each informative coordinate and keep a
-    /// lower mode (`[fit_options] inner_kick`, #3159). Default `true`. A clipped prediction
+    /// lower mode (`[fit_options] inner_kick`, #3159). **Default `false`.** A clipped prediction
     /// (`if (x - TH < 0) 0 else x - TH`) makes a second local minimum of a subject's individual
     /// objective a barrier away from the first, which no descent from the first reaches; the
     /// kicks do (at most 16 coordinates, two descents of at most 12 iterations each, per
     /// subject). A subject with one mode ends where it started. The search's own solves never
-    /// kick, so the cost is a fraction of the final pass; `false` skips it.
-    ///
-    /// Off by default: the kicks run in **every** final pass whether or not the model has a
-    /// kink, so an unconditional default would cost every existing fit (measured 5-18% on fast
-    /// ODE examples with few subjects; negligible on a long search, where the final pass is a
-    /// small fraction of the total). Turn it on for a model with a clipped or thresholded
-    /// prediction.
+    /// kick, so the cost is a fraction of the final pass — but the kicks run in **every** final
+    /// pass whether or not the model has a kink, and a cheap structural check cannot reliably
+    /// tell the two apart (measured 5-18% on fast ODE examples with few subjects; negligible on
+    /// a long search, where the final pass is a small fraction of the total), so an
+    /// unconditional default would cost every existing fit. Turn it on for a model with a
+    /// clipped or thresholded prediction.
     pub inner_kick: bool,
     /// Size of the inner multi-start's quasi-random screen (`[fit_options] inner_screen`,
     /// default `100`; set `0` to disable, #2013). Runs inside the cold multi-start

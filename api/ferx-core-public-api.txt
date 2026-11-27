@@ -6027,6 +6027,7 @@ pub ferx_core::SaemObjective::n_samples: core::option::Option<usize>
 pub struct ferx_core::ScoringSettings
 pub ferx_core::ScoringSettings::ebe_warm_start: bool
 pub ferx_core::ScoringSettings::gradient_method: ferx_core::GradientMethod
+pub ferx_core::ScoringSettings::inner_kick: bool
 pub ferx_core::ScoringSettings::inner_maxiter: usize
 pub ferx_core::ScoringSettings::inner_optimizer: ferx_core::InnerOptimizer
 pub ferx_core::ScoringSettings::inner_restarts: usize

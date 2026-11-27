@@ -906,6 +906,7 @@ mod tests {
                 inner_restarts: 4,
                 inner_screen: 7,
                 inner_twin_seed: false,
+                inner_kick: false,
                 mu_referencing: false,
                 n_agq: 5,
                 inner_optimizer: InnerOptimizer::Lbfgs,

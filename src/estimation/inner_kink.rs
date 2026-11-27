@@ -127,32 +127,47 @@ pub(super) fn stall_escape(
 }
 
 /// Restarts from a kick of each informative coordinate of the incumbent `x` (objective `nll`)
-/// by `±KICK_FRAC` prior SDs, `descend`ing from each and keeping any result lower by more than
-/// `1e-9`: the same acceptance as the guarded multi-start. At most [`MAX_KICK_COORDS`]
-/// coordinates are visited, the widest priors first. `None` when no kick found a lower mode.
-/// `E` is whatever `descend` reports about how its search ended.
+/// by `±KICK_FRAC` prior SDs, `probe`ing each with a short, capped descent (cheap: this runs
+/// up to `2 · MAX_KICK_COORDS` times) and walking on from whichever drops the objective by more
+/// than `1e-9`. At most [`MAX_KICK_COORDS`] coordinates are visited, the widest priors first.
+///
+/// `None` when no kick ever dropped the objective — the common case, and the only one that
+/// costs nothing beyond the probes. Otherwise the walk's end point is handed to `finish`, an
+/// **uncapped** re-descend to the search's own tolerance (#3159 review): `probe`'s
+/// [`KICK_MAX_ITER`] cap can stop short of a converged mode, which would otherwise report the
+/// adopted EBE `unconverged` and take its `H` off a point whose gradient has not settled, and a
+/// candidate still short of full convergence is closer to the incumbent's own basin, where the
+/// `1e-9` test is more exposed to the same non-move noise the guarded multi-start's distance
+/// gate exists for. The final decision compares `finish`'s fully-converged objective against
+/// `nll`, not `probe`'s: `None` when that comparison no longer clears `1e-9` either.
+///
+/// `E` is whatever `finish` reports about how its search ended — the `EbeResult::converged` /
+/// `H` / `used_fallback` the caller reports are read off that call alone.
 pub(super) fn kick_restarts<E>(
     x: &[f64], nll: f64, sds: &[f64], obj: &dyn Fn(&[f64]) -> f64,
-    mut descend: impl FnMut(&mut Vec<f64>) -> E,
+    mut probe: impl FnMut(&mut Vec<f64>), mut finish: impl FnMut(&mut Vec<f64>) -> E,
 ) -> Option<(Vec<f64>, f64, E)> {
-    let mut best: Option<(Vec<f64>, f64, E)> = None;
+    let mut best: Option<(Vec<f64>, f64)> = None;
     let mut coords: Vec<(usize, f64)> =
         sds.iter().copied().enumerate().filter(|&(_, sd)| sd >= KICK_MIN_SD).collect();
     coords.sort_by(|a, b| b.1.total_cmp(&a.1));
     coords.truncate(MAX_KICK_COORDS);
     for (j, sd) in coords {
         for sgn in [1.0, -1.0] {
-            let (from, f_from) = best.as_ref().map_or((x, nll), |(p, f, _)| (p.as_slice(), *f));
+            let (from, f_from) = best.as_ref().map_or((x, nll), |(p, f)| (p.as_slice(), *f));
             let mut cand = from.to_vec();
             cand[j] += sgn * KICK_FRAC * sd;
-            let exit = descend(&mut cand);
+            probe(&mut cand);
             if cand.iter().all(|v| v.is_finite()) {
                 let f = obj(&cand);
                 if f + 1e-9 < f_from {
-                    best = Some((cand, f, exit));
+                    best = Some((cand, f));
                 }
             }
         }
     }
-    best
+    let (mut p, _) = best?;
+    let exit = finish(&mut p);
+    let f = p.iter().all(|v| v.is_finite()).then(|| obj(&p))?;
+    (f + 1e-9 < nll).then_some((p, f, exit))
 }

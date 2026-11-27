@@ -42,18 +42,17 @@ fn a_stall_on_a_valley_floor_escapes_along_it_and_a_kink_minimum_is_certified() 
     assert!(stall_escape(&valley, &nan, &x, valley(&x), 11.0).is_none());
 }
 
-/// A kick moves one informative coordinate by a quarter of its prior SD, descends from there,
-/// and keeps a result lower by more than 1e-9; a placeholder coordinate (SD below 1e-3) is not
-/// kicked, and each accepted result is the next kick's incumbent.
+/// An identity `probe` (no descent) and `finish` (so the walk's own kicked point is what is
+/// finally compared and adopted). A kick moves one informative coordinate by a quarter of its
+/// prior SD and keeps a result lower by more than 1e-9; a placeholder coordinate (SD below
+/// 1e-3) is not kicked, and each accepted result is the next kick's incumbent.
 #[test]
 fn a_kick_restart_keeps_only_a_lower_mode_and_skips_placeholder_coordinates() {
     let obj = |p: &[f64]| p.iter().map(|v| (v - 1.0).powi(2)).sum::<f64>();
     let x = [0.0, 0.0, 0.0];
     let mut kicked = Vec::new();
-    // `descend` is the identity here, so the seeds themselves are the candidates.
-    let r = kick_restarts(&x, obj(&x), &[2.0, 0.0, 4.0], &obj, |cand: &mut Vec<f64>| {
-        kicked.push(cand.clone());
-    });
+    let probe = |cand: &mut Vec<f64>| kicked.push(cand.clone());
+    let r = kick_restarts(&x, obj(&x), &[2.0, 0.0, 4.0], &obj, probe, |_: &mut Vec<f64>| ());
     // The widest prior first: coordinate 2 kicks to +1.0 (lower, taken) and −1.0 (higher,
     // dropped); coordinate 1 is a placeholder; coordinate 0 kicks from the new incumbent to +0.5.
     let (best, f, ()) = r.expect("a kick finds a lower point");
@@ -63,18 +62,42 @@ fn a_kick_restart_keeps_only_a_lower_mode_and_skips_placeholder_coordinates() {
     assert!(kicked.iter().all(|k| k[1] == 0.0), "the placeholder coordinate was kicked");
 
     let at_min = [1.0, 1.0, 1.0];
-    assert!(kick_restarts(&at_min, 0.0, &[2.0, 2.0, 2.0], &obj, |_: &mut Vec<f64>| ()).is_none());
+    let none = kick_restarts(
+        &at_min,
+        0.0,
+        &[2.0, 2.0, 2.0],
+        &obj,
+        |_: &mut Vec<f64>| (),
+        |_: &mut Vec<f64>| (),
+    );
+    assert!(none.is_none());
+}
+
+/// `finish` re-checks the walk's end point against the incumbent's objective, not `probe`'s: a
+/// `finish` that moves the walk's end point back to `x` finds nothing to adopt, even though a
+/// raw kicked point was lower (#3159 review).
+#[test]
+fn finish_decides_the_final_accept_reject_not_probe() {
+    let obj = |p: &[f64]| p.iter().map(|v| (v - 1.0).powi(2)).sum::<f64>();
+    let x = [0.0, 0.0];
+    let mut probed_lower = false;
+    let probe = |cand: &mut Vec<f64>| probed_lower |= obj(cand) + 1e-9 < obj(&x.to_vec());
+    let finish = |cand: &mut Vec<f64>| cand.copy_from_slice(&[0.0, 0.0]); // undo the walk
+    assert!(kick_restarts(&x, obj(&x), &[2.0, 2.0], &obj, probe, finish).is_none());
+    assert!(probed_lower, "premise: a raw kick was lower");
 }
 
 /// A subject with 40 informative coordinates is kicked on 16 of them, the widest priors first.
+/// `obj` is constant, so no kick is ever lower and `finish` never runs.
 #[test]
 fn a_kick_restart_visits_at_most_sixteen_coordinates_the_widest_first() {
     let sds: Vec<f64> = (0..40).map(|i| 1.0 + i as f64).collect();
     let mut visited = Vec::new();
     let x = vec![0.0; 40];
-    let _ = kick_restarts(&x, 0.0, &sds, &|_: &[f64]| 1.0, |cand: &mut Vec<f64>| {
-        visited.push(cand.iter().position(|v| *v != 0.0).unwrap());
-    });
+    let probe = |cand: &mut Vec<f64>| visited.push(cand.iter().position(|v| *v != 0.0).unwrap());
+    let finish = |_: &mut Vec<f64>| panic!("obj is constant: no kick is ever lower");
+    let r = kick_restarts(&x, 0.0, &sds, &|_: &[f64]| 1.0, probe, finish);
+    assert!(r.is_none());
     assert_eq!(visited.len(), 32, "{visited:?}");
     assert!(visited.iter().all(|&j| j >= 24), "{visited:?}");
 }
