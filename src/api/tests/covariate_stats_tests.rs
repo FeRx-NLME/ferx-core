@@ -220,6 +220,18 @@ fn hockey_bounds_follow_the_psn_table() {
     assert!((thetas[1].upper - 1e6).abs() < 1e-9);
 }
 
+/// #2864: `=> NAME(init)` on `hockey` takes each slope's bound defaults, by position.
+#[test]
+fn an_init_only_hockey_clause_takes_the_bound_defaults() {
+    let text =
+        model("  WT continuous", "  CL ~ WT hockey(breakpoint = median) => A(0.01), B(0.02)");
+    let pop = population("WT", &[50.0, 60.0, 70.0, 80.0, 90.0]);
+    let bound = bind(&text, &pop).expect("binding should succeed");
+    let t = &bound.covariate_model.as_ref().unwrap().relations[0].thetas;
+    let got: Vec<_> = t.iter().map(|t| (t.name.as_str(), t.init, t.lower, t.upper)).collect();
+    assert_eq!(got, [("A", 0.01, -1e6, 1.0 / 20.0), ("B", 0.02, -1.0 / 20.0, 1e6)]);
+}
+
 /// A covariate value carried on a non-observation record still reaches the
 /// evaluator, so it has to reach the summary (#1111 review).
 ///

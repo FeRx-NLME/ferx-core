@@ -768,7 +768,7 @@ fn a_non_finite_literal_centre_is_an_error() {
 #[test]
 fn a_malformed_theta_clause_is_an_error() {
     let e = err("  WT continuous", "  CL ~ WT power(center = 70) => THETA_WT");
-    assert!(e.contains("expected `=> NAME(init, lower, upper)`"), "{e}");
+    assert!(e.contains("expected `=> NAME(init[, lower, upper])`"), "{e}");
 
     let e = err("  WT continuous", "  CL ~ WT power(center = 70) => T(0.75, low, 10)");
     assert!(e.contains("`low` is not a number"), "{e}");
@@ -1183,4 +1183,8 @@ fn an_init_only_theta_clause_keeps_the_form_default_bounds() {
     let levels = "  SEX categorical(levels = [0, 1, 2])";
     let cat = spec(levels, "  CL ~ SEX categorical(ref = 0) => A(0.1), B(0.2, -0.5, 0.5)");
     assert_eq!(bounds(&cat), [("A".into(), 0.1, -1.0, 5.0), ("B".into(), 0.2, -0.5, 0.5)]);
+    // Bounds still to bind from data: unresolved, as with no clause, with no `NaN` bound left.
+    let lin = spec("  WT continuous", "  CL ~ WT linear(center = 70) => T(0.01)");
+    assert!(lin.generated_thetas.is_empty() && lin.relations[0].thetas.is_empty());
+    assert_eq!(lin.unresolved().len(), 1);
 }

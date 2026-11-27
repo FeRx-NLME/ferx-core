@@ -599,7 +599,7 @@ fn parse_theta_clause(
             .split_once('(')
             .and_then(|(n, a)| a.strip_suffix(')').map(|a| (n.trim(), a)))
             .ok_or_else(|| {
-                format!("[covariate_model]: expected `=> NAME(init, lower, upper)`, got `{part}`")
+                format!("[covariate_model]: expected `=> NAME(init[, lower, upper])`, got `{part}`")
             })?;
         let nums: Vec<f64> = args
             .split(',')

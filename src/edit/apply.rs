@@ -372,7 +372,7 @@ fn add_covariate_relation(text: &mut ModelText, rel: &Relation) -> Result<(), St
 }
 
 fn drop_covariate_relation(text: &mut ModelText, param: &str, cov: &str) -> Result<(), String> {
-    let Some(span) = find_relation_decl(text, param, cov) else {
+    let Some((span, _)) = find_relation_decl(text, param, cov) else {
         return Err(format!(
             "ferx-core::edit: [covariate_model] declares no `{param} ~ {cov}` relation to drop"
         ));
@@ -389,7 +389,7 @@ fn drop_covariate_relation(text: &mut ModelText, param: &str, cov: &str) -> Resu
 /// Reads only as far as the pair — the form and the `=> …` clause are the
 /// parser's business, and a relation this cannot address is one the parser
 /// would reject anyway.
-fn find_relation_decl(text: &ModelText, param: &str, cov: &str) -> Option<Range<usize>> {
+fn find_relation_decl(text: &ModelText, param: &str, cov: &str) -> Option<(Range<usize>, String)> {
     find_decl(text, "covariate_model", |code| {
         let body = code.split("=>").next().unwrap_or(code);
         let Some((p, rest)) = body.split_once('~') else {
@@ -397,7 +397,6 @@ fn find_relation_decl(text: &ModelText, param: &str, cov: &str) -> Option<Range<
         };
         p.trim() == param && rest.trim().split_whitespace().next() == Some(cov)
     })
-    .map(|(span, _)| span)
 }
 
 // ── η surgery ───────────────────────────────────────────────────────────────
@@ -1475,17 +1474,7 @@ fn seed_inits(text: &mut ModelText, fit: &FitResult) -> Result<(), String> {
         .iter()
         .filter_map(|(_, c)| THETA_RE.captures(c).map(|m| m[2].to_string()))
         .collect();
-    for (span, code) in text.logical_lines("covariate_model") {
-        let (body, clause) = code.split_once("=>").unwrap_or((&code, ""));
-        let Some((param, rest)) = body.split_once('~') else { continue };
-        let cov = rest.split_whitespace().next().unwrap_or("");
-        let Some(rel) = fit
-            .covariate_relations
-            .iter()
-            .find(|r| r.parameter == param.trim() && r.covariate == cov)
-        else {
-            continue;
-        };
+    for rel in &fit.covariate_relations {
         if rel.thetas.is_empty()
             || rel
                 .thetas
@@ -1494,18 +1483,29 @@ fn seed_inits(text: &mut ModelText, fit: &FitResult) -> Result<(), String> {
         {
             continue;
         }
+        let Some((span, code)) = find_relation_decl(text, &rel.parameter, &rel.covariate) else {
+            continue;
+        };
+        let (body, clause) = code.split_once("=>").unwrap_or((&code, ""));
+        // A line of another form generates other θ, so it is left as written.
+        let form = body.split_once('~').and_then(|(_, r)| r.split_whitespace().nth(1));
+        if !form.is_some_and(|f| f.split('(').next().unwrap().eq_ignore_ascii_case(&rel.form)) {
+            continue;
+        }
         let stated: HashMap<String, String> =
             crate::parser::model_parser::split_top_level_args(clause)
                 .iter()
                 .filter_map(|p| p.trim().strip_suffix(')')?.split_once('('))
                 .map(|(n, a)| (n.trim().to_string(), a.to_string()))
                 .collect();
+        // `{:?}` round-trips exactly: a 15-digit init on a default bound computed at full
+        // precision (`1/(centre - min)`) could land outside it.
         let parts: Vec<String> = rel
             .thetas
             .iter()
             .map(|t| match stated.get(&t.name).and_then(|a| a.split_once(',')) {
-                Some((_, bounds)) => format!("{}({}, {})", t.name, num(t.estimate), bounds.trim()),
-                None => format!("{}({})", t.name, num(t.estimate)),
+                Some((_, bounds)) => format!("{}({:?}, {})", t.name, t.estimate, bounds.trim()),
+                None => format!("{}({:?})", t.name, t.estimate),
             })
             .collect();
         stale.extend(text.set_span(&span, &format!("{} => {}", body.trim_end(), parts.join(", "))));

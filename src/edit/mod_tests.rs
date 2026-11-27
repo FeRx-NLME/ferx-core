@@ -1529,17 +1529,19 @@ fn seed_inits_carries_estimates_over_by_name_not_position() {
 /// optimum (19.85 OFV off on `examples/two_cpt_oral_covmodel.ferx` with its clauses
 /// stripped). Now each fitted coefficient is written into its relation as `NAME(estimate)`,
 /// keeping the default bounds, or with the bounds its clause states; a categorical relation
-/// gets one part per level, in the form's order; a `FIX` relation is left alone. Re-parsed, every coefficient starts at its
-/// estimate with the bounds it had.
+/// gets one part per level, in the form's order. A `FIX` relation, one whose θ `[parameters]`
+/// declares, one with a non-finite estimate and one of another form are left alone.
+/// Re-parsed, every coefficient starts at its exact estimate (`1/29`, which 15 digits would
+/// round past a default bound of that value) with the bounds it had.
 #[test]
 fn seed_inits_writes_covariate_model_coefficients_2864() {
-    let rel =
-        |p: &str, names: &[(&str, f64)], fixed: bool| crate::types::CovariateRelationEstimate {
+    let rel = |p: &str, cov: &str, form: &str, names: &[(&str, f64)], fixed: bool| {
+        crate::types::CovariateRelationEstimate {
             parameter: p.into(),
-            covariate: if p == "CL" && names.len() == 2 { "SEX" } else { "WT" }.into(),
-            form: "power".into(),
-            center_source: Some("70".into()),
-            center: Some(70.0),
+            covariate: cov.into(),
+            form: form.into(),
+            center_source: None,
+            center: None,
             expression: None,
             thetas: names
                 .iter()
@@ -1551,29 +1553,48 @@ fn seed_inits_writes_covariate_model_coefficients_2864() {
                     level: None,
                 })
                 .collect(),
-        };
+        }
+    };
     let mut fit = fit_with(&[], &[], &[], &[], &[], &[]);
     fit.covariate_relations = vec![
-        rel("CL", &[("THETA_CL_WT", 0.8216)], false),
-        rel("V", &[("THETA_V_WT", 0.91)], false),
-        rel("KA", &[("THETA_KA_WT", 0.3)], true),
-        rel("CL", &[("THETA_CL_SEX_1", 0.1), ("THETA_CL_SEX_2", 0.2)], false),
+        rel("CL", "WT", "power", &[("THETA_CL_WT", 1.0 / 29.0)], false),
+        rel("V", "WT", "power", &[("THETA_V_WT", 0.91)], false),
+        rel("KA", "WT", "power", &[("THETA_KA_WT", 0.3)], true),
+        rel("CL", "SEX", "categorical", &[("THETA_CL_SEX_1", 0.1), ("THETA_CL_SEX_2", 0.2)], false),
+        rel("CL", "AGE", "power", &[("THETA_CL_AGE", 0.7)], false),
+        rel("KA", "AGE", "power", &[("THETA_KA_AGE", f64::NAN)], false),
+        rel("V", "AGE", "linear", &[("THETA_V_AGE", 0.01)], false),
+    ];
+    let untouched = [
+        "KA ~ WT power(center = 70, fix = 0.3)",
+        "CL ~ AGE power(center = 40)",
+        "KA ~ AGE power(center = 40)",
+        "V ~ AGE power(center = 40)",
     ];
     let src = format!(
         "{}\n[covariate_model]\n  CL ~ WT power(center = 70)\n  \
-         V ~ WT power(center = 70) => THETA_V_WT(0.5, 0.01, 5.0)\n  \
-         KA ~ WT power(center = 70, fix = 0.3)\n  CL ~ SEX categorical(ref = 0)\n",
-        BASE.replace("  WT continuous", "  WT continuous\n  SEX categorical(levels = [0, 1, 2])")
+         V ~ WT power(center = 70) => THETA_V_WT(0.5, 0.01, 5.0)\n  {}\n  \
+         CL ~ SEX categorical(ref = 0)\n  {}\n",
+        BASE.replace(
+            "  WT continuous",
+            "  WT continuous\n  AGE continuous\n  SEX categorical(levels = [0, 1, 2])"
+        )
+        .replace("  theta TVKA", "  theta THETA_CL_AGE(0.5, -5.0, 5.0)\n  theta TVKA"),
+        untouched[0],
+        untouched[1..].join("\n  ")
     );
     let mut text = ModelText::parse(&src).unwrap();
     apply(&mut text, ModelEdit::SeedInits(&fit));
     assert_eq!(
         text.block_lines("covariate_model"),
         [
-            "CL ~ WT power(center = 70) => THETA_CL_WT(0.8216)",
+            "CL ~ WT power(center = 70) => THETA_CL_WT(0.034482758620689655)",
             "V ~ WT power(center = 70) => THETA_V_WT(0.91, 0.01, 5.0)",
-            "KA ~ WT power(center = 70, fix = 0.3)",
+            untouched[0],
             "CL ~ SEX categorical(ref = 0) => THETA_CL_SEX_1(0.1), THETA_CL_SEX_2(0.2)",
+            untouched[1],
+            untouched[2],
+            untouched[3],
         ]
     );
     let m = crate::parser::model_parser::parse_full_model(&text.render()).unwrap().model;
@@ -1582,7 +1603,7 @@ fn seed_inits_writes_covariate_model_coefficients_2864() {
         let p = &m.default_params;
         (p.theta[i], p.theta_lower[i], p.theta_upper[i])
     };
-    assert_eq!(at("THETA_CL_WT"), (0.8216, -100.0, 1e6));
+    assert_eq!(at("THETA_CL_WT"), (1.0 / 29.0, -100.0, 1e6));
     assert_eq!(at("THETA_V_WT"), (0.91, 0.01, 5.0));
     assert_eq!(at("THETA_CL_SEX_2"), (0.2, -1.0, 5.0));
 }

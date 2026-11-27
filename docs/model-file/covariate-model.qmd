@@ -65,7 +65,9 @@ PARAM ~ COV form(kwargs) [*|+] [=> THETA_NAME(init[, lower, upper])[, ...]]
   `[parameters]` takes precedence and is used as declared. `NAME(init)`, without
   bounds, keeps the form's default bounds, one θ per name in the order the form
   generates them. This is how `ferx_update_model()` and a search's seeding write a
-  fitted coefficient back (#2864).
+  fitted coefficient back (#2864). Such a clause is tied to the fit's data: it fixes the θ
+  count and, by position, the level each init goes to, so drop it before refitting on
+  other data.
 - `*` / `+` — optional, and the **last token before any `=>` clause**. `*` is
   the default: the effect is a factor on the parameter. `+` makes it a term
   added to the parameter instead — see
