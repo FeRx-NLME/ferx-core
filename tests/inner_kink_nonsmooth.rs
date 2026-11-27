@@ -136,15 +136,16 @@ fn inner_kick_is_off_by_default_and_leaves_a_second_mode_unreached() {
 /// In a fit that estimates, the kicked EBEs are the ones reported (#3159 review). Kicked in the
 /// final pass only, subject 20's kicked EBE lost the #833 comparison to the search's unkicked
 /// one on OFV, so the fit reported that one with `W_EBE_START_DEPENDENT`, and stayed at its
-/// initial estimates' −4826.2194 as the unkicked fit does. Kicked in every solve, one outer
-/// iteration reaches −4828.7659 (measured), with no such warning.
+/// initial estimates' −4826.2194 as the unkicked fit does.
+///
+/// Since #3153 (the first L-BFGS leg minimises `f / c`), one outer iteration goes further, and
+/// the warning no longer separates the two: kicked in every solve, subject 17's warm EBE is
+/// carried into a mode its cold, kicked re-solve misses by 8.2 to 8.9, which #833 reports at
+/// `maxiter` 1, 2, 4 and 5; kicked in the final pass only, it fires at 5 alone. The objective
+/// still separates them at one iteration: every solve −4835.241380 (CI's Linux and macOS
+/// alike), final pass only −4834.445003 (macOS), so the bound sits between.
 #[test]
 fn an_estimating_fit_reports_the_kicked_ebes() {
     let fit = fit_with("bfgs", "  inner_kick = true\n  maxiter = 1\n");
-    assert!(
-        !fit.warnings.iter().any(|w| w.contains("W_EBE_START_DEPENDENT")),
-        "{:?}",
-        fit.warnings
-    );
-    assert!(fit.ofv < -4828.0, "OFV {}", fit.ofv);
+    assert!(fit.ofv < -4835.0, "OFV {}: {:?}", fit.ofv, fit.warnings);
 }
