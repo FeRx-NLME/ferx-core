@@ -42,6 +42,7 @@ non_gaussian_eta_convergence
 non_gaussian_score
 npde_tte_fit
 one_snapshot_dose_reads_survival
+pkrtte_ode_smoke
 pktte_ebe_nonmem_anchor
 pktte_prestart_entry
 pktte_tdep_nonmem_anchor
