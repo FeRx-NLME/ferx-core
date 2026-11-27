@@ -727,3 +727,34 @@ fn absorbed_step_warning_names_the_rep_of_the_first_replicate() {
         "{w}"
     );
 }
+
+/// The labels are ferx-r's tokens, one per variant, unique per enum (ferx-r#779 review
+/// finding 4). The `match`es without a wildcard stop compiling when a variant is added.
+///
+/// Mutation: any label changed or duplicated.
+#[test]
+fn every_scope_layer_and_status_has_a_unique_stable_label() {
+    let _exhaustive = |s: &Sc| match s {
+        Sc::Population | Sc::Subject(_) => (),
+    };
+    assert_eq!(
+        [Sc::Population, Sc::Subject("1".into())].map(|s| s.label()),
+        ["population", "subject"]
+    );
+
+    let _exhaustive = |l: &L| match l {
+        L::Parameter | L::Bsv | L::Within | L::BetweenRow | L::Total => (),
+    };
+    assert_eq!(
+        [L::Parameter, L::Bsv, L::Within, L::BetweenRow, L::Total].map(|l| l.label()),
+        ["parameter", "bsv", "within", "between_subject", "total"]
+    );
+
+    let _exhaustive = |s: &St| match s {
+        St::Estimated { .. } | St::Supplied | St::NotDrawn => (),
+    };
+    assert_eq!(
+        [St::Estimated { value: 1.0, mc_se: None }, St::Supplied, St::NotDrawn].map(|s| s.label()),
+        ["estimated", "supplied", "not_drawn"]
+    );
+}
