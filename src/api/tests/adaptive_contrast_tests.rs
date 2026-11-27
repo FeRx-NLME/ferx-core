@@ -457,11 +457,9 @@ fn a_controller_contrasted_with_itself_is_exactly_zero_in_every_layer() {
     assert_eq!(format!("{:?}", a.ledger), format!("{:?}", r.ledger));
     assert_eq!(format!("{:?}", a.decisions), format!("{:?}", r.decisions));
     assert_eq!(format!("{:?}", a.trajectories), format!("{:?}", r.trajectories));
-    let before = format!("{a:?}");
+    // Post-processing only: the contrast borrows the results (`&`), so the compiler already
+    // guarantees they are unchanged; no assertion here could fail.
     let c = decompose_contrast(&a, &r, &AdaptiveArmLabels::new("rule", "the same rule")).unwrap();
-    // Post-processing only: the contrast borrows the results (`&`), so they are unchanged.
-    // A record of that, not a check that could fail on its own.
-    assert_eq!(format!("{a:?}"), before);
     let diffs = estimates(&c.difference);
     assert!(!diffs.is_empty());
     for (value, se) in &diffs {
@@ -593,7 +591,7 @@ fn conditional_layers(r: &AdaptiveSimulationResult, adaptive: bool) -> [f64; 3] 
 }
 
 /// The difference against its conditional quadrature: a proportional controller with gain
-/// G = 0.8 on a `Dv` reading against the fixed 100 it starts from, one subject, D 100 × S 20
+/// G = 0.5 on a `Dv` reading against the fixed 100 it starts from, one subject, D 100 × S 20
 /// × R 2, the real asymptotic sampler (log-normal TVCL). Each arm's layers and the
 /// difference are computed outside the engine at the run's own draws.
 ///
@@ -721,3 +719,32 @@ const ORACLE_MODEL: &str = r#"
 /// (param), 3.2% (BSV), 5.0% (within), mean gap < 0.5% in each. Realised gaps at seed 946
 /// (macOS arm64): param +16.1% (2.3 SD), BSV −2.5% (0.8 SD), within −7.9% (1.6 SD).
 const TOL: [f64; 3] = [0.28, 0.13, 0.20];
+
+/// A threshold row on `difference` is P(A − R ≥ a), the fraction of runs whose effect is at
+/// least `a`, not the change in attainment P(A ≥ a) − P(R ≥ a) (review r1 row 1). With the
+/// reference = 2 × adaptive, draw 1's effects are −[1, 3, 4, 8]: at a = −3.5 two of four
+/// reach it, 0.5. Both arms' own values are all ≥ −3.5, so their rows are 1 and the change
+/// in attainment is 0: the two readings differ on this input (the straddle).
+///
+/// Mutation: the difference's threshold row formed as adaptive row − reference row (0).
+#[test]
+fn a_threshold_row_on_the_difference_is_the_fraction_of_runs_whose_effect_reaches_it() {
+    let a = result_of(&[("1", &CUBE)], true);
+    let r = result_of(&[("1", &scaled(2.0))], true);
+    let opts =
+        AdaptiveSummaryOptions { thresholds: vec![(M::SignalMean, -3.5)], ..Default::default() };
+    let s = summarize_contrast(&a, &r, &labels(), &opts).unwrap();
+    let at = |summary: &AdaptivePopulationSummary| {
+        summary
+            .rows
+            .iter()
+            .find(|x| {
+                x.metric == M::SignalMean
+                    && x.statistic == AdaptiveSummaryStatistic::FractionAtLeast(-3.5)
+                    && x.draw == 1
+            })
+            .and_then(|x| x.value)
+    };
+    assert_eq!(at(&s.difference), Some(0.5));
+    assert_eq!((at(&s.adaptive), at(&s.reference)), (Some(1.0), Some(1.0)));
+}

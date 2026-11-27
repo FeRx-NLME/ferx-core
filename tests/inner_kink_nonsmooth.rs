@@ -133,18 +133,25 @@ fn inner_kick_is_off_by_default_and_leaves_a_second_mode_unreached() {
     assert!(by_id(&fit_with("bfgs", "  inner_kick = true\n")) < 5e-3);
 }
 
-/// In a fit that estimates, the kicked EBEs are the ones reported (#3159 review). Kicked in the
-/// final pass only, subject 20's kicked EBE lost the #833 comparison to the search's unkicked
-/// one on OFV, so the fit reported that one with `W_EBE_START_DEPENDENT`, and stayed at its
-/// initial estimates' −4826.2194 as the unkicked fit does. Kicked in every solve, one outer
-/// iteration reaches −4828.7659 (measured), with no such warning.
+/// In a fit that estimates, the kicked EBEs are the ones reported (#3159 review): one outer
+/// iteration kicked in every solve ends lower than the same iteration unkicked. Kicked in the
+/// final pass only (#3202's first design), the search's unkicked EBEs won #833's comparison and
+/// the fit ended above the unkicked one. A differential pair, so a shift of the outer path that
+/// moves both fits (as #3153's `f / c` first leg did) cancels.
+///
+/// Measured (macOS; the kicked fit is the same on CI's Linux): kicked −4835.241380, unkicked
+/// −4835.017384, final pass only −4834.445003, so the gaps to the unkicked fit are 0.224, and
+/// −0.572 for the final-pass mutant. Both fits carry #833's warning on subject 17 (cold re-solve
+/// 8.87 and 8.11 worse): the fixture's start dependence at this point, with or without kicks.
 #[test]
 fn an_estimating_fit_reports_the_kicked_ebes() {
-    let fit = fit_with("bfgs", "  inner_kick = true\n  maxiter = 1\n");
+    let kicked = fit_with("bfgs", "  inner_kick = true\n  maxiter = 1\n");
+    let unkicked = fit_with("bfgs", "  maxiter = 1\n");
     assert!(
-        !fit.warnings.iter().any(|w| w.contains("W_EBE_START_DEPENDENT")),
-        "{:?}",
-        fit.warnings
+        kicked.ofv < unkicked.ofv - 0.1,
+        "kicked OFV {} vs unkicked {}: {:?}",
+        kicked.ofv,
+        unkicked.ofv,
+        kicked.warnings
     );
-    assert!(fit.ofv < -4828.0, "OFV {}", fit.ofv);
 }
