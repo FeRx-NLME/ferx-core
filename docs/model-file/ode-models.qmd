@@ -448,6 +448,13 @@ Scope and limits:
 
   Each of those can still return a finite OFV, so a check that did not really run never
   reads as a settled objective.
+- The check is two inner-loop passes over every subject, which on a run that only scores a
+  model at given estimates (`maxiter = 0`) can cost as much as the evaluation, and on a stiff
+  model much more: the tighter pass integrates at a tolerance where the stepper may take
+  many times the steps. `ofv_settlement_wall_time_secs` in the fit's `estimation:` block
+  says what it took. `ode_ofv_check = false` skips it; the fit then carries
+  `W_ODE_OFV_SETTLEMENT_UNCHECKED` with `ode_ofv_check = false` as its reason, so a skipped
+  check never reads as a settled objective either (#3157).
 - Both sides re-find the EBEs the same way: one warm solve per subject from the fit's modes,
   under the settings of the stage that published the OFV (such as the tighter `inner_tol` a
   `laplace` stage uses). Only the ODE tolerance differs between them, so further movement of

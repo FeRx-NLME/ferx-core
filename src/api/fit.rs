@@ -2965,6 +2965,7 @@ fn fit_inner(
         .as_ref()
         .filter(|_| mixest_classes.is_none())
         .and_then(|o| Some((o.agq_nodes()?, o.hessian_anchor())));
+    let t_subject_results = std::time::Instant::now();
     // The SS non-convergence notes this fit reports are this pass's, at its estimates (#1522).
     let ((mut subjects, ode_solver_stats), ss_notes) = crate::dosing::ss_notes_at_estimates(|| {
         compute_subject_results(
@@ -2981,6 +2982,7 @@ fn fit_inner(
         )
     });
     result.warnings.extend(ss_notes);
+    let subject_results_wall_time_secs = t_subject_results.elapsed().as_secs_f64();
     // No second, sensitivity sweep here (#3076). One used to run the analytic η-Hessian per
     // subject at the estimates, for the one counter an `f64` pass cannot set,
     // `auto_stiff_rejected_jets` — but the derivative solves are compiled plans whose ODE loops
@@ -3578,6 +3580,7 @@ fn fit_inner(
     // objective is the K-class marginal, which this single-population re-score would not
     // reproduce, and the Monte-Carlo estimators publish an objective it does not compute, so
     // both are out of scope.
+    let mut ofv_settlement_wall_time_secs = 0.0;
     {
         use crate::estimation::ode_tolerance_check as otc;
         use crate::parser::model_parser::rhs_regcode::kernel_jit::release_fit_plans;
@@ -3588,21 +3591,31 @@ fn fit_inner(
             // The check re-records every subject at a tighter solver override, which a plan
             // carries (`Plan::ode_override`): it starts from no plans of the phases before it
             // (SIR's draws, the output columns) and leaves none behind (#3077).
-            let applies = otc::tightened_override(model, &stage).is_some();
-            if applies {
+            let shift = if otc::tightened_override(model, &stage).is_none() {
+                None
+            } else if !stage.ode_ofv_check {
+                let (msg, entry) = super::postfit::ode_ofv_check_off_warning();
+                warnings.push(msg);
+                native_warnings.push(entry);
+                None
+            } else {
+                let t_check = std::time::Instant::now();
                 release_fit_plans();
-            }
-            let shift = otc::ofv_tolerance_shift(
-                model,
-                population,
-                &result.params,
-                &result.eta_hats,
-                &result.kappas,
-                &stage,
-            );
-            if applies {
+                let shift = otc::ofv_tolerance_shift(
+                    model,
+                    population,
+                    &result.params,
+                    &result.eta_hats,
+                    &result.kappas,
+                    &stage,
+                );
                 release_fit_plans();
-            }
+                // A check cancelled mid-pass did not run: its time stays `0.0`.
+                if shift.is_some() {
+                    ofv_settlement_wall_time_secs = t_check.elapsed().as_secs_f64();
+                }
+                shift
+            };
             match shift {
                 Some(Ok(shift)) => {
                     if let Some((msg, entry)) = super::postfit::ode_ofv_not_settled_warning(&shift)
@@ -3764,6 +3777,8 @@ fn fit_inner(
         method_chain: chain.clone(),
         method_wall_times_secs,
         covariance_wall_time_secs,
+        ofv_settlement_wall_time_secs,
+        subject_results_wall_time_secs,
         converged,
         ofv,
         ofv_data,

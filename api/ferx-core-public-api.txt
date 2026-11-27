@@ -3562,6 +3562,7 @@ pub ferx_core::types::FitOptions::ode_abstol: f64
 pub ferx_core::types::FitOptions::ode_auto_switch: bool
 pub ferx_core::types::FitOptions::ode_max_steps: usize
 pub ferx_core::types::FitOptions::ode_method: ferx_core::ode::OdeMethod
+pub ferx_core::types::FitOptions::ode_ofv_check: bool
 pub ferx_core::types::FitOptions::ode_reltol: f64
 pub ferx_core::types::FitOptions::ode_stiff_abort_after: core::option::Option<u32>
 pub ferx_core::types::FitOptions::optimizer: ferx_core::Optimizer
@@ -3724,6 +3725,7 @@ pub ferx_core::types::FitResult::ode_linear_exact: bool
 pub ferx_core::types::FitResult::ofv: f64
 pub ferx_core::types::FitResult::ofv_data: f64
 pub ferx_core::types::FitResult::ofv_prior: f64
+pub ferx_core::types::FitResult::ofv_settlement_wall_time_secs: f64
 pub ferx_core::types::FitResult::omega: nalgebra::base::alias::DMatrix<f64>
 pub ferx_core::types::FitResult::omega_fixed: alloc::vec::Vec<bool>
 pub ferx_core::types::FitResult::omega_init: nalgebra::base::alias::DMatrix<f64>
@@ -3777,6 +3779,7 @@ pub ferx_core::types::FitResult::sir_seed: core::option::Option<u64>
 pub ferx_core::types::FitResult::sir_settings: core::option::Option<ferx_core::estimation::sir::SirSettings>
 pub ferx_core::types::FitResult::starts: alloc::vec::Vec<ferx_core::StartRecord>
 pub ferx_core::types::FitResult::stationary_start: bool
+pub ferx_core::types::FitResult::subject_results_wall_time_secs: f64
 pub ferx_core::types::FitResult::subjects: alloc::vec::Vec<ferx_core::SubjectResult>
 pub ferx_core::types::FitResult::theta: alloc::vec::Vec<f64>
 pub ferx_core::types::FitResult::theta_fixed: alloc::vec::Vec<bool>
@@ -5423,6 +5426,7 @@ pub ferx_core::FitOptions::ode_abstol: f64
 pub ferx_core::FitOptions::ode_auto_switch: bool
 pub ferx_core::FitOptions::ode_max_steps: usize
 pub ferx_core::FitOptions::ode_method: ferx_core::ode::OdeMethod
+pub ferx_core::FitOptions::ode_ofv_check: bool
 pub ferx_core::FitOptions::ode_reltol: f64
 pub ferx_core::FitOptions::ode_stiff_abort_after: core::option::Option<u32>
 pub ferx_core::FitOptions::optimizer: ferx_core::Optimizer
@@ -5585,6 +5589,7 @@ pub ferx_core::FitResult::ode_linear_exact: bool
 pub ferx_core::FitResult::ofv: f64
 pub ferx_core::FitResult::ofv_data: f64
 pub ferx_core::FitResult::ofv_prior: f64
+pub ferx_core::FitResult::ofv_settlement_wall_time_secs: f64
 pub ferx_core::FitResult::omega: nalgebra::base::alias::DMatrix<f64>
 pub ferx_core::FitResult::omega_fixed: alloc::vec::Vec<bool>
 pub ferx_core::FitResult::omega_init: nalgebra::base::alias::DMatrix<f64>
@@ -5638,6 +5643,7 @@ pub ferx_core::FitResult::sir_seed: core::option::Option<u64>
 pub ferx_core::FitResult::sir_settings: core::option::Option<ferx_core::estimation::sir::SirSettings>
 pub ferx_core::FitResult::starts: alloc::vec::Vec<ferx_core::StartRecord>
 pub ferx_core::FitResult::stationary_start: bool
+pub ferx_core::FitResult::subject_results_wall_time_secs: f64
 pub ferx_core::FitResult::subjects: alloc::vec::Vec<ferx_core::SubjectResult>
 pub ferx_core::FitResult::theta: alloc::vec::Vec<f64>
 pub ferx_core::FitResult::theta_fixed: alloc::vec::Vec<bool>

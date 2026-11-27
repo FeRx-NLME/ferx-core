@@ -3681,6 +3681,8 @@ fn wire_to_fit_result(
         method_chain,
         method_wall_times_secs: w.method_wall_times_secs,
         covariance_wall_time_secs: w.covariance_wall_time_secs,
+        ofv_settlement_wall_time_secs: 0.0,
+        subject_results_wall_time_secs: 0.0,
         converged: w.converged,
         ofv: w.ofv,
         ofv_data: w.ofv_data,

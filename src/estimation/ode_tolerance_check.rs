@@ -355,11 +355,25 @@ pub(crate) const NOT_CHECKED_TOKEN: &str = "W_ODE_OFV_SETTLEMENT_UNCHECKED";
 /// cleanly or failed the EBE convergence guard. Never silent: an inapplicable check, a failed one and a settled objective must not
 /// read the same (#2994 review r1, r2).
 pub(crate) fn not_checked_warning(reason: &str) -> String {
+    unchecked_warning(&format!(
+        "could not be checked: re-solving at a tighter ode_reltol / ode_abstol could not be \
+         completed, because {reason}"
+    ))
+}
+
+/// The note for a check the user switched off (`ode_ofv_check = false`, #3157): the same token
+/// and advice as a check that could not run, so a fit that skipped it never reads like a
+/// settled one.
+pub(crate) fn check_off_warning() -> String {
+    unchecked_warning("was not checked, because `ode_ofv_check = false`")
+}
+
+/// `what` happened to the check, then the one piece of advice every unchecked fit gets.
+fn unchecked_warning(what: &str) -> String {
     format!(
-        "{NOT_CHECKED_TOKEN}: whether the OFV is settled at the fit's ODE tolerance could not \
-         be checked: re-solving at a tighter ode_reltol / ode_abstol could not be completed, \
-         because {reason}. The fit and its OFV are unaffected; refit once with tighter \
-         ode_reltol / ode_abstol and compare the OFV before comparing models by it (#2994)."
+        "{NOT_CHECKED_TOKEN}: whether the OFV is settled at the fit's ODE tolerance {what}. The \
+         fit and its OFV are unaffected; refit once with tighter ode_reltol / ode_abstol and \
+         compare the OFV before comparing models by it (#2994)."
     )
 }
 

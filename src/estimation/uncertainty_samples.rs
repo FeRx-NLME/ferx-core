@@ -917,6 +917,8 @@ mod tests {
             method_chain: vec![],
             method_wall_times_secs: vec![],
             covariance_wall_time_secs: 0.0,
+            ofv_settlement_wall_time_secs: 0.0,
+            subject_results_wall_time_secs: 0.0,
             converged: true,
             ofv: 0.0,
             aic: Some(0.0),
