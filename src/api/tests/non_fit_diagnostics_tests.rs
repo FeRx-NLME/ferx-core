@@ -819,11 +819,16 @@ fn the_abandoned_clause_and_the_escalation_note_carry_the_phase() {
 /// remedy is pinned. Mutation: restore "set ode_method = rk45 to pin the explicit stepper", or
 /// reword it to "set ode_method = rk45 to skip the probe", and the first assert fails; delete
 /// the stiff-method names, the "verdict can be wrong" clause, the "only if" condition or the
-/// `W_ODE_SOLVER_DIAGNOSTICS` pointer and the matching assert fails.
+/// `W_ODE_SOLVER_DIAGNOSTICS` pointer and the matching assert fails. Only a fit's note names an
+/// OFV: a `predict()` or `simulate()` pass has none (#3196 review).
 #[test]
 fn the_escalation_note_does_not_offer_rk45_as_a_safe_pin() {
     let o = FitOptions::default();
-    for phase in [SolverStatsPhase::PostfitPredictions, SolverStatsPhase::Predict] {
+    for (phase, wrong) in [
+        (SolverStatsPhase::PostfitPredictions, "a wrong OFV"),
+        (SolverStatsPhase::Predict, "wrong predictions"),
+        (SolverStatsPhase::Simulate, "wrong simulated trajectories"),
+    ] {
         for escalated in [1, 60] {
             let (note, entry) = ode_solver_diagnostics_warning(
                 &crate::ode::OdeSolverStats {
@@ -837,13 +842,15 @@ fn the_escalation_note_does_not_offer_rk45_as_a_safe_pin() {
             )
             .expect("an info note");
             assert!(!note.contains("ode_method = rk45"), "{note}");
+            assert_eq!(note.contains("OFV"), phase == SolverStatsPhase::PostfitPredictions);
             for clause in [
-                "ode_method = rodas5p or rodas4",
+                "To skip the probe, name a stiff method (ode_method = rodas5p or rodas4)",
+                ", which then runs every segment",
                 "can be wrong on a model that is not stiff",
                 "Pin rk45 only if those segments are not stiff",
-                "freeze-pads them and returns a wrong OFV",
+                format!("can exhaust its step budget, freeze-pad them and return {wrong}").as_str(),
                 "W_ODE_SOLVER_DIAGNOSTICS",
-                "Compare the OFV against a stiff method",
+                "Compare the results against a stiff method",
             ] {
                 assert!(note.contains(clause), "missing {clause:?}: {note}");
             }
