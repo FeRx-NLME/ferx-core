@@ -72,23 +72,63 @@ pub enum AdaptiveSummaryMetric {
     },
 }
 
-/// The scalar metrics, in output order: every one gets rows, present or not.
-const SCALAR_METRICS: [AdaptiveSummaryMetric; 12] = [
-    AdaptiveSummaryMetric::CumulativeDose,
-    AdaptiveSummaryMetric::NDoses,
-    AdaptiveSummaryMetric::NIncreases,
-    AdaptiveSummaryMetric::NDecreases,
-    AdaptiveSummaryMetric::NHolds,
-    AdaptiveSummaryMetric::NNotDue,
-    AdaptiveSummaryMetric::Discontinued,
-    AdaptiveSummaryMetric::SignalMin,
-    AdaptiveSummaryMetric::SignalMax,
-    AdaptiveSummaryMetric::SignalMean,
-    AdaptiveSummaryMetric::PctReadingsInWindow,
-    AdaptiveSummaryMetric::AucTargetAttainment,
-];
-
 impl AdaptiveSummaryMetric {
+    /// The scalar metrics (every variant but `Signal`), in output order: every one gets
+    /// rows, present or not. A slice, so adding a metric does not change its type.
+    pub const SCALARS: &'static [AdaptiveSummaryMetric] = &[
+        AdaptiveSummaryMetric::CumulativeDose,
+        AdaptiveSummaryMetric::NDoses,
+        AdaptiveSummaryMetric::NIncreases,
+        AdaptiveSummaryMetric::NDecreases,
+        AdaptiveSummaryMetric::NHolds,
+        AdaptiveSummaryMetric::NNotDue,
+        AdaptiveSummaryMetric::Discontinued,
+        AdaptiveSummaryMetric::SignalMin,
+        AdaptiveSummaryMetric::SignalMax,
+        AdaptiveSummaryMetric::SignalMean,
+        AdaptiveSummaryMetric::PctReadingsInWindow,
+        AdaptiveSummaryMetric::AucTargetAttainment,
+    ];
+
+    /// The stable output label: the [`AdaptiveSubjectMetrics`] column it summarises as
+    /// ferx-r names it (`"CUM_DOSE"`, `"N_DOSES"`, …), and `"SIGNAL"` for every `Signal`,
+    /// whose analyte and decision are its fields. Exhaustive here so downstream needs no
+    /// wildcard (#2581).
+    pub fn label(&self) -> &'static str {
+        use AdaptiveSummaryMetric::*;
+        match self {
+            CumulativeDose => "CUM_DOSE",
+            NDoses => "N_DOSES",
+            NIncreases => "N_INCREASES",
+            NDecreases => "N_DECREASES",
+            NHolds => "N_HOLDS",
+            NNotDue => "N_NOT_DUE",
+            Discontinued => "DISCONTINUED",
+            SignalMin => "SIGNAL_MIN",
+            SignalMax => "SIGNAL_MAX",
+            SignalMean => "SIGNAL_MEAN",
+            PctReadingsInWindow => "PCT_READINGS_IN_WINDOW",
+            AucTargetAttainment => "AUC_TARGET_ATTAINMENT",
+            Signal { .. } => "SIGNAL",
+        }
+    }
+
+    /// The scalar metric whose [`label`](Self::label) is `label`; `None` otherwise,
+    /// including `"SIGNAL"`, which needs an analyte and a decision to name one metric.
+    pub fn from_label(label: &str) -> Option<Self> {
+        Self::SCALARS.iter().find(|m| m.label() == label).cloned()
+    }
+
+    /// The label, with the analyte and decision of a `Signal`: for messages.
+    fn describe(&self) -> String {
+        match self {
+            AdaptiveSummaryMetric::Signal { analyte, decision_idx } => {
+                format!("SIGNAL (analyte '{analyte}', decision {decision_idx})")
+            }
+            m => m.label().to_string(),
+        }
+    }
+
     /// This metric's value in one run's metrics row; `None` where the run carries none.
     /// The only mapping from a metric to its field. `Signal` is not a field of the row.
     pub(crate) fn value(&self, m: &AdaptiveSubjectMetrics) -> Option<f64> {
@@ -123,6 +163,19 @@ pub enum AdaptiveSummaryStatistic {
     /// e.g. `PctReadingsInWindow ≥ 0.8`. Requested through
     /// [`AdaptiveSummaryOptions::thresholds`].
     FractionAtLeast(f64),
+}
+
+impl AdaptiveSummaryStatistic {
+    /// The stable output label: `"mean"`, `"median"` or `"fraction_at_least"` (the
+    /// threshold is the variant's field). Exhaustive here so downstream needs no wildcard
+    /// (#2581).
+    pub fn label(&self) -> &'static str {
+        match self {
+            AdaptiveSummaryStatistic::Mean => "mean",
+            AdaptiveSummaryStatistic::Median => "median",
+            AdaptiveSummaryStatistic::FractionAtLeast(_) => "fraction_at_least",
+        }
+    }
 }
 
 /// What [`summarize_adaptive`] computes besides the mean and median of every metric.
@@ -187,6 +240,17 @@ pub enum AdaptiveBandStatus {
     NotDrawn,
     /// The quantiles across draws of the per-draw statistic.
     Quantiles(AdaptiveQuantiles),
+}
+
+impl AdaptiveBandStatus {
+    /// The stable output label: `"not_drawn"` or `"quantiles"`. Exhaustive here so
+    /// downstream needs no wildcard (#2581).
+    pub fn label(&self) -> &'static str {
+        match self {
+            AdaptiveBandStatus::NotDrawn => "not_drawn",
+            AdaptiveBandStatus::Quantiles(_) => "quantiles",
+        }
+    }
 }
 
 /// The parameter-uncertainty band of one per-draw statistic: its quantiles **across
@@ -276,7 +340,8 @@ pub(super) fn check_summary_options(
     }
     if let Some((m, a)) = opts.thresholds.iter().find(|(_, a)| !a.is_finite()) {
         return Err(crate::entry_refusals::adaptive_options(format!(
-            "{who}: the threshold for {m:?} is {a}; it must be finite"
+            "{who}: the threshold for {} is {a}; it must be finite",
+            m.describe()
         )));
     }
     Ok(())
@@ -302,7 +367,7 @@ pub(super) fn summarize_values(
 ) -> AdaptivePopulationSummary {
     // The values present per (metric, draw).
     let mut by_metric: BTreeMap<AdaptiveSummaryMetric, BTreeMap<usize, Vec<f64>>> =
-        SCALAR_METRICS.iter().map(|m| (m.clone(), BTreeMap::new())).collect();
+        AdaptiveSummaryMetric::SCALARS.iter().map(|m| (m.clone(), BTreeMap::new())).collect();
     for (draw, metric, v) in values {
         by_metric.entry(metric).or_default().entry(draw).or_default().push(v);
     }
@@ -398,7 +463,9 @@ pub(super) fn run_values(
 ) -> impl Iterator<Item = (RunKey<'_>, AdaptiveSummaryMetric, f64)> {
     let scalars = result.metrics.iter().flat_map(|row| {
         let run = RunKey { subject: &row.subject, draw: row.draw, sim: row.sim, rep: row.rep };
-        SCALAR_METRICS.iter().filter_map(move |m| m.value(row).map(|v| (run, m.clone(), v)))
+        AdaptiveSummaryMetric::SCALARS
+            .iter()
+            .filter_map(move |m| m.value(row).map(|v| (run, m.clone(), v)))
     });
     let signals = result.decisions.iter().flat_map(|d| {
         let run = RunKey { subject: &d.subject, draw: d.draw, sim: d.sim, rep: d.rep };
