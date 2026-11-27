@@ -509,7 +509,7 @@ fn check_per_cmt_scaling(model: &CompiledModel, population: &Population) -> Vec<
         Ok(()) => Vec::new(),
         Err(msg) => {
             let block = msg.strip_prefix('[').and_then(|m| m.split_once(']')).map(|(b, _)| b);
-            let block = block.unwrap_or("scaling").to_string();
+            let block = block.expect("validate_per_cmt_scaling opens with its block").to_string();
             vec![Diagnostic::error("E_PER_CMT_SCALING", msg).with_block(&block)]
         }
     }

@@ -573,7 +573,9 @@ fn an_observed_cmt_with_no_readout_entry_is_an_error_on_every_readout() {
         assert_eq!(got.len(), 1, "{block}: {got:?}");
         assert_eq!(got[0].block.as_deref(), Some(block), "{:?}", got[0]);
         assert!(got[0].message.starts_with(&format!("[{block}]:")), "{}", got[0].message);
-        assert!(got[0].message.contains("[3]"), "{}", got[0].message);
+        for phrase in ["missing entries for observed CMTs [3]", "must have a `y[CMT=N]` entry"] {
+            assert!(got[0].message.contains(phrase), "{phrase}: {}", got[0].message);
+        }
         // The control: observations on the declared CMTs only are not refused.
         assert!(errs(&population(OBS_BOTH_CMTS)).is_empty(), "{block}: covered CMTs refused");
     }

@@ -830,7 +830,7 @@ pub fn validate_per_cmt_scaling(model: &CompiledModel, subjects: &[Subject]) -> 
             if !missing.is_empty() {
                 let block = if model.is_algebraic() { "[structural_model]" } else { "[scaling]" };
                 return Err(format!(
-                    "{block}: per-CMT `y[CMT=N]` Form C is missing entries for observed CMTs {:?}. \
+                    "{block}: the per-CMT `y[CMT=N]` readout is missing entries for observed CMTs {:?}. \
                      Every observed CMT must have a `y[CMT=N]` entry.",
                     missing
                 ));
