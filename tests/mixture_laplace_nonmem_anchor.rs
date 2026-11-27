@@ -1,6 +1,6 @@
 //! #3025's NONMEM anchor: a two-class `[mixture]` model under Laplace, against
 //! `nonmem_anchor/mixture_laplace.ctl` (`$MIX NSPOP=2`, `$EST METHOD=COND LAPLACIAN INTER`,
-//! `$COV MATRIX=R`; NONMEM 7.5.1 on klebsiella, `nonmem_anchor/results/mixture_laplace.{lst,ext}`).
+//! `$COV MATRIX=R`; NONMEM 7.5.1 on klebsiella, `nonmem_anchor/results/mixture_laplace.{nm.json,ext}`).
 //!
 //! The ferx twin is `nonmem_anchor/mixture_laplace.ferx` on `nonmem_anchor/mixture_iv.csv`.
 //! NONMEM writes the mixing fraction as `P(1) = THETA(4)`, ferx as `logit(1) = MIXL`, so

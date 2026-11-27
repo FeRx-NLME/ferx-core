@@ -284,7 +284,7 @@ NONMEM has no `weight =` on an `$OMEGA`, so its equivalent model writes the
 scaling into `$PK` by hand — which is exactly what the declaration desugars
 into. Both engines were run on the warfarin IOV dataset with an arm-size column
 (`NARM` = 400 on occasion 1, 25 on occasion 2), 1-cpt oral, FOCE, same starting
-values (`tests/nonmem/kappa_weight_iov.{ctl,lst,ext}`):
+values (`tests/nonmem/kappa_weight_iov.{ctl,nm.json,ext}`):
 
 | Quantity | NONMEM 7.6.0 | ferx |
 |---|---|---|

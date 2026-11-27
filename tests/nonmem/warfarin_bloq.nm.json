@@ -1,0 +1,131 @@
+{
+ "nonmem_version": "7.5.1",
+ "data_file": "warfarin_bloq.csv",
+ "data_records": 120,
+ "observations": 110,
+ "individuals": 10,
+ "nmtran_warnings": [2, 87],
+ "markers": [
+  "MINIMIZATION SUCCESSFUL"
+ ],
+ "steps": [
+  {
+   "method": "Laplacian Conditional Estimation with Interaction",
+   "objv": -216.788,
+   "objv_without_constant": -216.7875439184317,
+   "objv_with_constant": -32.999837277497164,
+   "function_evaluations": 152,
+   "significant_digits": 3.3,
+   "etabar": [
+    [7.8819e-05, 1.6977e-05, -0.00024051]
+   ],
+   "etabar_se": [
+    [0.053693, 0.030832, 0.1831]
+   ],
+   "p_val": [
+    [0.99883, 0.99956, 0.99895]
+   ],
+   "etashrinksd": [
+    [0.034442, 0.19905, 0.079506]
+   ],
+   "etashrinkvr": [
+    [0.068872, 0.3977, 0.15895]
+   ],
+   "ebvshrinksd": [
+    [0.042579, 0.20351, 0.034181]
+   ],
+   "ebvshrinkvr": [
+    [0.08514, 0.4066, 0.06835]
+   ],
+   "relativeinf": [
+    [99.915, 99.593, 99.932]
+   ],
+   "epsshrinksd": [
+    [16.087]
+   ],
+   "epsshrinkvr": [
+    [29.586]
+   ],
+   "final": {
+    "theta": [0.133, 7.73, 0.81, 0.0108],
+    "omega": {
+     "ETA1": [0.0288],
+     "ETA2": [0.0, 0.00954],
+     "ETA3": [0.0, 0.0, 0.336]
+    },
+    "sigma": {
+     "EPS1": [1.0]
+    }
+   },
+   "standard_error": {
+    "theta": [0.00714, 0.24, 0.149, 0.000956],
+    "omega": {
+     "ETA1": [0.0111],
+     "ETA2": [null, 0.00399],
+     "ETA3": [null, null, 0.139]
+    },
+    "sigma": {
+     "EPS1": [null]
+    }
+   },
+   "covariance": {
+    "TH 1": [5.09e-05],
+    "TH 2": [0.000183, 0.0574],
+    "TH 3": [-0.000326, 0.0125, 0.0221],
+    "TH 4": [-5.7e-07, 0.000117, 1.05e-05, 9.13e-07],
+    "OM11": [1.95e-05, 0.000265, -0.000242, 2.68e-06, 0.000122],
+    "OM12": [null, null, null, null, null, null],
+    "OM13": [null, null, null, null, null, null, null],
+    "OM22": [-8.01e-06, -0.000721, -0.00017, -1.67e-06, -9.82e-06, null, null, 1.59e-05],
+    "OM23": [null, null, null, null, null, null, null, null, null],
+    "OM33": [5.85e-05, 0.000147, 0.00983, -7.36e-05, -0.000432, null, null, 6.48e-05, null, 0.0193],
+    "SG11": [null, null, null, null, null, null, null, null, null, null, null]
+   },
+   "markers": [
+    "MINIMIZATION SUCCESSFUL"
+   ]
+  }
+ ],
+ "control_stream_as_run": [
+  "$PROBLEM Warfarin M3 BLOQ (proportional error, LLOQ=2.0) - ferx-core cross-check (issue #367)",
+  "; Cross-check for ferx's M3 likelihood + analytic M3 inner EBE gradient.",
+  "; ferx model: examples/warfarin_bloq.ferx (one_cpt_oral, DV ~ proportional(PROP_ERR),",
+  "; bloq_method = m3). On CENS=1 rows the DV cell carries the LLOQ (2.0) and the row",
+  "; contributes \u2212log\u03a6((LLOQ\u2212f)/\u221aV) to the objective.",
+  ";",
+  "; NONMEM reproduces M3 with the F_FLAG / mixed-likelihood pattern under LAPLACE:",
+  "; censored rows return \u03a6((LLOQ\u2212IPRED)/SD) as a likelihood (F_FLAG=1); quantified",
+  "; rows use the ordinary proportional residual. ferx's PROP_ERR is a proportional",
+  "; *SD* coefficient, so SD = THETA(4)*IPRED with EPS(1) ~ N(0,1) (SIGMA fixed to 1).",
+  "$DATA warfarin_bloq.csv IGNORE=@",
+  "$INPUT ID TIME DV EVID AMT CMT=DROP RATE MDV CENS",
+  "$SUBROUTINES ADVAN2 TRANS2",
+  "$PK",
+  "  CL = THETA(1)*EXP(ETA(1))",
+  "  V  = THETA(2)*EXP(ETA(2))",
+  "  KA = THETA(3)*EXP(ETA(3))",
+  "  S2 = V",
+  "$ERROR",
+  "  LLOQ  = 2.0",
+  "  IPRED = F",
+  "  SD    = THETA(4)*IPRED          ; proportional SD, matches ferx proportional(PROP_ERR)",
+  "  IF (CENS.EQ.1) THEN",
+  "    F_FLAG = 1",
+  "    Y = PHI((LLOQ - IPRED)/SD)     ; M3: censored row contributes \u03a6((LLOQ\u2212f)/SD)",
+  "  ELSE",
+  "    F_FLAG = 0",
+  "    Y = IPRED + SD*EPS(1)",
+  "  ENDIF",
+  "$THETA (0, 0.2)    ; TVCL",
+  "$THETA (0, 10.0)   ; TVV",
+  "$THETA (0, 1.5)    ; TVKA",
+  "$THETA (0, 0.02)   ; PROP_ERR (proportional SD)",
+  "$OMEGA 0.09        ; ETA_CL",
+  "$OMEGA 0.04        ; ETA_V",
+  "$OMEGA 0.30        ; ETA_KA",
+  "$SIGMA 1 FIX       ; EPS(1) ~ N(0,1); the proportional SD lives in THETA(4)",
+  "$ESTIMATION METHOD=1 LAPLACE INTER MAXEVAL=9999 NSIG=3 SIGL=9 PRINT=5 NOABORT",
+  "$COVARIANCE UNCONDITIONAL",
+  "$TABLE ID TIME IPRED CENS NOPRINT ONEHEADER FILE=sdtab_bloq"
+ ]
+}

@@ -6728,6 +6728,90 @@ fn ebe_gradient_fd_steps_by_the_integrator_and_scales_from_the_origin() {
     close("gradient", &g, &[5.0, -3.0, 0.6]);
 }
 
+/// #3145: one evaluation of the integrating difference that leaves a segment unfinished sends
+/// the whole gradient to the roundoff step, and none keeps it. The unfinished solve is placed on
+/// one probe at a time, so a check of only the first or the last evaluation dies.
+#[test]
+fn ebe_gradient_fd_takes_the_roundoff_step_where_a_solve_is_unfinished() {
+    use crate::ode::{solve_ode, OdeMethod, OdeSolverOptions};
+    let rhs = |u: &[f64], _p: &[f64], _t: f64, du: &mut [f64]| du[0] = -u[0];
+    let opts = |max_steps| OdeSolverOptions {
+        max_steps,
+        initial_dt: 0.1,
+        method: OdeMethod::Rk45,
+        ..OdeSolverOptions::default()
+    };
+    let x = [2.5, -1.5];
+    let quadratic = |x: &[f64]| x.iter().map(|v| v * v).sum::<f64>();
+    for unfinished_at in [None, Some(0), Some(1), Some(2), Some(3)] {
+        let n_eval = std::cell::Cell::new(0usize);
+        let obj = |x: &[f64]| {
+            let k = n_eval.replace(n_eval.get() + 1);
+            let budget = if Some(k) == unfinished_at { 1 } else { 10_000 };
+            solve_ode(&rhs, &[1.0], (0.0, 1.0), &[], &[1.0], &opts(budget));
+            quadratic(x)
+        };
+        arm_ebe_fd_calls();
+        let g = ebe_gradient_fd(&obj, &x, None, 2, Some(1e-3));
+        let calls = take_ebe_fd_calls();
+        let (step, evals, want) = match unfinished_at {
+            None => (Some(1e-3), 4, gradient_fd_step(&quadratic, &x, None, 2, 1e-3)),
+            Some(_) => (None, 8, gradient_fd(&quadratic, &x, 2)),
+        };
+        assert_eq!(calls, vec![(step, None)], "unfinished at {unfinished_at:?}");
+        assert_eq!(n_eval.get(), evals, "unfinished at {unfinished_at:?}");
+        assert_eq!(g, want, "unfinished at {unfinished_at:?}");
+    }
+    // An `auto` escalation the guard discarded and re-solved left no unfinished trajectory.
+    let obj = |x: &[f64]| {
+        crate::ode::solver::record_to_stats_sink(&crate::ode::OdeSolverStats {
+            unfinished_segments: 1,
+            discarded_unfinished_segments: 1,
+            ..Default::default()
+        });
+        quadratic(x)
+    };
+    arm_ebe_fd_calls();
+    ebe_gradient_fd(&obj, &x, None, 2, Some(1e-3));
+    assert_eq!(take_ebe_fd_calls(), vec![(Some(1e-3), None)], "a discarded attempt");
+}
+
+/// #3145 through the production objective: the counters the gate reads are the ones a subject's
+/// own inner solve leaves. One model, one subject, both sides: at the default step budget every
+/// FD gradient takes the integrating step, and on a budget no segment can finish within, none.
+#[test]
+fn an_fd_inner_search_takes_the_integrating_step_only_where_the_solve_finishes() {
+    let (_, subject, _) = tmdd_2868_fixture();
+    let mut model = crate::parser::model_parser::parse_model_string(
+        "[parameters]\n  theta TVCL(0.3, 0.001, 10.0)\n  theta TVV(3.0, 0.1, 100.0)\n  \
+         omega ETA_CL ~ 0.09\n  omega ETA_V ~ 0.04\n  sigma PROP_ERR ~ 0.04 (sd)\n\
+         [individual_parameters]\n  CL = TVCL * exp(ETA_CL)\n  V = TVV * exp(ETA_V)\n\
+         [structural_model]\n  ode(obs_cmt=drug, states=[drug])\n\
+         [odes]\n  d/dt(drug) = -(CL / V) * drug\n\
+         [scaling]\n  y = drug / V\n\
+         [error_model]\n  DV ~ proportional(PROP_ERR)\n",
+    )
+    .expect("one-compartment ODE parses");
+    model.gradient_method = GradientMethod::Fd;
+    let params = model.default_params.clone();
+    for (max_steps, want) in [(None, Some(1e-3)), (Some(1), None)] {
+        let _fit =
+            crate::ode::solver::arm_ode_solver_override(crate::ode::solver::OdeSolverOverride {
+                method: Some(crate::ode::OdeMethod::Rk45),
+                max_steps,
+                ..Default::default()
+            });
+        assert_eq!(model_integrating_fd_step(&model), Some(1e-3), "the model gate is open");
+        arm_ebe_fd_calls();
+        find_ebe(&model, &subject, &params, 20, 1e-5, None, None, 0);
+        let calls = take_ebe_fd_calls();
+        assert!(
+            !calls.is_empty() && calls.iter().all(|c| *c == (want, None)),
+            "max_steps {max_steps:?}: want step {want:?}, {calls:?}"
+        );
+    }
+}
+
 /// #2868 on a closed form with an ODE twin: a transit subject earns the integrating step only
 /// at an iterate the twin serves. The fixture is the crossing case above, whose search starts
 /// in the closed form's domain and ends past the flip-flop abscissa, so one solve has a
@@ -7158,9 +7242,8 @@ fn gradient_timing_follows_each_fits_reading_of_the_variable() {
     assert!(t.start().is_none());
 }
 
-/// The mode's predictions are handed back bit for bit from the one walk kept per solve, also
-/// where the search's last walk was another point (a probe beside the mode), and a solve of an
-/// ODE model holds one entry however many points it visited. Mutation: drop the kept walk's
+/// The mode's predictions are handed back bit for bit from the walks kept per solve, also
+/// where the search's last walk was another point (a trial beside the mode). Mutation: drop the kept walk's
 /// read-back at the end of the solve -> `ipreds` is `None` for the solves counted below.
 #[test]
 fn the_kept_walk_returns_the_modes_predictions_bit_for_bit() {
@@ -7209,6 +7292,35 @@ fn the_kept_walk_returns_the_modes_predictions_bit_for_bit() {
     eprintln!("{n_some} solves returned ipreds, {restored} from the kept walk");
     assert_eq!(n_some, 8, "every ODE solve hands its predictions back");
     assert!(restored > 0, "fixture: a solve whose last walk was another point");
+}
+
+/// The mode is kept whether it ties a point walked before it or one walked after it (#3042):
+/// the tie the test above meets on macOS arm64 only, forced here on every platform. Mutations:
+/// keep only the first of a tie (`<`) -> the first case fails; only the latest (`<=`) -> the
+/// second fails; `held` reads slot 0 only -> the `held` assert fails; drop the guard on
+/// non-finite and sentinel values -> the last three fail.
+#[test]
+fn kept_walks_hold_the_mode_on_either_side_of_a_tie() {
+    use crate::stats::likelihood::SUBJECT_SENTINEL_NLL as S;
+    let take = |walks: &[([f64; 1], f64)], mode: f64| {
+        let mut kept = KeptWalks::default();
+        for (e, v) in walks {
+            kept.offer(e, *v, &[e[0] * 10.0]);
+        }
+        kept.take_at(&[mode], 1)
+    };
+    let (a, m, b) = (([1.0], 2.0), ([2.0], 2.0), ([3.0], 2.0));
+    assert_eq!(take(&[a, m], 2.0), Some(vec![20.0]), "the mode ties an earlier point");
+    assert_eq!(take(&[m, b], 2.0), Some(vec![20.0]), "a later trial ties the mode");
+    assert_eq!(take(&[m, ([5.0], f64::NAN)], 2.0), Some(vec![20.0]), "NaN is never kept");
+    assert_eq!(take(&[([5.0], f64::NAN), m], 2.0), Some(vec![20.0]), "NaN does not block");
+    let inf = ([6.0], f64::NEG_INFINITY);
+    assert_eq!(take(&[inf, m], 2.0), Some(vec![20.0]), "-inf is never kept");
+    assert_eq!(take(&[([5.0], S), ([6.0], S)], 6.0), None, "the sentinel is never kept");
+    let mut kept = KeptWalks::default();
+    kept.offer(&[2.0], 2.0, &[20.0]);
+    kept.offer(&[3.0], 2.0, &[30.0]);
+    assert_eq!(kept.held(&[3.0]), Some(2.0), "`held` reads the tie slot");
 }
 
 /// A subject with no observations (doses only) has a prior-only inner problem and no data term

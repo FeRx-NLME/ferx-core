@@ -1,0 +1,37 @@
+{
+ "nonmem_version": "7.5.1",
+ "data_file": "count_pois.csv",
+ "data_records": 360,
+ "observations": 360,
+ "individuals": 60,
+ "nmtran_warnings": [2],
+ "markers": [],
+ "steps": [
+  {
+   "method": "Laplacian Conditional Estimation (Evaluation)",
+   "objv": 1514.514,
+   "final": {
+    "theta": [3.96, 0.679, -0.418],
+    "omega": {
+     "ETA1": [0.269]
+    }
+   },
+   "markers": []
+  }
+ ],
+ "control_stream_as_run": [
+  "$PROBLEM ferx #2877 count endpoint (pois, laplace) evaluated at the lme4::glmer optimum: -2 log PMF with ln Gamma(k+1) kept, LAPLACE",
+  "$INPUT ID TIME DV CMT EVID MDV WT TRT",
+  "$DATA count_pois.csv IGNORE=@",
+  "$PRED",
+  " LAM = EXP(LOG(THETA(1)) + THETA(2)*(WT/70 - 1) + THETA(3)*TRT + ETA(1))",
+  "",
+  " Y = -2*(DV*LOG(LAM) - LAM - GAMLN(DV+1))",
+  "$THETA",
+  " 3.960677636175127 FIX  ; BASE",
+  " 0.678942099471635 FIX  ; BETA",
+  " -0.4183540511101 FIX  ; GAM",
+  "$OMEGA 0.269389262185741 FIX  ; ETA_C",
+  "$ESTIMATION METHOD=COND LAPLACE -2LL MAXEVAL=0 NSIG=4 SIGL=12 PRINT=10 NOABORT FORMAT=s1PE23.16"
+ ]
+}

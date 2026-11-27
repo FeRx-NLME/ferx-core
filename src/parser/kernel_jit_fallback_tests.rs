@@ -195,8 +195,11 @@ fn saem_falls_back_to_fd() {
         ..opts(EstimationMethod::Saem)
     };
     let (e, f) = pair(&m, &p, &o);
-    // Measured 5.2e-10 / 0 / 1.8e-8: the M-step's per-θ score lands on the same draws.
-    check("saem", &e, &f, [1e-8, 1e-9, 1e-6]);
+    // Measured on 29a773f0: |ΔOFV| 0 and Δparam 0 (the M-step's per-θ score lands on the same
+    // draws); max ΔSE 7.4e-7 on Linux x86_64 and 1.07e-6 on macOS arm64 (θ2's SE there): the
+    // covariance step's finite differences against the plans' exact derivatives (#3047).
+    // 1e-5 is 9× the larger.
+    check("saem", &e, &f, [1e-8, 1e-9, 1e-5]);
 }
 
 #[test]

@@ -315,6 +315,8 @@ The EBE search takes an exact gradient of the inner objective wherever the recor
 
 So on a model with an integrator, the search differences with a step of `1e-3` per unit of $1 + |\eta|$ at the default `ode_reltol = 1e-4`, the step the [FD Jacobian](#fd-jacobian-tolerance) uses. At a tighter tolerance the step shrinks as `ode_reltol^(1/3)`: truncation error grows as the square of the step and integration noise as its inverse, so the best step follows the cube root of the noise. At a looser tolerance the step stays at `1e-3`; that direction has not been measured on a fit. A model on the exact matrix-exponential path (`ode_method = linear`, or `auto` on an affine `[odes]` block) keeps a step of `1e-7`, because its solve has no step sequence to jump between. A closed form keeps it too, except where a transit or inverse-Gaussian absorption subject is solved on its ODE twin. That solve integrates, so it takes the integrating step; no measurement above covers that case. An IOV search with μ-referencing scales the step by $|\eta|$, not by the μ-shifted coordinate it searches over.
 
+The integrating step assumes an integration error of about `ode_reltol`. Where a solve behind the difference stops at its step budget (`ode_max_steps`) before the end of a segment, that does not hold, and the gradient at that point uses the `1e-7` step ([#3145](https://github.com/FeRx-NLME/ferx-core/issues/3145)). This is reached mostly on outer line-search trials the EBE guard goes on to reject, including in fits whose inner gradient is otherwise exact.
+
 Measured on the full-TMDD model of [#2845](https://github.com/FeRx-NLME/ferx-core/issues/2845), 30 subjects, FOCEI, `maxiter = 0`, at 25 values of `TVKON` from 1.300 to 1.348, macOS arm64 ([#2868](https://github.com/FeRx-NLME/ferx-core/issues/2868)). Each cell is the worst distance from the analytic route's objective at the same settings:
 
 | `ode_method`, `ode_reltol` / `ode_abstol` | step `1e-7` (before) | integrating step (now) |
@@ -646,7 +648,7 @@ Before #2974 the score held each subject's EBEs and their linearisation at the e
 
 #### NONMEM cross-check at a common point (S, R, RSR)
 
-`S` contains no `R`, so it is the like-for-like comparison with NONMEM's `MATRIX=S`: both engines are evaluated at one fixed point, NONMEM 7.6's own MLE printed to six significant figures (`$ESTIMATION MAXEVAL=0`; ferx `outer_maxiter = 0`), and both re-estimate the EBEs there. Control streams are `nonmem_anchor/wf_{focei,foce,iov}_*.ctl` and their outputs `nonmem_anchor/results/wf_{focei,foce,iov}_*.{ext,lst}`, guarded by `tests/covariance_s_nonmem_eval_anchor.rs`. Worst relative SE gap over θ, Ω (and the IOV variance):
+`S` contains no `R`, so it is the like-for-like comparison with NONMEM's `MATRIX=S`: both engines are evaluated at one fixed point, NONMEM 7.6's own MLE printed to six significant figures (`$ESTIMATION MAXEVAL=0`; ferx `outer_maxiter = 0`), and both re-estimate the EBEs there. Control streams are `nonmem_anchor/wf_{focei,foce,iov}_*.ctl` and their outputs `nonmem_anchor/results/wf_{focei,foce,iov}_*.{ext,nm.json}`, guarded by `tests/covariance_s_nonmem_eval_anchor.rs`. Worst relative SE gap over θ, Ω (and the IOV variance):
 
 | Model | `s` vs `MATRIX=S` | `s` before #2974 | `r` vs `MATRIX=R` | `rsr` vs default `$COV` |
 |---|---|---|---|---|

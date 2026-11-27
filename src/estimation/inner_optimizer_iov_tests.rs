@@ -5168,6 +5168,7 @@ fn iov_solve_at_a_tight_tolerance_certifies_a_partial_at_its_mode() {
             0,
             EbeVariance::Conditional,
             false,
+            false,
             InnerHessianSeed::None,
         )
     };
@@ -5655,6 +5656,74 @@ fn iov_multistart_runs_on_cold_solves_only() {
     assert!(r.kappas[1][0] > 0.0, "and stays put: {:?}", r.kappas);
     cold_iov_solve(&model, &subject, 1, 1e-6, None);
     assert_eq!(started(), before + 1, "a cold one does");
+}
+
+/// #2900: an exactly-zero joint start an earlier pass returned (`PrevEtas::Solved`) is warm,
+/// as in the non-IOV solve (#2691), so it starts no multi-start; the same zeros as the cold
+/// placeholder do, and so does a solved η̂ alone (the ODE+IOV cache's), whose κ restart at 0.
+/// (An IOV subject none of whose η and κ the predictions read is re-scanned at every
+/// evaluation otherwise: 134 times in a 10-subject `warfarin_iov` fit.)
+#[test]
+fn iov_solved_zero_start_runs_no_multistart() {
+    let (model, subject) = two_mode_fixture(TWO_MODE_RESET, "1");
+    let r = cold_iov_solve(&model, &subject, 0, 1e-6, None);
+    let zero = vec![0.0; r.eta.len() + r.kappas.iter().map(|k| k.len()).sum::<usize>()];
+    let started = || EBE_MULTISTARTS_STARTED.with(|n| n.get());
+    let n_eta = r.eta.len();
+    for (prev, start, runs) in [
+        (PrevEtas::Solved, &zero[..], 0),
+        (PrevEtas::Placeholder, &zero[..], 1),
+        (PrevEtas::Solved, &zero[..n_eta], 1),
+    ] {
+        let before = started();
+        find_ebe_for_stage_with_prev(
+            &model,
+            &subject,
+            &model.default_params,
+            500,
+            1e-6,
+            Some(start),
+            None,
+            4,
+            &crate::types::FitOptions::default(),
+            prev,
+        );
+        assert_eq!(started() - before, runs, "{prev:?}, start of {}", start.len());
+    }
+}
+
+/// #2900: the same start is seeded with the Gauss–Newton metric as a solved zero joint start
+/// and left unseeded as the cold placeholder or a solved η̂ alone, as the non-IOV solve does.
+/// Mutation: `is_warm_start(eta_init, init_is_mode)` back at the seed gate -> the first row
+/// reads unseeded.
+#[test]
+fn iov_solved_zero_start_is_seeded() {
+    let prep = crate::prepare_run("examples/warfarin_iov.ferx", Some("data/warfarin_iov.csv"))
+        .expect("prepare");
+    let (model, p) = (prep.parsed.model, prep.init_params);
+    let s = &prep.population.subjects[0];
+    let n_flat = model.n_eta + model.n_kappa * crate::stats::stacked_layout::group_count(s);
+    let zero = vec![0.0; n_flat];
+    for (warm, start, seeded) in
+        [(true, &zero[..], true), (false, &zero[..], false), (true, &zero[..model.n_eta], false)]
+    {
+        find_ebe_iov_seeded(
+            &model,
+            s,
+            &p,
+            200,
+            1e-6,
+            Some(start),
+            None,
+            0,
+            EbeVariance::Conditional,
+            false,
+            warm,
+            InnerHessianSeed::GaussNewton,
+        );
+        let used = LAST_INITIAL_HESSIAN.with(|h| h.borrow().is_some());
+        assert_eq!(used, seeded, "warm {warm}, start of {}", start.len());
+    }
 }
 
 /// The issue's second validation: a unimodal IOV subject stays bit-identical, across a

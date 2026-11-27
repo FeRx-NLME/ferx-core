@@ -1318,9 +1318,6 @@ impl<'a> SubjectScoreContext<'a> {
     ) -> Option<f64> {
         use crate::estimation::fd_resolution::{ebe_resolved, tight_tol};
         use crate::estimation::parameterization::{compute_mu_k, unpack_params};
-        if crate::cancel::is_cancelled(&self.options.cancel) {
-            return None;
-        }
         let p = unpack_params(xv, self.template);
         let mu = compute_mu_k(self.model, &p.theta, self.options.mu_referencing);
         let ebe = crate::estimation::inner_optimizer::find_ebe(
@@ -1366,17 +1363,25 @@ impl<'a> SubjectScoreContext<'a> {
     }
 
     /// The reconverged central difference of the subject's AGQ objective, through the outer
-    /// gradient's [`central_diff_packed_gated`](crate::estimation::outer_optimizer::central_diff_packed_gated),
+    /// gradient's [`central_diff_until_cancel`](crate::estimation::outer_optimizer::central_diff_until_cancel),
     /// so a `|θ₀|`-floored step passes the #2406 resolution gate (#2678). `None` when the
     /// objective at `x` is not usable. With `salvage`, a probe that fails takes the helper's
     /// one-sided difference against the centre (both failing leaves that coordinate 0).
     /// Without it, a probe that fails at a coordinate's first step declines the score, as
     /// before #2678; one that fails only at a floor the gate grew to keeps what the smaller
     /// floors resolved, the gate's own policy.
+    ///
+    /// Cancel (#2776, #3136): the wrapper skips every probe once `options.cancel` is set, so
+    /// the centre solve — which it does not see — is polled here, and a non-`salvage` score
+    /// declines a cancelled stencil: a skipped probe never reaches `eval`, so `missing` cannot
+    /// record it. The flag is monotonic, so the poll after the stencil sees every cut.
     fn finite_difference_score(
         &self, subject: &Subject, joint_warm: &[f64], salvage: bool,
     ) -> Option<Vec<f64>> {
         use crate::estimation::parameterization::{fd_step, fd_step_floors};
+        if crate::cancel::is_cancelled(&self.options.cancel) {
+            return None;
+        }
         self.reconverged_nll(subject, self.x, joint_warm, false)?;
         let floor = fd_step_floors(self.template, self.model);
         let first_step = |xv: &[f64]| {
@@ -1386,19 +1391,21 @@ impl<'a> SubjectScoreContext<'a> {
         };
         let missing = std::cell::Cell::new(false);
         let tight = |xv: &[f64]| self.reconverged_nll(subject, xv, joint_warm, true);
-        let g = crate::estimation::outer_optimizer::central_diff_packed_gated(
+        let g = crate::estimation::outer_optimizer::central_diff_until_cancel(
             self.x,
             &self.fixed,
             &floor,
             self.bounds,
+            &self.options.cancel,
             |xv| {
                 let v = self.reconverged_nll(subject, xv, joint_warm, false);
                 missing.set(missing.get() || (v.is_none() && first_step(xv)));
                 v.unwrap_or(f64::NAN)
             },
-            Some(&tight),
+            tight,
         );
-        (salvage || !missing.get()).then_some(g)
+        (salvage || !(missing.get() || crate::cancel::is_cancelled(&self.options.cancel)))
+            .then_some(g)
     }
 }
 
@@ -2438,5 +2445,83 @@ mod tests {
         });
         assert_starts_at_modes("AGQ FD score", &rec, |_| true, &pop, &etas, &kappas);
         assert_solves_at_stencil_tol("AGQ FD score", &rec, |_| true, opts.inner_tol);
+    }
+
+    /// #3136: the AGQ reconverged FD score routes its cancel through
+    /// `central_diff_until_cancel`, as the outer reconverged gradients do (#2776). A cancel
+    /// solves no further probe and declines the score; the salvage keeps what it had.
+    ///
+    /// The first probe's poll is measured on the salvage, which polls only before its centre
+    /// solve and once per probe (each one inner solve) — no entry check, no decline read — so
+    /// `polls − (solves − 1)` is the stencil's own pre-probe polls and follows the centre poll
+    /// if that moves, but not the decline read: dropping the decline's cancel term must fail on
+    /// "a cancelled stencil is no score", not shift the cut (#3137 review r1). `score` adds one
+    /// entry poll before that. The cut-at-centre cases are the fixed polls before each centre
+    /// solve: with the centre poll deleted they land on the first probe's and the centre gets
+    /// solved — on the salvage path that poll is the only guard (`reconverged_score` has none).
+    #[test]
+    fn a_cancelled_agq_fd_score_solves_no_probe() {
+        use crate::cancel::CancelFlag;
+        use crate::estimation::inner_optimizer::record_inner_solves;
+        use crate::estimation::inner_optimizer::test_helpers::{
+            on_one_thread, warfarin_iov_fixture,
+        };
+        let (model, pop, opts) = warfarin_iov_fixture();
+        let opts =
+            crate::types::FitOptions { method: crate::types::EstimationMethod::Laplace, ..opts };
+        let p = &model.default_params;
+        let x = crate::estimation::parameterization::pack_params(p);
+        let bounds = crate::estimation::parameterization::compute_bounds(p);
+        let (etas, _, _, kappas) = crate::estimation::inner_optimizer::run_inner_loop_warm(
+            &model, &pop, p, 200, 1e-8, None, None, 0, 0,
+        );
+        let subject = &pop.subjects[0];
+        let joint_warm = stack_mode(etas[0].as_slice(), &kappas[0]);
+        // (result, inner solves) of `score` (salvage off) or `reconverged_score` (salvage on).
+        let run = |flag: Option<CancelFlag>, salvage: bool| {
+            let opts = crate::types::FitOptions { cancel: flag, ..opts.clone() };
+            on_one_thread(|| {
+                let (g, rec) = record_inner_solves(|| {
+                    let context = SubjectScoreContext::new(&model, p, &x, &opts, &bounds, true);
+                    if salvage {
+                        context.reconverged_score(subject, &joint_warm)
+                    } else {
+                        context.score(subject, etas[0].as_slice(), &kappas[0])
+                    }
+                });
+                (g, rec.solve_tols.len())
+            })
+        };
+
+        let (live, solves) = run(None, false);
+        let live = live.expect("fixture: the uncancelled FD score");
+        assert!(solves > 2, "fixture: the stencil must solve probes ({solves})");
+        assert!(live.iter().any(|v| *v != 0.0), "fixture: a non-trivial score");
+        let budget = 1_000_000;
+        let counter = CancelFlag::trip_after(budget);
+        let (salvage_live, salvage_solves) = run(Some(counter.clone()), true);
+        assert_eq!(salvage_live, Some(live.clone()), "the salvage of a clean stencil");
+        assert_eq!(salvage_solves, solves, "fixture: one stencil on both paths");
+        let polls = budget - counter.polls_left().expect("a countdown");
+        // Polls before the salvage's first probe: the centre poll.
+        let first_probe = (polls + 1)
+            .checked_sub(solves)
+            .unwrap_or_else(|| panic!("{polls} polls for {solves} solves: a probe went unpolled"));
+
+        let (cut, n) = run(Some(CancelFlag::trip_after(1)), false);
+        assert_eq!((cut, n), (None, 0), "a cancel at the centre poll solved {n} probes");
+        let (cut, n) = run(Some(CancelFlag::trip_after(0)), true);
+        assert_eq!((cut, n), (None, 0), "a cancel at the salvage's centre poll solved {n}");
+
+        // `score`'s entry poll comes first.
+        let (cut, n) = run(Some(CancelFlag::trip_after(first_probe + 1)), false);
+        assert_eq!(n, 1, "a cancel after the centre solved {n} (only the centre may run)");
+        assert_eq!(cut, None, "a cancelled stencil is no score");
+
+        let (salvaged, n) = run(Some(CancelFlag::trip_after(first_probe)), true);
+        assert_eq!(n, 1, "the salvage solved {n} after a cancel");
+        let salvaged = salvaged.expect("the salvage keeps its centre");
+        assert_eq!(salvaged.len(), live.len());
+        assert!(salvaged.iter().all(|v| *v == 0.0), "skipped probes left {salvaged:?}");
     }
 }

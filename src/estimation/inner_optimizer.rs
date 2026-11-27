@@ -998,10 +998,10 @@ pub(crate) struct InnerSolvePolicy {
     /// zero — a subject with no observations, a random effect no prediction reads — is taken
     /// for the cold placeholder at every evaluation and re-runs the guarded multi-start each
     /// time, which cannot move it: on `examples/mm_iv.ferx` with one unused η, 920 multi-starts
-    /// in 470 solves, none of which moved an EBE. Unlike `init_is_mode` it does not say the
-    /// starts are modes *at these parameters*, so the IOV solve's start gates — its seed gate
-    /// and, since #2730, its multi-start gate — read only that and still apply: an IOV
-    /// subject's exactly-zero mode is cold there at every evaluation. Set by
+    /// in 470 solves, none of which moved an EBE. The IOV solve's seed and multi-start gates
+    /// read it too, for a start that carries κ̂ as well as η̂ (#2900). Unlike `init_is_mode` it
+    /// does not say the starts are modes *at these parameters*, so the IOV solve's start
+    /// certificates read only that. Set by
     /// [`PrevEtas::Solved`]; `false`, the `Default`, otherwise.
     pub(crate) init_is_warm: bool,
     /// Return a warm start unchanged when [`FallbackCertifier::certifies_in_place`] already
@@ -2622,7 +2622,8 @@ fn find_ebe_impl_from(
     // When the model has kappa declarations AND this subject has occasion labels,
     // optimize over the flat vector [bsv_eta (n_eta), kappa_1 (n_kappa), ..., kappa_K (n_kappa)].
     if model.n_kappa > 0 && !subject.occasions.is_empty() {
-        if policy.skip_refused && crate::stats::likelihood::iov_refuses_frem(model, subject) {
+        let refused = crate::stats::likelihood::iov_refuses_frem(model, subject);
+        if policy.skip_refused && refused {
             return refused_iov_ebe(model, subject);
         }
         let ebe = find_ebe_iov_seeded(
@@ -2636,6 +2637,8 @@ fn find_ebe_impl_from(
             restarts,
             policy.ebe_variance,
             policy.init_is_mode,
+            // A refused subject's zeros are `refused_iov_ebe`'s placeholder, not a solve.
+            policy.init_is_warm && !refused,
             if policy.unseeded_iov_warm { InnerHessianSeed::None } else { policy.seed },
         );
         #[cfg(test)]
@@ -2719,8 +2722,8 @@ type ScreenDescent = Option<(Vec<f64>, InnerExit, f64)>;
 /// `init_is_mode` is the caller's certificate that `eta_init` came from a solve, which makes
 /// any `Some` warm, zeros included: a converged mode at these parameters
 /// ([`InnerSolvePolicy::init_is_mode`], #2076) or a mode an earlier inner pass returned
-/// ([`InnerSolvePolicy::init_is_warm`]); the non-IOV solve passes either
-/// ([`InnerSolvePolicy::is_warm`]), the IOV solve the first.
+/// ([`InnerSolvePolicy::init_is_warm`]); the solve's start gates pass either
+/// ([`InnerSolvePolicy::is_warm`]), the IOV solve's start certificates the first.
 fn is_warm_start(eta_init: Option<&[f64]>, init_is_mode: bool) -> bool {
     eta_init.is_some_and(|w| init_is_mode || w.iter().any(|&v| v != 0.0))
 }
@@ -2729,6 +2732,53 @@ fn is_warm_start(eta_init: Option<&[f64]>, init_is_mode: bool) -> bool {
 /// `find_ebe_impl`). Two solves reaching the *same* mode by different paths agree far below
 /// this; the second modes it exists for are separated by O(1).
 const COLD_SEED_TIE_TOL: f64 = 1e-9;
+
+/// The walks an EBE solve keeps for reading the mode's predictions back (#3042): the first point
+/// to reach the lowest value scored, and the latest point tied with it bit for bit. The mode can
+/// tie a point an ulp beside it, walked before it (macOS arm64, `mm_oral` subject 1) or after it
+/// (a line-search trial), so one slot keeps the earlier of a tie and the other the later, and the
+/// mode is found either way. The mode is not always the lowest value: a candidate scoring lower
+/// by under the multistart's `1e-9` is rejected, yet takes the first slot. A tie between three
+/// points, or a mode that is not the lowest, is walked again: only a copy is lost, never a value.
+#[derive(Default)]
+struct KeptWalks([Option<(Vec<u64>, f64, Vec<f64>)>; 2]);
+
+impl KeptWalks {
+    /// The value of a kept walk at exactly `e`.
+    fn held(&self, e: &[f64]) -> Option<f64> {
+        self.0.iter().flatten().find(|(k, ..)| same_bits(k, e)).map(|w| w.1)
+    }
+
+    /// Keep `(e, v, preds)` if `v` is a real value that is a new lowest or ties it.
+    fn offer(&mut self, e: &[f64], v: f64, preds: &[f64]) {
+        let slot = match &self.0[0] {
+            _ if !crate::stats::likelihood::is_usable_subject_nll(v) => return,
+            None => 0,
+            Some(b) if v < b.1 => 0,
+            Some(b) if v == b.1 => 1,
+            Some(_) => return,
+        };
+        let (k, bv, p) = self.0[slot].get_or_insert_with(Default::default);
+        k.clear();
+        k.extend(e.iter().map(|x| x.to_bits()));
+        *bv = v;
+        p.clear();
+        p.extend_from_slice(preds);
+    }
+
+    /// The predictions kept at exactly `mode`, if `n_obs` long.
+    fn take_at(self, mode: &[f64], n_obs: usize) -> Option<Vec<f64>> {
+        self.0
+            .into_iter()
+            .flatten()
+            .find(|(k, _, p)| same_bits(k, mode) && p.len() == n_obs)
+            .map(|w| w.2)
+    }
+}
+
+fn same_bits(k: &[u64], e: &[f64]) -> bool {
+    k.len() == e.len() && k.iter().zip(e).all(|(&b, &x)| b == x.to_bits())
+}
 
 /// One inner solve. `cold_seed = false` is the normal solve: the policy's Hessian seed is
 /// used only on a genuinely warm start. `cold_seed = true` forces the seed onto a cold start,
@@ -2909,15 +2959,14 @@ fn find_ebe_solve(
         key.extend(e.iter().map(|x| x.to_bits()));
         m.push((key, v));
     };
-    // The best point the walk has scored this solve, with the predictions it left: the 4-slot
+    // The best points the walk has scored this solve, with the predictions they left: the 4-slot
     // memo above decides which value a lookup returns (a fused gradient pass's value can sit
     // beside the walk's), and only on its miss is the walk's own, a pure function of η, read
     // back from here instead of walked again. The solve reads back one point's predictions —
-    // the mode's, which is the lowest value it scored — so one entry is all that is kept
-    // (not a vector per η the search and its finite-difference probes visited), written only
-    // on an improvement and read without a copy. An ODE walk is what a repeat is worth
-    // skipping; a closed form re-walks for less than the lookup costs.
-    let best_walk: RefCell<Option<(Vec<u64>, f64, Vec<f64>)>> = RefCell::new(None);
+    // the mode's, normally the lowest value it scored — so [`KeptWalks`] holds two entries, not
+    // a vector per η the search and its finite-difference probes visited. An ODE walk is what a
+    // repeat is worth skipping; a closed form re-walks for less than the lookup costs.
+    let best_walk: RefCell<KeptWalks> = RefCell::new(KeptWalks::default());
     let track_walks = model.ode_spec.is_some();
     let obj = |e: &[f64]| -> f64 {
         if let Some(v) = memo_get(e) {
@@ -2928,21 +2977,12 @@ fn find_ebe_solve(
             memo_put(e, v);
             return v;
         }
-        let held = best_walk.borrow().as_ref().and_then(|(k, v, _)| {
-            (k.len() == e.len() && k.iter().zip(e).all(|(&b, &x)| b == x.to_bits())).then_some(*v)
-        });
+        let held = best_walk.borrow().held(e);
         let v = if let Some(v) = held {
             v
         } else {
             let v = obj_uncached(e);
-            let mut best = best_walk.borrow_mut();
-            if v.is_finite() && best.as_ref().is_none_or(|b| v < b.1) {
-                let (k, bv, p) = best.get_or_insert_with(Default::default);
-                k.clear();
-                k.extend(e.iter().map(|x| x.to_bits()));
-                *bv = v;
-                p.clone_from(&pred_recycle.borrow());
-            }
+            best_walk.borrow_mut().offer(e, v, &pred_recycle.borrow());
             v
         };
         memo_put(e, v);
@@ -3484,7 +3524,7 @@ fn find_ebe_solve(
         // subject sits where `η_ka` and `η_V` move together (`ka ↔ CL/V`), and a cold
         // BFGS from η = 0 and every axis seed descend into the same shallower basin.
         // The screen scores `policy.screen` quasi-random points from `N(0, 4Ω)`, keyed
-        // by the subject's ID, and descends from the `SCREEN_TOP_K` lowest. A descent
+        // by the subject's ID, and descends from spread-out starts among the lowest. A descent
         // replaces the incumbent only when it is lower by more than the same `1e-9` the
         // axis scan uses AND lies more than `SCREEN_MIN_OMEGA_DIST` from it in the Ω⁻¹
         // metric: a descent that reconverges to the incumbent's basin, whatever its
@@ -3686,9 +3726,8 @@ fn find_ebe_solve(
     let ipreds = if at_mode(&preds_at.borrow()) && pred_recycle.borrow().len() == n_obs {
         Some(pred_recycle.take())
     } else {
-        // The last walk was another point (a finite-difference probe beside the mode).
-        let kept =
-            best_walk.take().filter(|(k, _, p)| at_mode(k) && p.len() == n_obs).map(|(_, _, p)| p);
+        // The last walk was another point (a line-search trial beside the mode).
+        let kept = best_walk.take().take_at(&eta_true, n_obs);
         #[cfg(test)]
         BEST_WALK_RESTORES.with(|c| c.set(c.get() + usize::from(kept.is_some())));
         kept
@@ -3853,14 +3892,15 @@ thread_local! {
     /// on the analytic route" distinguishable from "no step ran" (#2209).
     pub(crate) static INNER_AGRAD_ROUTE: std::cell::Cell<(usize, usize, usize)> =
         const { std::cell::Cell::new((0, 0, 0)) };
-    /// The `(integrating_step, origin)` of every `ebe_gradient_fd` call on this thread, so a
-    /// test can read which step and which origin each inner solve handed it (#2868). `None`
-    /// until a test arms it ([`arm_ebe_fd_calls`]), so the worker threads of the cached fit
-    /// pools, which nothing arms, do not grow it across the lib test run.
+    /// The integrating step taken (`None`: the roundoff step) and the `origin` of every
+    /// `ebe_gradient_fd` call on this thread, so a test can read which step and which origin
+    /// each inner solve differenced with (#2868, #3145). `None` until a
+    /// test arms it ([`arm_ebe_fd_calls`]), so the worker threads of the cached fit pools,
+    /// which nothing arms, do not grow it across the lib test run.
     pub(crate) static EBE_FD_CALLS: RefCell<Option<Vec<EbeFdCall>>> = const { RefCell::new(None) };
 }
 
-/// One `ebe_gradient_fd` call: its `integrating_step` and its `origin`.
+/// One `ebe_gradient_fd` call: the integrating step it took, if it did, and its `origin`.
 #[cfg(test)]
 pub(crate) type EbeFdCall = (Option<f64>, Option<Vec<f64>>);
 
@@ -3901,6 +3941,7 @@ fn find_ebe_iov(
         0,
         ebe_variance,
         init_is_mode,
+        false,
         InnerHessianSeed::GaussNewton,
     )
 }
@@ -3911,7 +3952,7 @@ fn find_ebe_iov(
 fn find_ebe_iov_seeded(
     model: &CompiledModel, subject: &Subject, params: &ModelParameters, max_iter: usize, tol: f64,
     eta_init: Option<&[f64]>, mu_k: Option<&[f64]>, restarts: usize, ebe_variance: EbeVariance,
-    init_is_mode: bool, seed: InnerHessianSeed,
+    init_is_mode: bool, init_is_warm: bool, seed: InnerHessianSeed,
 ) -> EbeResult {
     let n_eta = model.n_eta;
     let n_kappa = model.n_kappa;
@@ -3981,6 +4022,10 @@ fn find_ebe_iov_seeded(
         None => eta_init,
     };
     let mut x = iov_initial_vector(n_eta, n_flat, &mu, warm);
+    // A solved start is warm only when it carries κ̂ too (#2900): an all-zero η̂-only one (the
+    // ODE+IOV cache's, a nested subject's) restarts κ at 0, which the multi-start still scans.
+    let joint = warm.is_some_and(|w| w.len() == n_flat);
+    let warm_start = is_warm_start(eta_init, init_is_mode || (init_is_warm && joint));
     #[cfg(test)]
     with_recording(|r| {
         r.starts.push(IovStart {
@@ -4331,7 +4376,7 @@ fn find_ebe_iov_seeded(
         && !model.has_covariate_nn()
         && !matches!(inner_optimizer_mode(), crate::types::InnerOptimizer::NelderMead)
         && !inner_use_lbfgs(n_flat);
-    let iov_seed = (seeded && is_warm_start(eta_init, init_is_mode))
+    let iov_seed = (seeded && warm_start)
         .then(|| {
             let mut st: Vec<f64> = x[..n_eta].iter().zip(mu.iter()).map(|(p, m)| p - m).collect();
             for k in to_kappas(&x) {
@@ -4343,6 +4388,8 @@ fn find_ebe_iov_seeded(
         })
         .flatten()
         .filter(|h| h.nrows() == n_flat && h.ncols() == n_flat);
+    #[cfg(test)]
+    LAST_INITIAL_HESSIAN.with(|h| *h.borrow_mut() = iov_seed.clone());
     // Value/gradient fusion on the line search's full-step trial, as in `find_ebe_solve`:
     // where the gradient pass also scores the value bit-equal to the native objective, the
     // trial runs that one pass — value for the Armijo test, gradient parked in `primed` for the
@@ -4477,7 +4524,7 @@ fn find_ebe_iov_seeded(
     // Cost: `2·restarts` descents per scanned coordinate, so linear in the occasions, and
     // on cold solves only; the probes are objective evaluations, `2` per seed. The Sobol
     // screen and the twin seed stay off this path.
-    if restarts > 0 && !is_warm_start(eta_init, init_is_mode) {
+    if restarts > 0 && !warm_start {
         #[cfg(test)]
         EBE_MULTISTARTS_STARTED.with(|n| n.set(n.get() + 1));
         let mut nll = obj(&x);
@@ -7357,8 +7404,10 @@ const INNER_FTOL_GNORM_PLATEAU: f64 = 1e-3;
 /// covariate's own variance, so its Mahalanobis distance stays O(1) and it never trips this.
 const RUNAWAY_EBE_MAHA_PER_ETA: f64 = 100.0;
 
-/// Starts the #2013 screen descends from: the lowest-objective Sobol points it scores.
+/// Most starts the #2013 screen descends from (see [`screen_starts`]).
 const SCREEN_TOP_K: usize = 3;
+/// The lowest-objective screen points [`screen_starts`] picks its spread-out starts from.
+const SCREEN_POOL: usize = 32;
 /// Scale of the #2013 screen's proposal: `N(0, (2)²·Ω)`, twice the prior SD per axis.
 const SCREEN_SD_MULT: f64 = 2.0;
 /// Least Ω⁻¹-metric distance from the incumbent η̂ at which a #2013 screen descent counts
@@ -7399,9 +7448,10 @@ fn screen_descents(
         .collect()
 }
 
-/// Starts the #2013 screen keeps: the [`SCREEN_TOP_K`] lowest of `n` Sobol points from
-/// `N(0, (SCREEN_SD_MULT)²·Ω)`, by `obj`, lowest first. A point whose objective is not
-/// finite is dropped. The stream is keyed by [`screen_seed`] of the subject's ID, so it
+/// Starts the #2013 screen keeps: up to [`SCREEN_TOP_K`] of the [`SCREEN_POOL`] lowest of
+/// `n` Sobol points from `N(0, (SCREEN_SD_MULT)²·Ω)`, by `obj`, lowest first, each more than
+/// [`SCREEN_MIN_OMEGA_DIST`] from those before it in the Ω⁻¹ metric. A point whose
+/// objective is not finite is dropped. The stream is keyed by [`screen_seed`] of the subject's ID, so it
 /// depends neither on the worker thread nor on the subject's position in the data. Empty
 /// when there is nothing to draw, or more random effects than the Sobol table carries.
 fn screen_starts(
@@ -7414,11 +7464,10 @@ fn screen_starts(
     if n == 0 || n_eta == 0 || n_eta > SOBOL_MAX_DIMS || omega.chol.nrows() != n_eta {
         return Vec::new();
     }
-    // The lowest `SCREEN_TOP_K` so far, lowest first. A point goes in after every
-    // kept point it ties (`total_cmp` is a total order), which is the order a
-    // stable sort of all `n` scored points gives, so only the kept starts are
-    // ever copied out of the reused buffers.
-    let mut best: Vec<(f64, Vec<f64>)> = Vec::with_capacity(SCREEN_TOP_K + 1);
+    // The lowest `SCREEN_POOL` so far, lowest first. A point goes in after every kept point
+    // it ties (`total_cmp` is a total order), which is the order a stable sort of all `n`
+    // scored points gives, so only the kept points are ever copied out of the reused buffers.
+    let mut best: Vec<(f64, Vec<f64>)> = Vec::with_capacity(SCREEN_POOL + 1);
     let mut z = DVector::<f64>::zeros(n_eta);
     let mut e = DVector::<f64>::zeros(n_eta);
     for_each_sobol_uniform(n_eta, n, screen_seed(subject_id), |u| {
@@ -7431,12 +7480,22 @@ fn screen_starts(
             return;
         }
         let at = best.partition_point(|(b, _)| b.total_cmp(&v).is_le());
-        if at < SCREEN_TOP_K {
+        if at < SCREEN_POOL {
             best.insert(at, (v, e.as_slice().to_vec()));
-            best.truncate(SCREEN_TOP_K);
+            best.truncate(SCREEN_POOL);
         }
     });
-    best.into_iter().map(|(_, e)| e).collect()
+    // The starts, lowest first, each farther than `SCREEN_MIN_OMEGA_DIST` from those kept
+    // before it: a larger screen holds more points near one mode, and the plain lowest
+    // `SCREEN_TOP_K` would all descend into it (#2863).
+    let mut starts: Vec<Vec<f64>> = Vec::with_capacity(SCREEN_TOP_K);
+    for (_, e) in best {
+        let far = |s: &Vec<f64>| omega_distance(s, &e, omega) > SCREEN_MIN_OMEGA_DIST;
+        if starts.len() < SCREEN_TOP_K && starts.iter().all(far) {
+            starts.push(e);
+        }
+    }
+    starts
 }
 
 /// 64-bit FNV-1a of a subject ID: the #2013 screen's Sobol scramble seed. A fixed
@@ -8070,20 +8129,35 @@ fn gradient_fd(obj: &dyn Fn(&[f64]) -> f64, x: &[f64], n: usize) -> Vec<f64> {
 /// and a step scaled by `|ψ|` would grow with the typical value `μ` carries. `None` is the
 /// origin. The roundoff step ignores it, so an objective that never integrates differences
 /// exactly as before #2868.
+///
+/// Where an evaluation of the integrating difference leaves a segment unfinished, the gradient
+/// is the roundoff one (#3145). The integrating step is sized for an integrator error of order
+/// `ode_reltol`, which a solve that ran out of steps does not have. Such points are reached on
+/// outer trials the EBE guard goes on to reject. On an 8-state `auto` model whose inner gradient
+/// is otherwise analytic, the recorders declined there, and the integrating step let more of those
+/// searches converge: of the solves that differenced, the fit needed 68 to reach the 17
+/// unconverged the guard stops at, against 36 here and at the roundoff step, at up to a minute
+/// each (3407 s against 2165 s and 2127 s for the fit, with identical results). The check reads
+/// the solver counters of the evaluations the difference makes anyway; only a declined one costs a
+/// second difference. On the TMDD fixture above it moves only `rk45`: worst point 0.103 OFV from
+/// the analytic route, 0.129 without it (Linux), for 7% more wall.
 fn ebe_gradient_fd(
     obj: &dyn Fn(&[f64]) -> f64, x: &[f64], origin: Option<&[f64]>, n: usize,
     integrating_step: Option<f64>,
 ) -> Vec<f64> {
+    let integrated = integrating_step.and_then(|step| {
+        let (g, stats) =
+            crate::ode::solver::with_solver_stats(|| gradient_fd_step(obj, x, origin, n, step));
+        (stats.kept_unfinished_segments() == 0).then_some(g)
+    });
     #[cfg(test)]
     EBE_FD_CALLS.with(|c| {
         if let Some(calls) = c.borrow_mut().as_mut() {
-            calls.push((integrating_step, origin.map(<[f64]>::to_vec)));
+            let taken = integrating_step.filter(|_| integrated.is_some());
+            calls.push((taken, origin.map(<[f64]>::to_vec)));
         }
     });
-    match integrating_step {
-        Some(step) => gradient_fd_step(obj, x, origin, n, step),
-        None => gradient_fd(obj, x, n),
-    }
+    integrated.unwrap_or_else(|| gradient_fd(obj, x, n))
 }
 
 /// Central differences of `obj` at `x`, coordinate `i` stepped by

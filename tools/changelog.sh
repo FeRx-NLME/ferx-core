@@ -37,7 +37,7 @@ NON_FRAGMENTS=(README.md .gitkeep)
 
 # Paths whose change is presumed user-facing. Test-only files under them are
 # excluded by `is_test_path` below.
-USER_FACING_PREFIXES=(src/ crates/ferx-cli/ crates/ferx-tools/)
+USER_FACING_PREFIXES=(src/ crates/ferx-cli/ crates/ferx-tools/ crates/ferx-search/)
 
 OPT_OUT_LABEL="no-changelog"
 

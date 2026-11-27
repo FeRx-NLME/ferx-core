@@ -173,7 +173,7 @@ fn warfarin_iov_focei_warns_and_names_the_shelf_variance_and_natural_does_not() 
     assert!(low_ess(&nat).is_none(), "{:?}", nat.warnings);
 }
 
-/// S4: the healthy `warfarin_iov` FOCE fit (ESS 402.3820667781389 since #2786's last wave; 402.3883345788064 from #2706; 402.38098512621974 from #2549; 402.38186322963156 from #2462; 402.38245815217266 from #2443; 402.34727326791347 from #2261 PR 2; 402.3472759966188 from #2261 PR 1; 402.3856724693695 from #2280; 402.38107815756786 from #2210; 402.3820222439373 from #2217; 402.38567292526295 from #2202; 402.3856723316291 from #2093; 404.59 from #1722's frozen-variance FOCE EBEs; 396.21 before)
+/// S4: the healthy `warfarin_iov` FOCE fit (ESS 402.3820622609698 since #3019; 402.3820667781389 from #2786's last wave; 402.3883345788064 from #2706; 402.38098512621974 from #2549; 402.38186322963156 from #2462; 402.38245815217266 from #2443; 402.34727326791347 from #2261 PR 2; 402.3472759966188 from #2261 PR 1; 402.3856724693695 from #2280; 402.38107815756786 from #2210; 402.3820222439373 from #2217; 402.38567292526295 from #2202; 402.3856723316291 from #2093; 404.59 from #1722's frozen-variance FOCE EBEs; 396.21 before)
 /// carries no SIR warning at all.
 #[test]
 #[cfg_attr(not(feature = "slow-tests"), ignore = "slow: opt in with --features slow-tests")]
@@ -249,7 +249,13 @@ fn warfarin_iov_foce_carries_no_sir_warning() {
     // the range adds the off-mode polish, EBE adoption and the coincident-break walk; which of
     // them moves this fit's L-BFGS path (and the covariance the fixed-seed proposal is built
     // from) was not isolated. The ESS stays 4× above the warning threshold.
-    assert_ess(f.sir_ess, 402.382_066_778_138_9, "FOCE packed");
+    // #3019 moved it by −1.1e-8 relative (402.3820667781389 → 402.3820622609698; x86_64 CI
+    // slow-tests runs 45805889208, 45806068784, 45806208547 and 45806553120 on `main` agree to
+    // every printed digit, as does Linux aarch64 at 0054d726, and its parent e70846f6 reproduces
+    // the old pin): past the Woodbury gate `foce_f` rotates the rows into `I + S` instead of
+    // factoring the dense `R̃`, the same objective rounded differently, so the L-BFGS path and
+    // the covariance the fixed-seed proposal is built from move in their last bits.
+    assert_ess(f.sir_ess, 402.382_062_260_969_8, "FOCE packed");
     assert!(sir_warnings(&f).is_empty(), "{:?}", f.warnings);
 }
 
