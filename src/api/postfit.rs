@@ -3580,6 +3580,20 @@ impl SolverStatsPhase {
         }
     }
 
+    /// What a wrongly integrated pass returns, as the object of "… and return …" (#3196
+    /// review): only a fit has an OFV.
+    fn wrong_result(self) -> &'static str {
+        match self {
+            Self::PostfitPredictions => "a wrong OFV",
+            Self::Predict => "wrong predictions",
+            #[cfg(feature = "survival")]
+            Self::PredictSurvival => "wrong predictions",
+            Self::Simulate | Self::SimulateAdaptive | Self::SimulateUncertainty => {
+                "wrong simulated trajectories"
+            }
+        }
+    }
+
     /// What paid for a discarded escalation *and* the re-solve that replaced it, as the
     /// subject of "… paid for both solves".
     ///
@@ -4073,10 +4087,15 @@ pub(crate) fn ode_solver_diagnostics_warning(
             "{ODE_SOLVER_INFO_TOKEN}: ode_method = auto escalated {escalated} integration \
              segment(s) to a stiff stepper {at}; every other segment used \
              {explicit}, no escalation was rejected, and no step clamped at the minimum step \
-             size.{switched_info_clause} {provenance} Informational — set ode_method = \
-             {explicit} to pin the explicit stepper, or name a stiff method to pin the other \
-             half.",
+             size.{switched_info_clause} {provenance} Informational. The escalated \
+             segments are the ones the stiffness probe judged stiff, a verdict that can be wrong \
+             on a model that is not stiff. To skip the probe, name a stiff method (ode_method = \
+             rodas5p or rodas4), which then runs every segment. Pin {explicit} only if those \
+             segments are not stiff: on a stiff system it can exhaust its step budget, \
+             freeze-pad them and return {wrong}, which W_ODE_SOLVER_DIAGNOSTICS reports. \
+             Compare the results against a stiff method before keeping it.",
             explicit = crate::ode::OdeMethod::EXPLICIT_FALLBACK.as_str(),
+            wrong = phase.wrong_result(),
             at = phase.at_label(),
             provenance = phase.provenance(),
         );
