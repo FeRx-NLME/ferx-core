@@ -175,6 +175,33 @@ fn the_summary_difference_summarises_the_paired_runs() {
     assert_eq!(s.labels, labels());
 }
 
+/// The difference's `mc_se` is paired: the jackknife over sims of the per-run differences,
+/// leaving one sim out of both arms at once (#3215). Draw 1, differences by sim
+/// [−1, −3], [−4, −8]: replicates −6 and −2, SE = √((1/2)·8) = 2, exactly. The arms' own
+/// SEs are 2 (adaptive) and 4 (reference), so combining them unpaired gives √20.
+///
+/// Mutation: the difference's SE formed as `√(se_A² + se_R²)` (√20 ≠ 2).
+#[test]
+fn the_summary_difference_has_a_paired_mc_se() {
+    let a = result_of(&[("1", &CUBE)], true);
+    let r = result_of(&[("1", &scaled(2.0))], true);
+    let s = summarize_contrast(&a, &r, &labels(), &AdaptiveSummaryOptions::default()).unwrap();
+    let se = |sum: &AdaptivePopulationSummary| {
+        sum.rows
+            .iter()
+            .find(|x| {
+                x.metric == M::SignalMean
+                    && x.statistic == AdaptiveSummaryStatistic::Mean
+                    && x.draw == 1
+            })
+            .and_then(|x| x.mc_se)
+            .expect("an SE")
+    };
+    assert_eq!((se(&s.adaptive), se(&s.reference)), (2.0, 4.0));
+    assert_eq!(se(&s.difference), 2.0);
+    assert!(20f64.sqrt() - se(&s.difference) > 2.0);
+}
+
 // ── refusals ───────────────────────────────────────────────────────────────────────────
 
 fn refusal(a: &AdaptiveSimulationResult, r: &AdaptiveSimulationResult) -> String {
@@ -446,6 +473,10 @@ fn a_controller_contrasted_with_itself_is_exactly_zero_in_every_layer() {
     let s = summarize_contrast(&a, &r, &labels(), &AdaptiveSummaryOptions::default()).unwrap();
     assert!(s.difference.rows.iter().all(|x| x.value.is_none_or(|v| v == 0.0)));
     assert!(s.difference.rows.iter().any(|x| x.value == Some(0.0)));
+    // The paired summary SE is exactly 0 too (#3215); the arms' own SEs are not.
+    assert!(s.difference.rows.iter().all(|x| x.mc_se.is_none_or(|v| v.to_bits() == 0)));
+    assert!(s.difference.rows.iter().any(|x| x.mc_se == Some(0.0)));
+    assert!(s.adaptive.rows.iter().any(|x| x.mc_se.is_some_and(|v| v > 0.0)));
 }
 
 /// The fixture's spec: a `with_assay_error` block on the PR3 model, so its single `signal`
@@ -602,6 +633,59 @@ fn the_difference_matches_the_conditional_quadrature_at_the_runs_own_draws() {
         );
         assert!(gap.is_finite() && gap.abs() < tol, "{layer:?}: {got} vs {want} ({gap:+.4})");
     }
+}
+
+/// Per-run moments of the difference `D = Y_a − Y_r` at one draw, by quadrature over η
+/// (from `arm_moments`' closed forms: the reference has no reading term):
+/// `D = −(A0·G/3)·x² − (A0·G·σ/3)·x²·ε`, so `[Var_η E[D|η], E_η Var_W(D|η)]`.
+fn difference_moments(cl: f64, v: f64, omega2: f64, sigma: f64) -> [f64; 2] {
+    let (z, w) = gauss_hermite(60);
+    let (mut m, mut m2, mut within) = (0.0, 0.0, 0.0);
+    for (&zk, &wk) in z.iter().zip(&w) {
+        let x = (-24.0 * cl * (omega2.sqrt() * zk).exp() / v).exp();
+        let mean = -A0 * G * x * x / 3.0;
+        m += wk * mean;
+        m2 += wk * mean * mean;
+        within += wk * (A0 * G * sigma * x * x / 3.0).powi(2);
+    }
+    [m2 - m * m, within]
+}
+
+/// The summary difference's `mc_se` against the analytic Monte Carlo SD of the mean
+/// effect, without parameter uncertainty (#3215): one subject, S 200 × R 2, so the row's
+/// mean has SD `√((Var_η E[D|η] + E Var_W / R) / S)` (the two reps of a sim share η).
+///
+/// Band: over 300 seeds at this design (`~/ferx-probes/946/mc_se/`) the SE's RMS was 0.995
+/// of this SD and its own coefficient of variation 0.062; the band is ±4 of that, ±25 %.
+/// Realised at seed 946 (macOS arm64): mc_se 0.0995, SD 0.1013, ratio 0.982.
+///
+/// Mutation: the run as the unit instead of the sim (the reps share η: RMS ratio 0.76 over
+/// the 300 seeds, outside the band by 4 cv).
+#[test]
+fn the_mean_effect_mc_se_matches_the_analytic_monte_carlo_sd_without_uncertainty() {
+    let m = oracle_model();
+    let params = fitted_params_from_result(&iov_fit(&m), &m).expect("template");
+    let inputs = AdaptiveInputs::new(&params);
+    let (n_sim, n_reps) = (200, 2);
+    let o = opts(ObserveMode::Dv, n_reps);
+    let a = simulate_adaptive_with_inputs(&m, &pop(1), &inputs, n_sim, proportional, &o).unwrap();
+    let r =
+        simulate_adaptive_with_inputs(&m, &pop(1), &inputs, n_sim, fixed_bolus_100, &o).unwrap();
+    let s = summarize_contrast(&a, &r, &labels(), &AdaptiveSummaryOptions::default()).unwrap();
+    let row = s
+        .difference
+        .rows
+        .iter()
+        .find(|x| x.metric == M::SignalMean && x.statistic == AdaptiveSummaryStatistic::Mean)
+        .expect("the mean effect");
+    let p = &params;
+    let [var_eta, within] =
+        difference_moments(p.theta[0], p.theta[1], p.omega.matrix[(0, 0)], p.sigma.values[0]);
+    let want = ((var_eta + within / n_reps as f64) / n_sim as f64).sqrt();
+    let got = row.mc_se.expect("an SE");
+    let ratio = got / want;
+    eprintln!("mean effect {:?} mc_se {got:.5} analytic SD {want:.5} ratio {ratio:.3}", row.value);
+    assert!(ratio.is_finite() && (ratio - 1.0).abs() < 0.25, "{got} vs {want} ({ratio:.3})");
 }
 
 /// The PR3 model at TVCL = 2 (`x = e^{−0.96}` ≈ 0.38 at the typical value), so the

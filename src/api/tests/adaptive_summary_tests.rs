@@ -416,6 +416,86 @@ fn signal_thresholds_with_no_reading_give_rows_and_repeats_give_one() {
     assert_eq!(n, 1);
 }
 
+// ── the Monte Carlo SE (#3215) ──────────────────────────────────────────────────────────
+
+/// One `signal_mean` value per run, `cells[sim]` = the values of that sim's runs (subjects
+/// "a", "b", …), `None` a run that carries none. Draw 1.
+fn signal_mean_runs(cells: &[&[Option<f64>]]) -> AdaptiveSimulationResult {
+    let mut rows = Vec::new();
+    for (k, cell) in cells.iter().enumerate() {
+        for (j, v) in cell.iter().enumerate() {
+            let id = ((b'a' + j as u8) as char).to_string();
+            rows.push(AdaptiveSubjectMetrics {
+                signal_mean: *v,
+                ..metrics_row(1, k + 1, &id, 0.0)
+            });
+        }
+    }
+    result_of(rows, vec![])
+}
+
+fn mc_se_of(r: &AdaptiveSimulationResult, stat: S) -> Option<f64> {
+    let opts =
+        AdaptiveSummaryOptions { thresholds: vec![(M::SignalMean, 4.0)], ..Default::default() };
+    row(&summary(r, &opts), &M::SignalMean, stat, 1).mc_se
+}
+
+/// The delete-one jackknife over sims, by hand. Sims [1, 3], [5, 7], [6, missing]: per-sim
+/// (sum, count) (4, 2), (12, 2), (6, 1), T = 22, N = 5.
+/// - Mean: replicates 18/3 = 6, 10/3, 16/4 = 4; mean 40/9; deviations 14/9, −10/9, −4/9;
+///   SE² = (2/3)·312/81 = 208/81, SE = 4√13/9.
+/// - FractionAtLeast(4): indicators [0, 0], [1, 1], [1]; replicates 1, 1/3, 1/2; mean
+///   11/18; SE² = (2/3)·78/324 = 13/81, SE = √13/9.
+/// - Median: `None`.
+///
+/// Mutations: the run as the unit (iid over the five runs: SE = √(5.8/5) ≈ 1.077); the
+/// `(n − 1)/n` factor dropped or replaced by `1/n`; the third sim's count taken as two;
+/// the median given a jackknife SE.
+#[test]
+fn the_mc_se_is_the_jackknife_over_sims_by_hand_and_none_for_the_median() {
+    let r =
+        signal_mean_runs(&[&[Some(1.0), Some(3.0)], &[Some(5.0), Some(7.0)], &[Some(6.0), None]]);
+    let close = |got: Option<f64>, want: f64| {
+        let g = got.expect("an SE");
+        assert!((g - want).abs() < 1e-14, "{g} vs {want}");
+    };
+    close(mc_se_of(&r, S::Mean), 4.0 * 13f64.sqrt() / 9.0);
+    close(mc_se_of(&r, S::FractionAtLeast(4.0)), 13f64.sqrt() / 9.0);
+    assert_eq!(mc_se_of(&r, S::Median), None);
+}
+
+/// The gate on the number of sims, both sides: one sim (however many runs) gives no SE,
+/// two give one. A metric no run carries has `value = None` and so no SE.
+///
+/// Mutations: the `< 2` gate removed (one sim → `Some(0)`) or raised to `< 3` (two sims →
+/// `None`); the SE formed without a value.
+#[test]
+fn one_sim_has_no_mc_se_two_have_one_and_a_missing_value_has_none() {
+    let one = signal_mean_runs(&[&[Some(1.0), Some(3.0), Some(8.0)]]);
+    let two = signal_mean_runs(&[&[Some(1.0), Some(3.0)], &[Some(8.0)]]);
+    for stat in [S::Mean, S::FractionAtLeast(4.0)] {
+        assert_eq!(mc_se_of(&one, stat), None, "{stat:?}");
+        assert!(mc_se_of(&two, stat).is_some_and(|se| se > 0.0), "{stat:?}");
+    }
+    let none = signal_mean_runs(&[&[None], &[None]]);
+    let s = summary(&none, &AdaptiveSummaryOptions::default());
+    let r = row(&s, &M::SignalMean, S::Mean, 1);
+    assert_eq!((r.value, r.mc_se), (None, None));
+}
+
+/// A non-finite value makes the SE `NaN`, like the value, for `Mean` and for
+/// `FractionAtLeast`, whose `≥` alone would read a `NaN` as 0 and give a finite SE.
+///
+/// Mutation: the non-finite gate removed (the fraction's SE is finite).
+#[test]
+fn a_non_finite_value_makes_the_mc_se_nan() {
+    let r = signal_mean_runs(&[&[Some(1.0), Some(f64::NAN)], &[Some(5.0), Some(7.0)]]);
+    for stat in [S::Mean, S::FractionAtLeast(4.0)] {
+        assert!(mc_se_of(&r, stat).is_some_and(f64::is_nan), "{stat:?}");
+    }
+    assert_eq!(mc_se_of(&r, S::Median), None);
+}
+
 // ── engine fixtures ────────────────────────────────────────────────────────────────────
 
 /// A 1-cpt IV ODE; the cmt-1 monitor reads the central **amount**.

@@ -956,7 +956,7 @@ options.
 
 | Table | One entry per | What it holds |
 |---|---|---|
-| `rows` | metric, statistic, draw | The statistic over that draw's runs, `n_runs` and `n_missing` |
+| `rows` | metric, statistic, draw | The statistic over that draw's runs, `n_runs`, `n_missing` and its Monte Carlo SE `mc_se` |
 | `bands` | metric, statistic | Quantiles of the per-draw statistic **across draws** |
 | `prediction_intervals` | metric | Quantiles of the individual value **pooled over every run** |
 
@@ -979,6 +979,28 @@ default. The mean of `Discontinued` is the fraction discontinued.
   (`n_runs − n_missing`). For the signal at a decision after some runs stopped, it is a
   statistic of the runs still going at that decision.
 - A non-finite value makes every statistic, band and interval it enters `NaN`.
+
+#### Monte Carlo standard error of a row
+
+Each row's `mc_se` says how far the statistic could move with another seed at the same
+`n_sim` ([#3215](https://github.com/FeRx-NLME/ferx-core/issues/3215)). It is a
+delete-one jackknife over the draw's sims. A sim is the independent replicate: η, κ and
+the assay ε are all redrawn per sim, while the `n_reps` replicates of a run share η, so
+treating each run as independent would understate the error.
+
+- `Mean` and `FractionAtLeast` rows get one. A `Median` row has `mc_se = None`: the
+  delete-one jackknife is not consistent for a quantile.
+- With `S` sims carrying the metric, read it with a t on `S − 1` degrees of freedom. At
+  `n_sim = 5`, ±1.96 SE covers 88 %, as t₄ predicts.
+- It is `None` with fewer than two such sims or when the row's `value` is `None`, and
+  `NaN` when the value is.
+- It is the error of that draw's statistic. Parameter uncertainty is the band's.
+
+Over 300 seeds on the contrast's analytic fixture below, the SE was 0.96 to 1.07 of the
+empirical SD of `Mean` and `FractionAtLeast` rows from `n_sim = 5` to 200, and 0.99 to
+1.02 of the analytic Monte Carlo SD of the mean. A jackknife over runs instead of sims
+gave 0.68 to 0.76 at `n_reps = 2`. For the median the jackknife's own spread did not
+shrink as `n_sim` grew.
 
 #### Band versus prediction interval
 
@@ -1093,8 +1115,8 @@ for their difference, adaptive − reference.
   `n_sim ≥ 2`).
 - `summarize_contrast(&adaptive, &reference, &labels, &opts)` returns the
   [population summary](#population-summary-and-bands) of both arms and of the per-run
-  differences: the mean effect per draw, its band across draws, and the prediction
-  interval of one patient's effect. It works on any design, including `n_reps = 1`.
+  differences: the mean effect per draw with its paired Monte Carlo SE (`mc_se`), its
+  band across draws, and the prediction interval of one patient's effect. It works on any design, including `n_reps = 1`.
 
 Both return an `AdaptiveContrast { labels, adaptive, reference, difference }`. Each arm's
 summary is exactly what that arm alone gives. `AdaptiveArmLabels` names both arms, and
@@ -1175,7 +1197,9 @@ The arms share their outer units (draws, or sims with one draw), so the differen
 `mc_se` is a **paired** jackknife: the same unit is left out of both arms at once.
 Combining the arms' own SEs as `√(se_A² + se_R²)` ignores their correlation. Over 300
 seeds on the analytic fixture, the paired SE was 0.95 to 1.07 of the empirical SD of the
-difference, and the unpaired one 4.2 to 4.9.
+difference, and the unpaired one 4.2 to 4.9. The summary difference's `mc_se` is paired
+the same way, by sim: 0.99 to 1.09 of the empirical SD of the mean effect without
+parameter uncertainty, against 8.7 to 9.9 unpaired.
 
 No NONMEM run exists for feedback dosing. Two cases need no tolerance: a controller
 contrasted with itself gives bit-identical runs and every difference exactly 0, and a
