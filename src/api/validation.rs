@@ -7734,8 +7734,9 @@ pub(crate) fn check_nn_bare_output_start(model: &CompiledModel, theta: &[f64]) -
 /// `a = √(6 / (fan_in + fan_out))` a pre-activation past `3` puts `tanh` (and the sigmoid,
 /// twice as wide) where its derivative is below 1e-2, so an input past `3 / a` does it alone.
 /// There the layer is nearly blind to its input, and which optimum a fit reaches depends on
-/// the path to it: on `examples/warfarin_dcm.ferx` without normalisation, starts perturbed by
-/// 1e-6 ended at OFV −164 or −1173 depending only on the inner warm-start strategy. Saturating
+/// the path to it: on `examples/warfarin_dcm.ferx` before it declared `init` (a bare head and no
+/// normalisation), starts perturbed by 1e-6 ended at OFV −164 or −1173 depending only on the
+/// inner warm-start strategy. Saturating
 /// hidden activations only; one warning per block, naming every such input.
 #[cfg(feature = "nn")]
 pub(crate) fn check_nn_input_scale(

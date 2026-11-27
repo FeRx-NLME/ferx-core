@@ -1231,9 +1231,9 @@ and a gap ends the leg for the restart. Before, a trapped leg ran until NLopt it
 On a 10-subject subset of the Michaelis–Menten benchmark below (`tests/ebe_basin_shift.rs`)
 the probe stops the trapped first leg at its 33rd evaluation, where a cold solve scores
 68.08, and the restart converges at 63.29. A leg the probe clears runs on unchanged, at the
-cost of one cold inner pass per probe. On `examples/warfarin_dcm.ferx` (Linux) the probe
-catches a trapped first leg at its 64th evaluation instead of the 96th, and the restart
-converges at −1173.56 either way (#2204).
+cost of one cold inner pass per probe. On `examples/warfarin_dcm.ferx` as it was before it declared `init`
+(Linux), the probe caught a trapped first leg at its 64th evaluation instead of the 96th, and
+the restart converged at −1173.56 either way (#2204).
 
 A probe ends the leg only when the gap comes from at least **1 % of the subjects** (#2600).
 On a large population a handful of subjects almost always sits in a lower cold mode: a
@@ -1285,9 +1285,9 @@ notice in `FitResult.warnings` says which run the reported estimates come from.
 
 On a simulated population of 80 subjects, 24 of them flip-flop
 (`tests/fixtures/flip_flop_pop/`, fitted in closed form and as an ODE), both fits end at the
-optimum, OFV −3051.439163, and are now reported converged. The closed form stops through the
-verified-stop rule and the ODE twin through the plateau rule. The check costs about 110 more
-objective evaluations (87 → 197 and 85 → 202), about twice each fit's run time (Linux).
+optimum, OFV −3392.235417, and are now reported converged. The closed form stops through the
+verified-stop rule and the ODE twin through the plateau rule. The check costs about 85–95 more
+objective evaluations (73 → 156 and 112 → 208), about twice each fit's run time (Linux).
 
 ## Configuration Example
 

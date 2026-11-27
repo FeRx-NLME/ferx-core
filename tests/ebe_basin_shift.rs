@@ -51,6 +51,17 @@
 //! 7.0614, one subject, on both. Measured at `72e1c6ef` + #2441, macOS in `release`, Linux
 //! in `ci-test` via `tools/linux-test.sh`.
 //!
+//! **And again with #3153.** The opening step's objective scale (`outer_optimizer::cap_factor`) changes
+//! the first leg's path, and the #2441 subset no longer traps. The current subset is subjects 16, 34,
+//! 46, 85, 88, 159, 163, 179, 190 and 196: draw 70 of 120 seeded 10-subject draws from `mm_n200.csv`
+//! (`random.Random(3153)`, `sample(ids, 10)` sorted), 7 of which trapped and restarted as both tests
+//! need. Measured on Linux x86_64, with the predictor off: restart notice cold OFV -25.180160 at
+//! the 33rd evaluation, restarted OFV -43.185843 (17.99 below the trapped leg's cold objective); at
+//! `maxiter = 3` best-seen -8.8642, cold -25.1831, gap 16.3189, one subject. The digits move with the
+//! CPU's libm (glibc picks FMA / AVX variants): on CI's runners the trapped leg's cold objective is
+//! -24.8866 and the `maxiter = 3` gap 16.40, so the two tests assert bands (±0.5 and ±0.2) that hold on
+//! both. A macOS intersection is still to be measured.
+//!
 //! **#2549: the two Tier-2 tests run with the warm-start predictor off.** #2549 starts every
 //! FOCE(I) inner solve at the mode predicted for the new point,
 //! `η̂ + (dη̂/dx)·Δx`, so a subject's start tracks the branch its mode is on instead of the
@@ -126,9 +137,9 @@ fn quoted_pair(message: &str) -> (f64, f64) {
 }
 
 /// The restart path. The trapped leg is stopped by the mid-leg basin probe after 33
-/// evaluations, at a point whose cold re-solve scores 68.0831, below what the optimizer saw
+/// evaluations, at a point whose cold re-solve scores -25.1802, below what the optimizer saw
 /// there; the run is restarted from it — its first inner solve is cold — and converges at
-/// 63.2880, 4.80 below the trapped leg's cold objective, with no gap left for the end-of-leg
+/// -43.1858, 17.99 below the trapped leg's cold objective, with no gap left for the end-of-leg
 /// check to find.
 #[test]
 fn a_trapped_fit_is_restarted_to_the_lower_objective() {
@@ -149,8 +160,8 @@ fn a_trapped_fit_is_restarted_to_the_lower_objective() {
         });
     assert_eq!(notice.category, WarningCode::OptimizerHealth);
     // The trapped basin, not a digit string: the cold objective moves in its sixth decimal
-    // with any rounding-level change to the gradient, while the basin it identifies sits 4.80
-    // above the optimum (63.2880) — over 200× the band.
+    // with any rounding-level change to the gradient (-25.18 here, -24.89 on CI), while the basin it
+    // identifies sits 17.99 above the optimum (-43.1858) — over 30× the band.
     let cold = notice
         .message
         .split("cold OFV = ")
@@ -159,15 +170,15 @@ fn a_trapped_fit_is_restarted_to_the_lower_objective() {
         .and_then(|v| v.parse::<f64>().ok())
         .unwrap_or_else(|| panic!("the notice quotes the cold objective: {}", notice.message));
     assert!(
-        (cold - 68.083).abs() < 0.02,
-        "the notice names the trapped leg's cold objective (≈ 68.083): {}",
+        (cold + 25.1).abs() < 0.5,
+        "the notice names the trapped leg's cold objective (≈ -25.1, ±0.5): {}",
         notice.message
     );
 
     assert!(
-        result.ofv < 63.4,
-        "expected the restart to reach the optimum (63.2880); the trapped leg's cold \
-         objective is ≈ 68.083. Got {}",
+        result.ofv < -43.0,
+        "expected the restart to reach the optimum (-43.1858); the trapped leg's cold \
+         objective is ≈ -25.180. Got {}",
         result.ofv
     );
     assert!(result.converged, "the restarted leg converged on its own terms");
@@ -215,10 +226,11 @@ fn a_basin_shift_with_no_budget_left_is_not_reported_converged() {
         result.ofv
     );
     assert!(
-        // Measured 7.0614 (best-seen 75.1577, cold 68.0963); a band, since the sixth decimal
-        // follows the rounding.
-        (best - cold - 7.0614).abs() < 0.02,
-        "measured gap ≈ 7.06 (best-seen ≈ 75.16, cold ≈ 68.10): got {best} vs {cold}"
+        // Measured 16.3189 (best-seen -8.8642, cold -25.1831); a band, since the digits follow the
+        // CPU's libm: 16.37 with AVX2/FMA masked, 16.40 on CI's runners (best-seen -8.9538,
+        // cold -25.3486).
+        (best - cold - 16.35).abs() < 0.2,
+        "measured gap ≈ 16.35 (best-seen ≈ -8.9, cold ≈ -25.3): got {best} vs {cold}"
     );
     assert!(!result.converged, "a fit optimized under trapped EBEs must not report converged");
 }
