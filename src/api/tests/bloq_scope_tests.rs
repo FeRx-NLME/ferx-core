@@ -315,3 +315,68 @@ fn check_model_options_reads_the_options_bloq_method() {
     assert!(!without.iter().any(|c| c == CODE), "None on a drop model: {without:?}");
     assert_eq!(model.bloq_in_force(), BloqMethod::Drop, "nothing outlives the call");
 }
+
+/// #3149: each subject's `ofv_contribution` is a term of the published objective, so they
+/// sum to the OFV under every quadrature objective as under FOCEI. On this M3 fixture
+/// Laplace used to report the FOCEI scores, 0.0831 off its OFV (the sign differs from
+/// the uncensored `one_cpt_iv`, where it was 0.0444).
+#[test]
+fn the_contributions_sum_to_every_quadrature_objective() {
+    let (model, population) = warfarin_bloq(BloqMethod::M3);
+    use EstimationMethod::{FoceI, Laplace};
+    for (method, n_agq) in [(FoceI, 1), (Laplace, 1), (Laplace, 2), (FoceI, 2)] {
+        let o = FitOptions { method, n_agq, ..opts(None, 1) };
+        let r = fit(&model, &population, &model.default_params, &o).expect("fit");
+        let sum: f64 = r.subjects.iter().map(|s| s.ofv_contribution).sum();
+        assert!((sum - r.ofv).abs() < 1e-9, "{method:?}, n_agq {n_agq}: Σ {sum} vs OFV {}", r.ofv);
+    }
+}
+
+/// #3149: a chained `agq_eval_only` readout publishes the quadrature OFV, so the
+/// contributions must sum to it whatever estimator produced the EBEs it follows (the
+/// post-fit pass re-solves them as conditional modes). Measured |Σ − OFV| on Linux x86_64 (macOS
+/// arm64 agrees to the printed digits): 2.74e-9 after FOCEI, 7.42e-10 after SAEM, whose EBEs are
+/// re-found at the post-fit tolerance; the bound is 3.6× over the larger.
+#[test]
+fn the_contributions_sum_to_a_chained_quadrature_readout() {
+    let (model, population) = warfarin_bloq(BloqMethod::M3);
+    for first in [EstimationMethod::FoceI, EstimationMethod::Saem] {
+        let o = FitOptions {
+            method: first,
+            methods: vec![first, EstimationMethod::Laplace],
+            agq_eval_only: true,
+            outer_maxiter: 8,
+            ..opts(None, 1)
+        };
+        let r = fit(&model, &population, &model.default_params, &o).expect("fit");
+        let sum: f64 = r.subjects.iter().map(|s| s.ofv_contribution).sum();
+        assert!((sum - r.ofv).abs() < 1e-8, "[{first:?}, laplace]: Σ {sum} vs OFV {}", r.ofv);
+    }
+}
+
+/// #3149 on the IOV path: the κ̂ reach the quadrature term, so the contributions of an
+/// IOV Laplace fit sum to its OFV. Measured |Σ − OFV| is 0 (exact) on Linux x86_64 and macOS
+/// arm64: the same term is summed in the same order.
+#[test]
+fn the_contributions_sum_to_an_iov_laplace_objective() {
+    let mut parsed = crate::parser::model_parser::parse_full_model_file(Path::new(
+        "examples/warfarin_iov_bloq.ferx",
+    ))
+    .expect("parse warfarin_iov_bloq");
+    let (population, _) = read_population_for(
+        &parsed.model,
+        &parsed.covariate_decls,
+        "data/warfarin_iov_bloq.csv",
+        None,
+        Some("OCC"),
+        None,
+        &parsed.column_map,
+    )
+    .expect("read warfarin_iov_bloq");
+    parsed.model.bloq_method = BloqMethod::M3;
+    let o = FitOptions { method: EstimationMethod::Laplace, ..opts(None, 1) };
+    let r = fit(&parsed.model, &population, &parsed.model.default_params, &o).expect("fit");
+    assert!(!r.ebe_kappas.is_empty(), "premise: an IOV fit");
+    let sum: f64 = r.subjects.iter().map(|s| s.ofv_contribution).sum();
+    assert!((sum - r.ofv).abs() < 1e-9, "Σ {sum} vs OFV {}", r.ofv);
+}
