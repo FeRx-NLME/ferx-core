@@ -2071,4 +2071,19 @@ fn a_fit_estimate_on_a_log_packed_bound_is_not_a_start_outside_it_2896() {
     let out: Vec<_> =
         crate::estimation::parameterization::theta_outside_declared_range(&q).collect();
     assert_eq!(out.len(), 2, "both sides are still judged: {out:?}");
+    // An identity-packed θ (negative lower) unpacks exactly, so its bound gets no round trip.
+    let rest = "  theta TVV(10.0, 1.0, 100.0)\n  omega ETA_CL ~ 0.09\n  sigma PROP_ERR ~ 0.04\n";
+    let mut r = model_with_parameters(&format!("  theta TVCL(1.0, -1.0, 10.0)\n{rest}"));
+    r.default_params.theta[0] = 10f64.next_up();
+    let hits = crate::estimation::parameterization::theta_outside_declared_range(&r.default_params);
+    assert_eq!(hits.count(), 1, "identity θ one ULP past 10");
+    // Where the round trip moves `ln b` (#3053 review), only the packed walk sees the start,
+    // and no cap is involved: no diagnostic.
+    let b = 1.9956874516962497_f64;
+    let mut s = model_with_parameters(&format!("  theta TVCL(1.0, 0.001, {b:?})\n{rest}"));
+    s.default_params.theta[0] = rt(b);
+    if rt(b).ln() != b.ln() {
+        let d = check_packed_start_in_box(&s.default_params, &FitOptions::default());
+        assert!(d.is_empty(), "{d:#?}");
+    }
 }
