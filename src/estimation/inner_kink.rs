@@ -1,0 +1,158 @@
+//! Inner searches on a **non-smooth** individual objective (#3159).
+//!
+//! A prediction clipped at a threshold (`y = if (x − TH < 0) 0 else x − TH`) puts a kink in the
+//! individual objective wherever a record crosses it. Two things go wrong there, and each has
+//! its own remedy here:
+//!
+//! * **A stall at a kink** ([`stall_escape`]). BFGS arrives on the kink's valley floor, where the
+//!   gradient is large and points *across* the valley, every step along it raises the objective
+//!   by more than the descent along the valley gains, and the objective-stall stop certifies the
+//!   point at ‖g‖ ≈ 10. A large gradient is not what is wrong: the *true* minimum of such an
+//!   objective is itself a kink minimum, certified at a large gradient. The right test is
+//!   Clarke stationarity, `0 ∈ conv{∇f near x}` (gradient sampling, Burke–Lewis–Overton): when it
+//!   holds the point is a minimum; when it does not, the hull's minimum-norm element is a descent
+//!   direction along the valley.
+//! * **A second mode** ([`kick_restarts`]). A clipped record that crosses the threshold
+//!   between two points makes a second local minimum a barrier away from the first, close to it
+//!   in distance (0.01) and not reachable by any descent from the incumbent. A descent from a
+//!   small kick of each coordinate reaches it.
+
+/// The gradient norm above which a stall is examined. The objective-stall stop's noise floor on
+/// a smooth ODE objective is at most about 6e-3 (measured on a 40-subject fit); a kink's is
+/// 5 and up, so nothing below this, which is every smooth objective, pays for a check.
+pub(super) const STALL_GNORM: f64 = 1.0;
+/// The radius of the gradient samples around a stalled point.
+const SAMPLE_RADIUS: f64 = 1e-5;
+/// The most escapes one inner solve attempts, so a pathological objective cannot spin.
+pub(super) const MAX_STALL_ESCAPES: usize = 25;
+/// Doublings of the first step along the descent direction (a span of 1e9).
+const MAX_DOUBLINGS: usize = 30;
+/// A hull element this small contains zero for this purpose: the point is stationary.
+const HULL_STATIONARY: f64 = 1e-6;
+/// The kick of a restart, in prior standard deviations. 0.25 is the smallest radius that found
+/// every second mode on the benchmark's clipped model; 0.5 and 1.0 found the same ones.
+const KICK_FRAC: f64 = 0.25;
+/// A coordinate whose prior SD is below this carries no information (a `0 FIX` placeholder).
+const KICK_MIN_SD: f64 = 1e-3;
+/// The most coordinates one subject's kicks visit (two descents each), the widest priors first,
+/// so a model with many occasions cannot make the final pass cost a descent per coordinate pair.
+const MAX_KICK_COORDS: usize = 16;
+/// The iterations of one kick's descent. A descent that reaches a lower mode does so within a
+/// handful (12 found every second mode on the fixture; 6 missed one by 2e-4, 3 missed two),
+/// and one that has not got there by then is not worth finishing.
+pub(super) const KICK_MAX_ITER: usize = 12;
+
+/// The minimum-norm point of the convex hull of `gs` (Frank–Wolfe with an exact line search).
+pub(super) fn min_norm_hull(gs: &[Vec<f64>]) -> Vec<f64> {
+    let n = gs[0].len();
+    let dot = |a: &[f64], b: &[f64]| a.iter().zip(b).map(|(x, y)| x * y).sum::<f64>();
+    let mut v = gs[0].clone();
+    for _ in 0..500 {
+        let (mut best, mut best_dot) = (0, f64::INFINITY);
+        for (i, g) in gs.iter().enumerate() {
+            let d = dot(g, &v);
+            if d < best_dot {
+                (best, best_dot) = (i, d);
+            }
+        }
+        let vv = dot(&v, &v);
+        if best_dot >= vv - 1e-14 * (1.0 + vv) {
+            break;
+        }
+        let diff: Vec<f64> = (0..n).map(|k| gs[best][k] - v[k]).collect();
+        let dd = dot(&diff, &diff);
+        if dd <= 0.0 {
+            break;
+        }
+        let t = (-dot(&v, &diff) / dd).clamp(0.0, 1.0);
+        for k in 0..n {
+            v[k] += t * diff[k];
+        }
+    }
+    v
+}
+
+/// Where a stall escape moved the search: the new point, its objective and its gradient.
+pub(super) struct StallEscape {
+    pub(super) x: Vec<f64>,
+    pub(super) f: f64,
+    pub(super) g: Vec<f64>,
+}
+
+/// The search stalled at `x` (objective `f0`) with a gradient of norm `gnorm`. `None` when `x`
+/// is stationary in Clarke's sense (it is certified as before) or no lower point was found
+/// (likewise); otherwise a lower point reached along the descent direction of the gradients
+/// sampled `±SAMPLE_RADIUS` along each axis. The caller restarts its metric from it.
+pub(super) fn stall_escape(
+    obj: &dyn Fn(&[f64]) -> f64, grad: &dyn Fn(&[f64]) -> Vec<f64>, x: &[f64], f0: f64, gnorm: f64,
+) -> Option<StallEscape> {
+    if !(gnorm >= STALL_GNORM) {
+        return None;
+    }
+    let n = x.len();
+    let mut gs = vec![grad(x)];
+    for k in 0..n {
+        for sgn in [1.0, -1.0] {
+            let mut p = x.to_vec();
+            p[k] += sgn * SAMPLE_RADIUS;
+            gs.push(grad(&p));
+        }
+    }
+    if gs.iter().flatten().any(|v| !v.is_finite()) {
+        return None;
+    }
+    let hull = min_norm_hull(&gs);
+    let norm = hull.iter().map(|v| v * v).sum::<f64>().sqrt();
+    if norm < HULL_STATIONARY {
+        return None;
+    }
+    let lower = |f: f64| f.is_finite() && f < f0 - 1e-9 * (1.0 + f0.abs());
+    let at = |t: f64| -> Vec<f64> { (0..n).map(|k| x[k] - t * hull[k]).collect() };
+    let (mut best_t, mut best_f) = (0.0, f0);
+    let mut t = SAMPLE_RADIUS / norm;
+    for _ in 0..MAX_DOUBLINGS {
+        let f = obj(&at(t));
+        if lower(f) && f < best_f {
+            (best_t, best_f) = (t, f);
+        } else if best_t > 0.0 {
+            break;
+        }
+        t *= 2.0;
+    }
+    (best_t > 0.0).then(|| {
+        let p = at(best_t);
+        let g = grad(&p);
+        StallEscape { x: p, f: best_f, g }
+    })
+}
+
+/// Restarts from a kick of each informative coordinate of the incumbent `x` (objective `nll`)
+/// by `±KICK_FRAC` prior SDs, `descend`ing from each and keeping any result lower by more than
+/// `1e-9`: the same acceptance as the guarded multi-start. At most [`MAX_KICK_COORDS`]
+/// coordinates are visited, the widest priors first. `None` when no kick found a lower mode.
+/// `E` is whatever `descend` reports about how its search ended.
+pub(super) fn kick_restarts<E>(
+    x: &[f64], nll: f64, sds: &[f64], obj: &dyn Fn(&[f64]) -> f64,
+    mut descend: impl FnMut(&mut Vec<f64>) -> E,
+) -> Option<(Vec<f64>, f64, E)> {
+    let mut best: Option<(Vec<f64>, f64, E)> = None;
+    let mut coords: Vec<(usize, f64)> =
+        sds.iter().copied().enumerate().filter(|&(_, sd)| sd >= KICK_MIN_SD).collect();
+    coords.sort_by(|a, b| b.1.total_cmp(&a.1));
+    coords.truncate(MAX_KICK_COORDS);
+    for (j, sd) in coords {
+        for sgn in [1.0, -1.0] {
+            let (from, f_from) = best.as_ref().map_or((x, nll), |(p, f, _)| (p.as_slice(), *f));
+            let mut cand = from.to_vec();
+            cand[j] += sgn * KICK_FRAC * sd;
+            let exit = descend(&mut cand);
+            if cand.iter().all(|v| v.is_finite()) {
+                let f = obj(&cand);
+                if f + 1e-9 < f_from {
+                    best = Some((cand, f, exit));
+                }
+            }
+        }
+    }
+    best
+}

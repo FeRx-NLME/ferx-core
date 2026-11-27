@@ -12017,6 +12017,7 @@ pub fn apply_fit_option(opts: &mut FitOptions, key: &str, value: &str) -> Result
         "inner_maxiter" => opts.inner_maxiter = parse_usize("inner_maxiter")?,
         "inner_tol" => opts.inner_tol = parse_f64("inner_tol")?,
         "inner_restarts" => opts.inner_restarts = parse_usize("inner_restarts")?,
+        "inner_kick" => opts.inner_kick = parse_bool("inner_kick")?,
         "inner_screen" => opts.inner_screen = parse_usize("inner_screen")?,
         "inner_twin_seed" => opts.inner_twin_seed = parse_bool("inner_twin_seed")?,
         // Validated like its covariance-step sibling `fd_hessian_step`, not like

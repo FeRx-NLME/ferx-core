@@ -1031,6 +1031,12 @@ pub(crate) struct InnerSolvePolicy {
     /// quadrature, whose objective is that constant; quadrature, IMP and the rest keep the
     /// solve. `false`, the `Default`, solves.
     pub(crate) skip_refused: bool,
+    /// Restart from a small kick of each informative coordinate of the returned EBE and keep a
+    /// lower mode ([`kink::kick_restarts`], #3159): the final EBE pass's, where a second mode a
+    /// barrier away is otherwise reported as the subject's EBE. Set by the final and cold
+    /// re-solves ([`Self::with_kick`], from `[fit_options] inner_kick`); `false`, the `Default`,
+    /// otherwise, so a search's warm solves pay nothing for it.
+    pub(crate) kick: bool,
 }
 
 impl InnerSolvePolicy {
@@ -1052,7 +1058,13 @@ impl InnerSolvePolicy {
             keep_certified_start: false,
             unseeded_iov_warm: false,
             skip_refused: skips_refused_subjects(options),
+            kick: false,
         }
+    }
+
+    /// This policy with the kick restarts ([`Self::kick`]) on or off.
+    pub(crate) fn with_kick(self, on: bool) -> Self {
+        Self { kick: on, ..self }
     }
 
     /// This policy for a pass whose `eta_init` are `prev` ([`PrevEtas`]).
@@ -2485,6 +2497,9 @@ pub(crate) fn recording_handle() -> Option<RecordingHandle> {
     INNER_RECORDING.with(|r| r.borrow().clone())
 }
 
+#[path = "inner_kink.rs"]
+mod kink;
+
 /// Run `f` with this thread writing to `handle`, then restore what it wrote to before — on
 /// every exit path, a panic included, so a recorded fit that panics on a cached pool worker
 /// cannot leave its handle armed there (#2379).
@@ -2640,6 +2655,7 @@ fn find_ebe_impl_from(
             // A refused subject's zeros are `refused_iov_ebe`'s placeholder, not a solve.
             policy.init_is_warm && !refused,
             if policy.unseeded_iov_warm { InnerHessianSeed::None } else { policy.seed },
+            policy.kick,
         );
         #[cfg(test)]
         with_recording(|r| {
@@ -3622,6 +3638,32 @@ fn find_ebe_solve(
         MULTISTART_PROFILE.record(twin_moved, screen_moved, axis_moved);
     }
 
+    // Kick restarts around the incumbent (#3159): a second mode a barrier away.
+    if policy.kick {
+        let sds: Vec<f64> =
+            omega_prior_diag(&params.omega, n_eta).iter().map(|p| p.var.max(0.0).sqrt()).collect();
+        if let Some((cand, cand_nll, ok)) = kink::kick_restarts(&eta, nll, &sds, &obj, |cand| {
+            inner_minimize_with_grad(
+                &obj,
+                &agrad,
+                cand,
+                n_eta,
+                max_iter.min(kink::KICK_MAX_ITER),
+                tol,
+                precond.as_deref(),
+                None,
+                stop_precond,
+                &stall_at,
+                false,
+            )
+        }) {
+            nll = cand_nll;
+            eta = cand;
+            ebe_exit = ok;
+            used_fallback = false;
+        }
+    }
+
     // ── Runaway-EBE guard (#958) ───────────────────────────────────────────
     // A gradient the search cannot trust can march the inner BFGS tens of prior
     // SDs away from η = 0 and then *certify* the point it lands on: the objective
@@ -3943,6 +3985,7 @@ fn find_ebe_iov(
         init_is_mode,
         false,
         InnerHessianSeed::GaussNewton,
+        false,
     )
 }
 
@@ -3952,7 +3995,7 @@ fn find_ebe_iov(
 fn find_ebe_iov_seeded(
     model: &CompiledModel, subject: &Subject, params: &ModelParameters, max_iter: usize, tol: f64,
     eta_init: Option<&[f64]>, mu_k: Option<&[f64]>, restarts: usize, ebe_variance: EbeVariance,
-    init_is_mode: bool, init_is_warm: bool, seed: InnerHessianSeed,
+    init_is_mode: bool, init_is_warm: bool, seed: InnerHessianSeed, kick: bool,
 ) -> EbeResult {
     let n_eta = model.n_eta;
     let n_kappa = model.n_kappa;
@@ -4586,6 +4629,34 @@ fn find_ebe_iov_seeded(
             }
         }
         MULTISTART_PROFILE.record(false, false, axis_moved);
+    }
+
+    // Kick restarts around the incumbent (#3159), on the flat `[ψ, κ_1, …, κ_K]`.
+    if kick {
+        let nll = obj(&x);
+        let sds: Vec<f64> = iov_prior_diag(n_eta, n_kappa, k_occasions, nested, params)
+            .iter()
+            .map(|p| p.var.max(0.0).sqrt())
+            .collect();
+        if let Some((cand, _, ok)) = kink::kick_restarts(&x, nll, &sds, &obj, |cand| {
+            inner_minimize_with_grad(
+                &obj,
+                &agrad,
+                cand,
+                n_flat,
+                max_iter.min(kink::KICK_MAX_ITER),
+                tol,
+                None,
+                None,
+                None,
+                &stall_at,
+                false,
+            )
+        }) {
+            x = cand;
+            ebe_exit = ok;
+            used_fallback = false;
+        }
     }
 
     let runaway_limit = RUNAWAY_EBE_MAHA_PER_ETA * n_flat as f64;
@@ -6748,6 +6819,8 @@ fn lbfgs_run(
     let mut stall = 0u32;
     // Accepted non-moves in a row ([`exact_search_stuck`], #2497).
     let mut non_moves = NonMoveStreak::default();
+    // Kink escapes this solve has attempted ([`kink::stall_escape`], #3159).
+    let mut escapes = 0usize;
     let mut best_gnorm = f64::INFINITY;
     // The regime is a property of the *iterate*, not of the start point (#1521 review): a
     // transit/IG subject can begin inside the closed form's domain and cross the flip-flop
@@ -6847,6 +6920,21 @@ fn lbfgs_run(
             x[i] += s[i];
         }
         if stalled {
+            // A stall at a kink is not a minimum unless the gradients around it say so (#3159).
+            if escapes < kink::MAX_STALL_ESCAPES {
+                escapes += 1;
+                if let Some(e) = kink::stall_escape(obj, grad, x, f_cur, gnorm) {
+                    x.copy_from_slice(&e.x);
+                    f_cur = e.f;
+                    g = e.g;
+                    s_hist.clear();
+                    y_hist.clear();
+                    rho_hist.clear();
+                    stall = 0;
+                    best_gnorm = f64::INFINITY;
+                    continue;
+                }
+            }
             return InnerExit::Converged;
         }
         enable_stall = enable_stall || stall_at(x);
@@ -7052,6 +7140,8 @@ fn dense_bfgs_run(
     let mut stall = 0u32;
     // Accepted non-moves in a row ([`exact_search_stuck`], #2497).
     let mut non_moves = NonMoveStreak::default();
+    // Kink escapes this solve has attempted ([`kink::stall_escape`], #3159).
+    let mut escapes = 0usize;
     let mut best_gnorm = f64::INFINITY;
     // The regime is a property of the *iterate*, not of the start point (#1521 review): a
     // transit/IG subject can begin inside the closed form's domain and cross the flip-flop
@@ -7166,6 +7256,20 @@ fn dense_bfgs_run(
         let f_old = f_cur;
         f_cur = f_new;
         if stalled {
+            // A stall at a kink is not a minimum unless the gradients around it say so (#3159).
+            if escapes < kink::MAX_STALL_ESCAPES {
+                escapes += 1;
+                if let Some(e) = kink::stall_escape(obj, grad, x, f_cur, gnorm) {
+                    x.copy_from_slice(&e.x);
+                    f_cur = e.f;
+                    g = e.g;
+                    h_inv = init_h_inv(n, precond, seed_inv.as_ref());
+                    h_unshaped = true;
+                    stall = 0;
+                    best_gnorm = f64::INFINITY;
+                    continue;
+                }
+            }
             return InnerExit::Converged;
         }
         enable_stall = enable_stall || stall_at(x);
@@ -8845,6 +8949,10 @@ fn run_inner_loop_warm_map_impl<T: Send + Default>(
 
     (eta_hats, h_matrices, stats, kappas, extras)
 }
+
+#[cfg(test)]
+#[path = "inner_kink_tests.rs"]
+mod kink_tests;
 
 #[cfg(test)]
 #[path = "inner_optimizer_tests.rs"]

@@ -3533,6 +3533,7 @@ pub ferx_core::types::FitOptions::impmap_seed: core::option::Option<u64>
 pub ferx_core::types::FitOptions::impmap_sobol: bool
 pub ferx_core::types::FitOptions::impmap_trace: bool
 pub ferx_core::types::FitOptions::inits_from_nca: core::option::Option<ferx_core::suggest_start::NcaInit>
+pub ferx_core::types::FitOptions::inner_kick: bool
 pub ferx_core::types::FitOptions::inner_maxiter: usize
 pub ferx_core::types::FitOptions::inner_optimizer: ferx_core::InnerOptimizer
 pub ferx_core::types::FitOptions::inner_restarts: usize
@@ -5394,6 +5395,7 @@ pub ferx_core::FitOptions::impmap_seed: core::option::Option<u64>
 pub ferx_core::FitOptions::impmap_sobol: bool
 pub ferx_core::FitOptions::impmap_trace: bool
 pub ferx_core::FitOptions::inits_from_nca: core::option::Option<ferx_core::suggest_start::NcaInit>
+pub ferx_core::FitOptions::inner_kick: bool
 pub ferx_core::FitOptions::inner_maxiter: usize
 pub ferx_core::FitOptions::inner_optimizer: ferx_core::InnerOptimizer
 pub ferx_core::FitOptions::inner_restarts: usize
