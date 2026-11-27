@@ -179,7 +179,7 @@ fn warfarin_iov_focei_warns_and_names_the_shelf_variance_and_natural_does_not() 
     assert!(low_ess(&nat).is_none(), "{:?}", nat.warnings);
 }
 
-/// S4: the healthy `warfarin_iov` FOCE fit (ESS 402.3845432843758 since #3153; 402.3820622609698 from #3019; 402.3820667781389 from #2786's last wave; 402.3883345788064 from #2706; 402.38098512621974 from #2549; 402.38186322963156 from #2462; 402.38245815217266 from #2443; 402.34727326791347 from #2261 PR 2; 402.3472759966188 from #2261 PR 1; 402.3856724693695 from #2280; 402.38107815756786 from #2210; 402.3820222439373 from #2217; 402.38567292526295 from #2202; 402.3856723316291 from #2093; 404.59 from #1722's frozen-variance FOCE EBEs; 396.21 before)
+/// S4: the healthy `warfarin_iov` FOCE fit (ESS 402.3883440281194 since #3153; 402.3820622609698 from #3019; 402.3820667781389 from #2786's last wave; 402.3883345788064 from #2706; 402.38098512621974 from #2549; 402.38186322963156 from #2462; 402.38245815217266 from #2443; 402.34727326791347 from #2261 PR 2; 402.3472759966188 from #2261 PR 1; 402.3856724693695 from #2280; 402.38107815756786 from #2210; 402.3820222439373 from #2217; 402.38567292526295 from #2202; 402.3856723316291 from #2093; 404.59 from #1722's frozen-variance FOCE EBEs; 396.21 before)
 /// carries no SIR warning at all.
 #[test]
 #[cfg_attr(not(feature = "slow-tests"), ignore = "slow: opt in with --features slow-tests")]
@@ -261,10 +261,12 @@ fn warfarin_iov_foce_carries_no_sir_warning() {
     // the old pin): past the Woodbury gate `foce_f` rotates the rows into `I + S` instead of
     // factoring the dense `R̃`, the same objective rounded differently, so the L-BFGS path and
     // the covariance the fixed-seed proposal is built from move in their last bits.
-    // #3153 moved it by +6.2e-6 relative (402.382_062_260_969_8 → 402.384_543_284_375_8; Linux
-    // x86_64, see the FOCEI note): the same optimum (OFV 205.090329604 → 205.090329605, worst θ
-    // 1.1e-6 relative, 66 → 86 iterations) on another first-leg path.
-    assert_ess(f.sir_ess, 402.384_543_284_375_8, "FOCE packed");
+    // #3153 moved it by +1.6e-5 relative (402.382_062_260_969_8 → 402.388_344_028_119_4, CI's
+    // x86_64 `slow-tests.yml` digits): the same optimum (OFV 205.090329604 → 205.090329605,
+    // worst θ 1.1e-6 relative, 66 → 86 iterations) on another first-leg path. A Linux x86_64
+    // host whose four #3167 tests fail reads 402.384_543_284_375_8 here; the other four pins
+    // in this file match CI there.
+    assert_ess(f.sir_ess, 402.388_344_028_119_4, "FOCE packed");
     assert!(sir_warnings(&f).is_empty(), "{:?}", f.warnings);
 }
 

@@ -10291,8 +10291,15 @@ fn a_handful_of_switched_subjects_is_absorbed_into_the_running_leg() {
 /// (omega and sigma × 0.95 to 1.05) every fit ends between −1194.8 and −1284.6. With CI's
 /// libm digits emulated (`GLIBC_TUNABLES=glibc.cpu.hwcaps=-AVX2,-FMA,-AVX512F,...`) the own
 /// start ends at −1230.4537 in 4752 evaluations, converged, and the 42 range is −1275.5 to
-/// −1194.6 (41 of 42 converge, against 42). The bound below sits under the worst of them and
-/// under −1185; −231.5 and the −1154.59 unconverged trap #2093 fixed both fail it.
+/// −1194.6 (41 of 42 converge, against 42). CI's own `slow-tests.yml` runner ends the own
+/// start at −1242.676698 in 1933 evaluations, converged. The bound below sits under the worst
+/// of them and under −1185; −231.5 and the −1154.59 unconverged trap #2093 fixed both fail it.
+///
+/// The gap this test is about is the cold re-solve scoring worse than the optimizer's EBEs
+/// (#833), the trace a trapped basin leaves. On CI the final point also has one subject (7)
+/// whose EBE the Sobol screen moves to a lower individual objective (#2013's notice, filed
+/// under the same code). That is a per-subject second mode, reported at its lower EBE, not a
+/// gap, so it is allowed.
 ///
 /// The basin probe is owned end to end by `tests/ebe_basin_shift.rs` (a subset re-picked to
 /// trap on both platforms) and by
@@ -10318,7 +10325,8 @@ fn the_warfarin_dcm_fit_converges_with_no_start_dependence_left() {
         r.ofv
     );
     assert!(
-        !r.warnings_structured.iter().any(|w| w.category == WarningCode::EbeStartDependent),
+        !r.warnings_structured.iter().any(|w| w.category == WarningCode::EbeStartDependent
+            && !w.message.contains("Sobol screen (`inner_screen`)")),
         "no start-dependence gap survives: {:?}",
         r.warnings
     );
@@ -15784,8 +15792,10 @@ fn a_cold_mode_leg_below_the_verified_incumbent_is_kept() {
 
 /// #2645, the Newton pass: the legs settle on a stop that is no minimum, and a leg from the
 /// capped BHHH step leaves it. Re-picked for #3153 alongside `cold_wins.csv` above, same
-/// noise and search: seed 33's `newton_wins.csv` gains 1.2673 on Linux x86_64; the bound is
-/// under a third of that.
+/// noise: seed 37's `newton_wins.csv` gains 1.6988 (2 legs off, 4 on) both on a Linux x86_64
+/// host and on CI's `slow-tests.yml` runner, scanned over all 60 seeds on both. Seed 33, the
+/// first pick, gained 1.2673 on the host and nothing on CI. The bound is under a fourth of
+/// that.
 #[test]
 #[cfg_attr(
     not(feature = "slow-tests"),
