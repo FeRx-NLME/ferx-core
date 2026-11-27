@@ -5372,6 +5372,13 @@ pub struct CompiledModel {
     /// models to FD. (Structured replacement for matching the "conditional
     /// parameter" `parse_warnings` string.)
     pub has_conditional_eta_params: bool,
+    /// True when the prediction has a kink an inner search can stall at: an `if`, `min`, `max`,
+    /// `clamp`, `abs`, `floor`, `ceil` or `round` whose condition or operand depends on a
+    /// random effect or a state, in `[individual_parameters]` or a `[scaling]` `y` readout. Set by
+    /// the parser (#3210). It turns the inner stall escape on by default on an ODE model (a
+    /// closed-form model has no stall stop; [`FitOptions::inner_kick`] turns it on everywhere). `[odes]` switches and η-moved event
+    /// times are kinks it does not detect.
+    pub prediction_has_kink: bool,
     /// Per-ETA transformation metadata derived from the `[individual_parameters]`
     /// expressions at parse time. Length ≤ n_eta (only ETAs whose expression was
     /// classified are present). Forwarded into `FitResult`.
@@ -9679,9 +9686,11 @@ pub struct FitOptions {
     /// kick too: kicked in the final pass only, the #833 recovery reported the search's unkicked
     /// EBEs, which score lower on OFV. The kicks run whether or not the model has a kink
     /// (measured 2-20× on four fast ODE examples without one), so turn it on only for a model
-    /// with a clipped or thresholded prediction. It also turns on the stall escape: a stall at
-    /// ‖∇‖ ≥ 1 is checked by gradient sampling, and left along the valley when the sampled
-    /// gradients' hull excludes zero (off by default: a smooth ODE objective stalls there too).
+    /// with a clipped or thresholded prediction. It also turns on the stall escape for every
+    /// model: a stall at ‖∇‖ ≥ 1 is checked by gradient sampling, and left along the valley when
+    /// the sampled gradients' hull excludes zero. Without it the escape runs only on a model whose
+    /// prediction has a kink ([`CompiledModel::prediction_has_kink`], #3210), since a smooth ODE
+    /// objective stalls there too.
     pub inner_kick: bool,
     /// Size of the inner multi-start's quasi-random screen (`[fit_options] inner_screen`,
     /// default `100`; set `0` to disable, #2013). Runs inside the cold multi-start

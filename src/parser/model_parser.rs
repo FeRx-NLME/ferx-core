@@ -5106,27 +5106,26 @@ pub fn parse_full_model_with(
     // `__ferx_ro_*` variables (#486/#1636), which would hide the block.
     // #1065: per θ block, the one plain column every read indexes it by.
     let mut read_index: Vec<(String, Option<String>)> = Vec::new();
+    let readout = match blocks.get("scaling") {
+        Some(lines) => readout_y_exprs(lines, &theta_names, &eta_names, &indiv_var_names)
+            .map_err(|e| retarget_scaling_diag(is_algebraic, e))?,
+        None => Vec::new(),
+    };
+    // #1649/#1650: the per-η couplings also follow the random effects into the
+    // states, which the share above does not.
+    let state_lines: Vec<&String> =
+        ["odes", "initial_conditions"].iter().filter_map(|b| blocks.get(*b)).flatten().collect();
+    let states = StateInputs::new(
+        &state_lines,
+        is_algebraic,
+        ode_spec.as_ref().map(|s| s.state_names.as_slice()),
+        pk_model,
+        &pk_param_map,
+        &indiv_var_names,
+    );
+    // #3210: turns the inner stall escape on by default.
+    let prediction_has_kink = prediction_has_kink(&indiv_stmts, &readout, &states);
     if !level_block_decls.is_empty() || vector_theta_decls.iter().any(|d| d.profiled) {
-        let readout = match blocks.get("scaling") {
-            Some(lines) => readout_y_exprs(lines, &theta_names, &eta_names, &indiv_var_names)
-                .map_err(|e| retarget_scaling_diag(is_algebraic, e))?,
-            None => Vec::new(),
-        };
-        // #1649/#1650: the per-η couplings also follow the random effects into the
-        // states, which the share above does not.
-        let state_lines: Vec<&String> = ["odes", "initial_conditions"]
-            .iter()
-            .filter_map(|b| blocks.get(*b))
-            .flatten()
-            .collect();
-        let states = StateInputs::new(
-            &state_lines,
-            is_algebraic,
-            ode_spec.as_ref().map(|s| s.state_names.as_slice()),
-            pk_model,
-            &pk_param_map,
-            &indiv_var_names,
-        );
         let mut readout_with_states = states.readout(&readout, blocks.contains_key("scaling"));
         // #2562: a `[binary_model]` predictor is a prediction too. It reads no state,
         // so it joins both readout lists as written.
@@ -5857,6 +5856,7 @@ pub fn parse_full_model_with(
         gradient_method: GradientMethod::default(),
         parse_warnings: deprecated_block_warnings, // more pushed below
         has_conditional_eta_params: false,
+        prediction_has_kink,
         eta_param_info,
         kappa_param_types,
         theta_transform,
@@ -24412,42 +24412,24 @@ fn map_condition_operands<'a>(
 ///
 /// The readout is read from its source text, where a block lifted into `__ferx_ro_g{n}` by the #1636
 /// desugaring is still the gather it is; the statements that desugaring appends to `stmts` only
-/// re-state a readout read, so they add no share. The propagation is a fixpoint over assignment
-/// order, so a forward reference cannot be missed by a single pass. `only_eta` restricts the η
-/// taint to one slot of the extended η vector (#1649): each [`EtaCoupling::share`] is this question
-/// asked of one random effect.
+/// re-state a readout read, so they add no share. Both propagations are fixpoints over assignment
+/// order ([`eta_tainted_names`] for the η one). `only_eta` restricts the η taint to one slot of the
+/// extended η vector (#1649): each [`EtaCoupling::share`] is this question asked of one random
+/// effect.
 fn block_shares_scale_with_eta(
     stmts: &[Statement], readout: &[Expression], endpoint_labels: &[&'static str], block: &str,
     only_eta: Option<usize>,
 ) -> Option<ScaleShare> {
-    /// Every `(lhs, rhs)` assignment in source order, `if`-branches included.
-    fn assignments<'a>(stmts: &'a [Statement], out: &mut Vec<(Option<&'a str>, &'a Expression)>) {
-        for s in stmts {
-            match s {
-                Statement::Assign(n, e) => out.push((Some(n.as_str()), e)),
-                Statement::If { branches, else_body } => {
-                    for (_, body) in branches {
-                        assignments(body, out);
-                    }
-                    if let Some(eb) = else_body {
-                        assignments(eb, out);
-                    }
-                }
-                _ => {}
-            }
-        }
-    }
-
     let mut assigns = Vec::new();
     assignments(stmts, &mut assigns);
     let n_y = readout.len() - endpoint_labels.len();
     // `None` is the readout: it is read, never assigned to.
     assigns.extend(readout.iter().map(|e| (None, e)));
     let first_readout = assigns.len() - readout.len();
+    let eta_tainted = eta_tainted_names(&assigns, only_eta);
     let mut block_tainted: Vec<&str> = Vec::new();
-    let mut eta_tainted: Vec<&str> = Vec::new();
     loop {
-        let before = (block_tainted.len(), eta_tainted.len());
+        let before = block_tainted.len();
         for (at, (lhs, rhs)) in assigns.iter().enumerate() {
             let mut reads_block = false;
             let mut reads_eta = false;
@@ -24479,15 +24461,122 @@ fn block_shares_scale_with_eta(
                 if reads_block && !block_tainted.contains(&lhs) {
                     block_tainted.push(lhs);
                 }
-                if (reads_eta || eta_via.is_some()) && !eta_tainted.contains(&lhs) {
-                    eta_tainted.push(lhs);
-                }
             }
         }
-        if (block_tainted.len(), eta_tainted.len()) == before {
+        if block_tainted.len() == before {
             return None;
         }
     }
+}
+
+/// Every `(lhs, rhs)` assignment of `stmts` in source order, `if`-branches included.
+fn assignments<'a>(stmts: &'a [Statement], out: &mut Vec<(Option<&'a str>, &'a Expression)>) {
+    for s in stmts {
+        match s {
+            Statement::Assign(n, e) => out.push((Some(n.as_str()), e)),
+            Statement::If { branches, else_body } => {
+                for (_, body) in branches {
+                    assignments(body, out);
+                }
+                if let Some(eb) = else_body {
+                    assignments(eb, out);
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
+/// Whether `expr` reads a random effect: an `Eta` node (only slot `only_eta`, when given) or a
+/// name in `tainted`.
+fn expr_reads_eta(expr: &Expression, tainted: &[&str], only_eta: Option<usize>) -> bool {
+    let mut reads = false;
+    visit_expr_nodes(expr, &mut |n| match n {
+        Expression::Eta(i) => reads |= only_eta.is_none_or(|k| k == *i),
+        Expression::Variable(v) => reads |= tainted.contains(&v.as_str()),
+        _ => {}
+    });
+    reads
+}
+
+/// The assigned names whose value depends on a random effect through any chain of assignments
+/// (`assigns` as [`assignments`] lists them; a `None` left-hand side is read, never assigned). A
+/// fixpoint over assignment order, so a forward reference or a reassignment cannot be missed by a
+/// single pass. `only_eta` restricts the taint to one slot of the extended η vector (#1649).
+fn eta_tainted_names<'a>(
+    assigns: &[(Option<&'a str>, &'a Expression)], only_eta: Option<usize>,
+) -> Vec<&'a str> {
+    let mut tainted: Vec<&str> = Vec::new();
+    loop {
+        let before = tainted.len();
+        for (lhs, rhs) in assigns {
+            if let Some(lhs) = *lhs {
+                if !tainted.contains(&lhs) && expr_reads_eta(rhs, &tainted, only_eta) {
+                    tainted.push(lhs);
+                }
+            }
+        }
+        if tainted.len() == before {
+            return tainted;
+        }
+    }
+}
+
+/// Whether the prediction has a kink an inner search can stall at (#3210): an `if`, `min`, `max` or
+/// `clamp` (each a `Conditional` once desugared), `abs`, `floor`, `ceil` or `round` whose
+/// condition or operand depends on a random effect or a state, in an `[individual_parameters]`
+/// statement (block `if` conditions included) or a `y` readout (`readout`, as [`readout_y_exprs`]
+/// gives it). A branch on time or a covariate alone is smooth in η and does not count. Not read:
+/// `[odes]` right-hand sides, `[derived]`, and event times, so an η-moved switch or dose end that
+/// crosses an observation is a kink this misses (the gain measured on #3210 was 7.8e-7).
+fn prediction_has_kink(stmts: &[Statement], readout: &[Expression], states: &StateInputs) -> bool {
+    let mut assigns = Vec::new();
+    assignments(stmts, &mut assigns);
+    let eta = eta_tainted_names(&assigns, None);
+    let tainted = |e: &Expression| {
+        let mut state = false;
+        visit_expr_nodes(e, &mut |n| {
+            if let Expression::Variable(v) | Expression::Covariate(v) = n {
+                state |= states.is_state(v);
+            }
+        });
+        state || expr_reads_eta(e, &eta, None)
+    };
+    let cond_tainted = |c: &Condition| {
+        let mut t = false;
+        visit_condition_nodes(c, &mut |n| t |= tainted(n));
+        t
+    };
+    let kinked = |e: &Expression| {
+        let mut k = false;
+        visit_expr_nodes(e, &mut |n| {
+            k |= match n {
+                Expression::Conditional(c, _, _) => cond_tainted(c),
+                Expression::UnaryFn(f, a) => {
+                    matches!(f.as_str(), "abs" | "floor" | "ceil" | "round") && tainted(a)
+                }
+                _ => false,
+            }
+        });
+        k
+    };
+    fn conditions<'a>(stmts: &'a [Statement], out: &mut Vec<&'a Condition>) {
+        for s in stmts {
+            if let Statement::If { branches, else_body } = s {
+                for (c, body) in branches {
+                    out.push(c);
+                    conditions(body, out);
+                }
+                if let Some(eb) = else_body {
+                    conditions(eb, out);
+                }
+            }
+        }
+    }
+    let mut conds = Vec::new();
+    conditions(stmts, &mut conds);
+    conds.into_iter().any(cond_tainted)
+        || assigns.iter().map(|(_, e)| *e).chain(readout).any(kinked)
 }
 
 /// The name a readout leaf takes for "some state" when `y` is a state by
