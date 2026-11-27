@@ -268,9 +268,9 @@ fn vanco_iov_loading_titration_matches_mrgsolve() {
 
     // Point metric: troughs in [10, 15] on 2 of 8 decisions (6 and 7).
     assert!(
-        (m.pct_time_in_window.expect("trough window declared") - 2.0 / 8.0).abs() < 1e-9,
-        "pct_time_in_window {:?}",
-        m.pct_time_in_window
+        (m.pct_readings_in_window.expect("trough window declared") - 2.0 / 8.0).abs() < 1e-9,
+        "pct_readings_in_window {:?}",
+        m.pct_readings_in_window
     );
 
     // The example declares no `auc_target`, so no exposure metric is reported.

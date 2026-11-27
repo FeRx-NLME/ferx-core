@@ -30,7 +30,7 @@
 //! # NONMEM
 //!
 //! Both files were run through the committed control streams on NONMEM 7.6.0
-//! (`tests/nonmem/warfarin_bloq_{intcols,floatcols}.{ctl,lst}`, each naming its own
+//! (`tests/nonmem/warfarin_bloq_{intcols,floatcols}.{ctl,nm.json}`, each naming its own
 //! dataset): 109 observation records and `#OBJV 279.35595553971399` on both, with
 //! identical final estimates; with that one `MDV` flag cleared, 110 records and
 //! 281.06112134711015. NONMEM reads the float spelling as the integer, and so must
@@ -38,7 +38,7 @@
 //! FOCEI against NONMEM's LAPLACE `F_FLAG` likelihood, which carries a different
 //! additive constant (see `tests/bloq_convergence.rs`) — the anchor is that each
 //! engine reads both files identically. `the_committed_nonmem_runs_read_both_files_alike`
-//! checks the committed `.lst` pair says so, so the evidence cannot quietly become
+//! checks the committed `.nm.json` pair says so, so the evidence cannot quietly become
 //! two runs of one file (the #1009 review found exactly that hole in an earlier
 //! anchor).
 //!
@@ -247,29 +247,24 @@ fn float_formatted_integer_columns_fit_like_the_integer_spelling() {
     }
 }
 
-/// The NONMEM half of the anchor, as committed. Each `.lst` must name its own
+/// The NONMEM half of the anchor, as committed. Each extracted run must name its own
 /// dataset (so it records which file it read), and the two must report the same
 /// observation count and objective.
 #[test]
 fn the_committed_nonmem_runs_read_both_files_alike() {
     let read = |tag: &str| {
-        let lst = std::fs::read_to_string(repo(&format!("tests/nonmem/warfarin_bloq_{tag}.lst")))
-            .expect("the NONMEM listing is committed");
-        assert!(
-            lst.contains(&format!("$DATA warfarin_bloq_{tag}.csv")),
-            "{tag}.lst must record that it read warfarin_bloq_{tag}.csv"
+        let path = repo(&format!("tests/nonmem/warfarin_bloq_{tag}.nm.json"));
+        let text = std::fs::read_to_string(path).expect("the extracted NONMEM run is committed");
+        let run: serde_json::Value = serde_json::from_str(&text).expect("valid JSON");
+        assert_eq!(
+            run["data_file"],
+            format!("warfarin_bloq_{tag}.csv"),
+            "{tag}.nm.json must record that it read warfarin_bloq_{tag}.csv"
         );
-        let field = |key: &str| -> String {
-            lst.lines()
-                .find(|l| l.contains(key))
-                .unwrap_or_else(|| panic!("{tag}.lst has no `{key}` line"))
-                .split(':')
-                .next_back()
-                .unwrap()
-                .trim()
-                .to_string()
-        };
-        (field("TOT. NO. OF OBS RECS"), field("OBJECTIVE FUNCTION VALUE WITHOUT CONSTANT"))
+        (
+            run["observations"].as_u64().expect("observation count"),
+            run["steps"][0]["objv_without_constant"].as_f64().expect("objective"),
+        )
     };
     let integer = read("intcols");
     let float = read("floatcols");
@@ -280,11 +275,7 @@ fn the_committed_nonmem_runs_read_both_files_alike() {
     let evid = lines[0].split(',').position(|h| h == "EVID").expect("EVID");
     let n_evid0 = lines[1..].iter().filter(|l| l.split(',').nth(evid) == Some("0")).count();
     assert_eq!(n_evid0, 110, "observation records in the committed dataset");
-    assert_eq!(
-        integer.0,
-        (n_evid0 - 1).to_string(),
-        "NONMEM excludes exactly the MDV=1 observation"
-    );
-    assert_eq!(integer.1, "279.35595553971399");
+    assert_eq!(integer.0, (n_evid0 - 1) as u64, "NONMEM excludes exactly the MDV=1 observation");
+    assert_eq!(integer.1, 279.355_955_539_713_99);
     assert_eq!(float, integer, "NONMEM reads the float spelling as the integer");
 }

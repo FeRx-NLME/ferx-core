@@ -2595,7 +2595,7 @@ fn qtc_fit(on: bool) -> (crate::types::FitResult, f64) {
         crate::api::read_population_as_fitted(&parsed, "tests/data/variance_collapse/qtc_sim.csv")
             .expect("data")
             .0;
-    crate::api::bind_theta_levels(&mut parsed, QTC_MODEL, &mut pop).expect("TEFF levels");
+    crate::levels::bind_theta_levels(&mut parsed, QTC_MODEL, &mut pop).expect("TEFF levels");
     let model = parsed.model;
     let opts = FitOptions {
         method: crate::types::EstimationMethod::FoceI,

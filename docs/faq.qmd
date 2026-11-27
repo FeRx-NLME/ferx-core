@@ -352,7 +352,7 @@ $OMEGA 0 FIX
 
 `examples/one_cpt_iv_pooled.ferx` against `data/one_cpt_iv.csv`, versus the
 control stream above under `$EST METHOD=0 MAXEVAL=9999 SIGDIGITS=4`
-(`nonmem_anchor/results/zero_omega_pooled.{ctl,lst,ext}`, NONMEM 7.6.0):
+(`nonmem_anchor/results/zero_omega_pooled.{ctl,nm.json,ext}`, NONMEM 7.6.0):
 
 | Quantity | ferx | NONMEM | Relative Δ |
 |---|---|---|---|

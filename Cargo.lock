@@ -534,6 +534,7 @@ name = "ferx-cli"
 version = "0.4.0"
 dependencies = [
  "ferx-core",
+ "ferx-search",
  "ferx-tools",
  "indicatif",
  "mimalloc",
@@ -571,19 +572,33 @@ dependencies = [
 ]
 
 [[package]]
+name = "ferx-search"
+version = "0.4.0"
+dependencies = [
+ "csv",
+ "ferx-core",
+ "ferx-tools",
+ "libc",
+ "nalgebra",
+ "rand 0.10.3",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "toml",
+]
+
+[[package]]
 name = "ferx-tools"
 version = "0.4.0"
 dependencies = [
  "csv",
  "ferx-core",
- "libc",
  "nalgebra",
  "rand 0.10.3",
  "rayon",
  "serde",
  "serde_json",
  "tempfile",
- "toml",
 ]
 
 [[package]]
@@ -1713,9 +1728,9 @@ dependencies = [
 
 [[package]]
 name = "zip"
-version = "9.0.2"
+version = "9.0.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "9e2fc56a6707efb066c40aead2409ebb1224e6dde24a074e9fbc78ced500507b"
+checksum = "6e04976da629d3b04204ba8105b396a193af8ad2583b2c79bfb3ab8af580a11e"
 dependencies = [
  "crc32fast",
  "flate2",

@@ -116,8 +116,7 @@ fn draws_are_reproducible_and_order_independent() {
     let alloc = strata.allocation(&SampleSize::Original).unwrap();
 
     // The whole point of per-replicate seeding: replicate 5 is the same draw
-    // whether it is computed first, last, or on another thread. PsN's guide
-    // documents the opposite as a known wart.
+    // whether it is computed first, last, or on another thread.
     let forward: Vec<Replicate> = (1..=10).map(|i| draw(&strata, &alloc, 99, i)).collect();
     let backward: Vec<Replicate> = (1..=10).rev().map(|i| draw(&strata, &alloc, 99, i)).collect();
     for r in &forward {

@@ -146,13 +146,13 @@ fn ferx_ofv(data: &str) -> f64 {
 /// platform drift while still catching the 14.89-unit class of defect #1060 was.
 const TOL: f64 = 0.5;
 
-/// `nonmem_anchor/results/tvcov_lag_saltation.lst`.
+/// `nonmem_anchor/results/tvcov_lag_saltation.nm.json`.
 const NM_OBJV_SINGLE: f64 = -302.914_708_127_690_74;
 
-/// `nonmem_anchor/results/tvcov_lag_saltation_md_control.lst`.
+/// `nonmem_anchor/results/tvcov_lag_saltation_md_control.nm.json`.
 const NM_OBJV_CONTROL: f64 = -415.644_109_023_425_07;
 
-/// `nonmem_anchor/results/tvcov_lag_saltation_multidose.lst`.
+/// `nonmem_anchor/results/tvcov_lag_saltation_multidose.nm.json`.
 const NM_OBJV_MULTIDOSE: f64 = -459.772_591_872_574_08;
 
 #[test]

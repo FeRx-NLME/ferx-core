@@ -15,13 +15,13 @@ Nothing is fitted, so the dump takes a second and never touches NONMEM.
 
 ```bash
 tools/pharmpy-amd-anchor/run.sh          # regenerate the JSON
-cargo test -p ferx-tools --lib amd::pharmpy_anchor
+cargo test -p ferx-search --lib amd::pharmpy_anchor
 ```
 
 It runs inside the licensed `pmx` container, where Pharmpy 2.2.0 is
 pip-installed — see `tools/pharmpy-variability-anchor/README.md` for how that
 container is set up. `FERX_PHARMPY_CONTAINER` overrides the container name.
-The committed `crates/ferx-tools/tests/data/amd_pharmpy_anchor.json` is what
+The committed `crates/ferx-search/tests/data/amd_pharmpy_anchor.json` is what
 CI replays; the container is only needed to regenerate it.
 
 ## What the corpus can and cannot cover

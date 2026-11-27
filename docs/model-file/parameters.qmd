@@ -1191,7 +1191,7 @@ omega ETA_CL ~ 0.0          # rejected: E_OMEGA_INIT_AT_RAIL
 
 A *free* zero asks the optimizer to estimate a variance from a start it cannot
 leave. The optimizer works on `ln(L_ii)` (the log Cholesky diagonal), bounded
-below at `-6`; a declared zero is regularised to a variance of `1e-8`, which
+below at `-6`; a free declared zero is regularised to a variance of `1e-8`, which
 packs to `ln(L) = -9.21` — below its own bound — so the start is clamped onto
 the rail. From there the coordinate either stays collapsed or runs away to the
 opposite rail (variance ≈ 1.6e5), and the **theta** estimates move with it: on a
@@ -1228,7 +1228,8 @@ with `maxiter = 0`, a free `omega ETA_CL ~ 0.0` is **evaluated at the rail
 variance `exp(-12) ≈ 6.14e-6`**, not at the `1e-8` it is stored as, and nothing
 says so. Write `omega ETA_CL ~ 0.0 FIX` if you want the objective evaluated at
 the variance you declared — a fixed coordinate is pinned at its own packed
-start, so the clamp cannot move it.
+start, so the clamp cannot move it. (A fixed zero the model removes is held at 0,
+not evaluated: see [individual parameters](individual-parameters.qmd).)
 
 This is not specific to variances: a `theta TVCL(0.05, 0.1, 10.0)` is scored at
 `0.1`, a factor of two. The `theta` case is reported at `maxiter = 0`: the run

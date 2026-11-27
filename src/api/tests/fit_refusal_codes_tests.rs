@@ -109,29 +109,64 @@ fn mixture_refusals_are_coded() {
          them from the model file) rather than params with `mixture: None`",
     );
 
-    let quadrature = FitOptions {
-        method: EstimationMethod::FoceI,
-        interaction: true,
-        n_agq: 3,
-        ..FitOptions::default()
-    };
-    assert_coded(
-        &fit_refusal(&model, &pop, &model.default_params, &quadrature),
-        "n_agq > 1",
-        "E_MIXTURE_METHOD",
-        Some("fit_options"),
-        "mixture models do not yet support FOCEI quadrature (n_agq > 1); use n_agq = 1 \
-         for mixture FOCEI. The mixture objective does not evaluate the quadrature grid.",
-    );
+    // Laplace and FOCEI quadrature are accepted since #3025 (the refusal is lifted).
+    for (label, opts) in [
+        (
+            "focei n_agq = 3",
+            FitOptions {
+                method: EstimationMethod::FoceI,
+                interaction: true,
+                n_agq: 3,
+                ..FitOptions::default()
+            },
+        ),
+        ("laplace", FitOptions { method: EstimationMethod::Laplace, ..FitOptions::default() }),
+    ] {
+        assert!(
+            crate::api::validation::check_mixture_options(&model, &opts, &model.default_params)
+                .is_empty(),
+            "{label}: a mixture under quadrature is accepted"
+        );
+    }
 
-    let laplace = FitOptions { method: EstimationMethod::Laplace, ..FitOptions::default() };
+    // `agq_eval_only` would overwrite the mixture OFV with a one-class quadrature value.
+    // Refused per stage: a chain that merely contains Laplace is refused too, and the
+    // estimating Laplace stage without it stays accepted (asserted above).
+    for (label, opts) in [
+        (
+            "laplace + agq_eval_only",
+            FitOptions {
+                method: EstimationMethod::Laplace,
+                agq_eval_only: true,
+                ..FitOptions::default()
+            },
+        ),
+        (
+            "[focei, laplace] + agq_eval_only",
+            FitOptions {
+                methods: vec![EstimationMethod::FoceI, EstimationMethod::Laplace],
+                agq_eval_only: true,
+                ..FitOptions::default()
+            },
+        ),
+    ] {
+        let err = fit_refusal(&model, &pop, &model.default_params, &opts);
+        assert_eq!(err.code(), Some("E_MIXTURE_METHOD"), "{label}: {err}");
+        assert_eq!(err.block(), Some("fit_options"), "{label}");
+        assert!(
+            err.to_string().contains("agq_eval_only") && err.to_string().contains("one-class"),
+            "{label}: {err}"
+        );
+    }
+
+    let vi = FitOptions { method: EstimationMethod::Vi, ..FitOptions::default() };
     assert_coded(
-        &fit_refusal(&model, &pop, &model.default_params, &laplace),
-        "laplace",
+        &fit_refusal(&model, &pop, &model.default_params, &vi),
+        "vi",
         "E_MIXTURE_METHOD",
         Some("fit_options"),
-        "mixture models (#977) currently support FOCE / FOCEI / SAEM / Bayes / IMP / \
-         IMPMAP; the LAPLACE method is not yet wired for mixtures (#985)",
+        "mixture models (#977) currently support FOCE / FOCEI / Laplace / SAEM / Bayes / \
+         IMP / IMPMAP; the VI method is not yet wired for mixtures (#985)",
     );
 
     let overrides = parse_model_string(
@@ -154,12 +189,16 @@ fn mixture_refusals_are_coded() {
     // for the accepted one.
     let with = |opts: &str| format!("{MIXTURE}[fit_options]\n  {opts}\n");
     assert!(
-        check_codes(&with("method = laplace")).contains(&"E_MIXTURE_METHOD".to_string()),
+        check_codes(&with("method = vi")).contains(&"E_MIXTURE_METHOD".to_string()),
         "ferx check misses the mixture method"
     );
     assert!(
         !check_codes(&with("method = foce")).contains(&"E_MIXTURE_METHOD".to_string()),
         "ferx check refuses an accepted mixture method"
+    );
+    assert!(
+        !check_codes(&with("method = laplace")).contains(&"E_MIXTURE_METHOD".to_string()),
+        "ferx check refuses a Laplace mixture (#3025)"
     );
 }
 
@@ -820,4 +859,36 @@ fn run_model_simulate_survival_design_refusals_are_coded() {
         ),
         "{err}"
     );
+}
+
+/// #3025: `optimizer = auto` on a mixture is NLopt L-BFGS on the exact mixture gradient for
+/// every method (Laplace, FOCE, FOCEI), the same as a single population; an explicit
+/// `bobyqa` is honoured. One rule in `resolve_outer_optimizer`, keyed on the model.
+#[test]
+fn mixture_auto_resolves_to_lbfgs_for_every_method_and_explicit_bobyqa_is_honoured() {
+    use crate::api::fit::stage_optimizer_request;
+    use crate::estimation::outer_optimizer::resolve_outer_optimizer;
+    use crate::types::Optimizer;
+    let mix = parse_model_string(MIXTURE).expect("parse");
+    let single = parse_model_string(ONE_CPT_IV).expect("parse");
+    let resolve = |m: &CompiledModel, method, req| {
+        let request = stage_optimizer_request(method, req);
+        resolve_outer_optimizer(request, m, m.mixture.is_some(), true).0
+    };
+    // The single-population control resolves the same way.
+    assert_eq!(resolve(&single, EstimationMethod::Laplace, Optimizer::Auto), Optimizer::NloptLbfgs);
+    for method in [EstimationMethod::Laplace, EstimationMethod::Foce, EstimationMethod::FoceI] {
+        assert_eq!(
+            resolve(&mix, method, Optimizer::Auto),
+            Optimizer::NloptLbfgs,
+            "{method:?}: a mixture under `auto` is L-BFGS whatever the method"
+        );
+    }
+    for method in [EstimationMethod::Laplace, EstimationMethod::FoceI] {
+        assert_eq!(
+            resolve(&mix, method, Optimizer::Bobyqa),
+            Optimizer::Bobyqa,
+            "{method:?}: an explicit bobyqa is honoured"
+        );
+    }
 }

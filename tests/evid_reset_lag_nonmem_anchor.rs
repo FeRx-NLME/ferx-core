@@ -61,14 +61,9 @@ const TABLE_ADVAN13: &str = "nonmem_anchor/results/evid_reset_lag_advan13.sdtab"
 const ADVAN13_REFERENCE: &[&str] = &["23"];
 
 /// The analytic `lagtime=` slot lags every dose record, so it cannot express NONMEM's
-/// depot-only `ALAG1` on ID 16's central dose.
+/// depot-only `ALAG1` on ID 16's central dose. ID 23, an `SS=1` dose with `ALAG > II`, is
+/// asserted on the dual too, on both sides of its arrival (#1353).
 const CENTRAL_DOSE: &[&str] = &["16"];
-
-/// The analytic dual's skip list: `CENTRAL_DOSE`, plus ID 23 — an `SS=1` dose with
-/// `ALAG > II` on the static closed-form superposition, which wraps the pre-arrival tail where
-/// the value path clamps it (#1353, open, out of scope). It reads `ADVAN2`'s 4.5306 there
-/// while ferx's own value path reads 4.4741. ID 22, its cancelled twin, is asserted.
-const ANALYTIC_DUAL_SKIP: &[&str] = &["16", "23"];
 
 /// Pairs that differ in one input and straddle the gate: (with the dose cancelled, with it
 /// live). The live member carries one more dose than the cancelled one.
@@ -351,5 +346,5 @@ fn analytic_dual_cancels_a_dose_recorded_before_the_reset() {
     let m = analytic();
     let eta = vec![0.0; m.n_eta];
     let got = via_dual(&m, |s| subject_eta_grad(&m, s, &m.default_params.theta, &eta));
-    assert_matches("analytic dual", &got, ANALYTIC_BOUND, ANALYTIC_DUAL_SKIP);
+    assert_matches("analytic dual", &got, ANALYTIC_BOUND, CENTRAL_DOSE);
 }

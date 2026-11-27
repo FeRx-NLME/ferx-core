@@ -10,6 +10,7 @@ mod iivsearch_cmd;
 mod iovsearch_cmd;
 mod modelsearch_cmd;
 mod ruvsearch_cmd;
+mod summary_json;
 
 use ferx_core::NcaInit;
 use std::env;
@@ -21,7 +22,7 @@ const MAIN_USAGE: &str = "\
 Usage: ferx <model.ferx> --data <data.csv> [--threads N|auto] [--output <run.fitrx>] [--include-data] [--inits-from-nca[=nca|nca_sweep|nca_ebe]] [--output-format yaml|json|both] [--clean]
        ferx <model.ferx> --simulate          [--threads N|auto] [--output <run.fitrx>]
        ferx check <model.ferx> [--data <data.csv>] [--json]
-       ferx summary <run.fitrx> [<run2.fitrx> ...]
+       ferx summary <run.fitrx> [<run2.fitrx> ...] [--json]
        ferx bootstrap <model.ferx> [--data <data.csv>] [--samples N] [--seed N]
                       [--stratify-on COL] [--threads N]   (see `ferx bootstrap --help`)
        ferx gam      <model.ferx>  --data <data.csv> [--csv gam.csv] [--threads N]
@@ -475,7 +476,7 @@ fn main() {
 }
 
 const SUMMARY_USAGE: &str = "\
-Usage: ferx summary <run.fitrx> [<run2.fitrx> ...]
+Usage: ferx summary <run.fitrx> [<run2.fitrx> ...] [--json]
 
 With one bundle: prints a psn::sumo-style summary — parameter estimates
 with %RSE plus basic run info.
@@ -483,26 +484,44 @@ with %RSE plus basic run info.
 With two or more bundles: prints a Markdown table comparing the runs
 (method, convergence, OFV/AIC/BIC, ΔOFV, runtime, sizes, and parameter
 estimates) side by side.
+
+--json   emit the summary as one JSON document on stdout instead: a
+         `runs` array with one object per bundle (status, objective,
+         name-keyed `estimates`, diagnostics, structured warnings — the
+         keys of {model}-fit.json), plus `delta_ofv` against the first
+         run when two or more bundles are given. A bundle that fails to
+         load gets an `error` entry and the exit code is 1.
 ";
+
+/// The column/run label for a bundle path: its file stem (`run1.fitrx` → `run1`).
+fn bundle_label(path: &str) -> String {
+    std::path::Path::new(path).file_stem().and_then(|s| s.to_str()).unwrap_or(path).to_string()
+}
 
 /// Run the `summary` subcommand: load one or more `.fitrx` bundles.
 ///
 /// A single bundle prints a `psn::sumo`-style summary (parameter estimates +
 /// basic run info). Two or more bundles print a Markdown comparison table.
-/// The column label for each run is the bundle's file stem.
+/// The column label for each run is the bundle's file stem. With `--json`
+/// (#3074) the same content is one JSON document on stdout (`summary_json::summary_json`).
 ///
 /// Returns the process exit code: `0` = printed (incl. `--help`), `1` = a load
 /// failed, `2` = usage (missing/flag-looking path).
 fn run_summary(args: &[String]) -> i32 {
-    // `summary` takes only bundle paths plus `-h`/`--help`. Scan every argument:
-    // help anywhere prints usage (exit 0); any other flag-looking argument is a
-    // usage error (exit 2) rather than being silently ignored or mistaken for a
-    // file path. Everything else is a bundle path.
+    // `summary` takes only bundle paths plus `--json` and `-h`/`--help`. Scan
+    // every argument: help anywhere prints usage (exit 0); any other flag-looking
+    // argument is a usage error (exit 2) rather than being silently ignored or
+    // mistaken for a file path. Everything else is a bundle path.
     let mut paths: Vec<&str> = Vec::new();
+    let mut json = false;
     for arg in &args[2..] {
         if is_help_flag(Some(arg)) {
             print!("{SUMMARY_USAGE}");
             return 0;
+        }
+        if arg == "--json" {
+            json = true;
+            continue;
         }
         if arg.starts_with('-') {
             eprintln!("Error: unknown option {}", arg);
@@ -514,6 +533,10 @@ fn run_summary(args: &[String]) -> i32 {
     if paths.is_empty() {
         eprint!("{SUMMARY_USAGE}");
         return 2;
+    }
+
+    if json {
+        return run_summary_json(&paths);
     }
 
     // Load all bundles up front so a bad path fails before any output.
@@ -531,21 +554,43 @@ fn run_summary(args: &[String]) -> i32 {
     if loaded.len() == 1 {
         print!("{}", ferx_core::io::output::format_summary(&loaded[0].1.fit));
     } else {
-        // Column label = file stem (e.g. `run1.fitrx` → `run1`).
-        let runs: Vec<(String, &ferx_core::FitResult)> = loaded
-            .iter()
-            .map(|(path, l)| {
-                let label = std::path::Path::new(path)
-                    .file_stem()
-                    .and_then(|s| s.to_str())
-                    .unwrap_or(path)
-                    .to_string();
-                (label, &l.fit)
-            })
-            .collect();
+        let runs: Vec<(String, &ferx_core::FitResult)> =
+            loaded.iter().map(|(path, l)| (bundle_label(path), &l.fit)).collect();
         print!("{}", ferx_core::io::output::format_comparison(&runs));
     }
     0
+}
+
+/// `ferx summary --json`: load every bundle (a failure does not stop the others,
+/// it becomes that run's `error` entry), print one JSON document, and return `1`
+/// when any bundle failed to load, else `0`.
+fn run_summary_json(paths: &[&str]) -> i32 {
+    let loaded: Vec<Result<ferx_core::io::fitrx::LoadedFit, String>> = paths
+        .iter()
+        .map(|p| ferx_core::io::fitrx::load_fit(std::path::Path::new(p)).map_err(|e| e.to_string()))
+        .collect();
+    let entries: Vec<summary_json::SummaryEntry<'_>> = paths
+        .iter()
+        .zip(&loaded)
+        .map(|(path, l)| summary_json::SummaryEntry {
+            path,
+            label: bundle_label(path),
+            fit: l.as_ref().map(|l| &l.fit).map_err(|e| format!("failed to load {path}: {e}")),
+        })
+        .collect();
+    let doc = summary_json::summary_json(&entries);
+    match serde_json::to_string_pretty(&doc) {
+        Ok(s) => println!("{s}"),
+        Err(e) => {
+            eprintln!("Error: failed to serialize summary: {e}");
+            return 2;
+        }
+    }
+    if loaded.iter().any(Result::is_err) {
+        1
+    } else {
+        0
+    }
 }
 
 /// Parsed `ferx check` arguments.
@@ -796,10 +841,10 @@ fn parse_inits_from_nca_flag(args: &[String]) -> Result<Option<NcaInit>, String>
 #[cfg(test)]
 mod tests {
     use super::{
-        check_summary_line, classify_first_arg, edit_distance, is_help_flag, normalize_args,
-        parse_check_args, parse_inits_from_nca_flag, parse_output_flag, parse_output_format,
-        parse_threads_flag, print_check_human, run_check, run_summary, subcommand,
-        unknown_tool_hint, CheckArgsError, EstimatesFormat, FirstArg, SUBCOMMANDS,
+        bundle_label, check_summary_line, classify_first_arg, edit_distance, is_help_flag,
+        normalize_args, parse_check_args, parse_inits_from_nca_flag, parse_output_flag,
+        parse_output_format, parse_threads_flag, print_check_human, run_check, run_summary,
+        subcommand, unknown_tool_hint, CheckArgsError, EstimatesFormat, FirstArg, SUBCOMMANDS,
     };
     use ferx_core::NcaInit;
 
@@ -1233,6 +1278,48 @@ mod tests {
         write_warfarin_fitrx(&p1);
         write_warfarin_fitrx(&p2);
         assert_eq!(run_summary(&args(&["summary", p1.to_str().unwrap(), p2.to_str().unwrap()])), 0);
+    }
+
+    /// #3074: `--json` is a summary flag, so it combines with `--help` (usage, 0)
+    /// in either order, and alone still needs a path (2).
+    #[test]
+    fn run_summary_json_with_help_returns_0_and_without_a_path_returns_2() {
+        assert_eq!(run_summary(&args(&["summary", "--json", "--help"])), 0);
+        assert_eq!(run_summary(&args(&["summary", "-h", "--json"])), 0);
+        assert_eq!(run_summary(&args(&["summary", "--json"])), 2);
+        assert_eq!(run_summary(&args(&["summary", "--json", "--bogus", "x.fitrx"])), 2);
+    }
+
+    #[test]
+    fn run_summary_json_one_and_several_bundles_return_0() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let p1 = dir.path().join("run1.fitrx");
+        let p2 = dir.path().join("run2.fitrx");
+        write_warfarin_fitrx(&p1);
+        write_warfarin_fitrx(&p2);
+        let (s1, s2) = (p1.to_str().unwrap(), p2.to_str().unwrap());
+        assert_eq!(run_summary(&args(&["summary", "--json", s1])), 0);
+        assert_eq!(run_summary(&args(&["summary", s1, s2, "--json"])), 0);
+    }
+
+    /// A bundle that fails to load is still exit 1 under `--json`, and the bundles
+    /// around it are loaded (the document carries an error entry for it).
+    #[test]
+    fn run_summary_json_load_failure_returns_1() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let good = dir.path().join("good.fitrx");
+        write_warfarin_fitrx(&good);
+        assert_eq!(run_summary(&args(&["summary", "--json", "/no/such/file.fitrx"])), 1);
+        assert_eq!(
+            run_summary(&args(&["summary", "--json", good.to_str().unwrap(), "/no/such.fitrx"])),
+            1
+        );
+    }
+
+    #[test]
+    fn bundle_label_is_the_file_stem() {
+        assert_eq!(bundle_label("a/b/run1.fitrx"), "run1");
+        assert_eq!(bundle_label("run2"), "run2");
     }
 
     #[test]

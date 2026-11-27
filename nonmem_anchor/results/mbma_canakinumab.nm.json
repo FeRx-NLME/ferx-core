@@ -1,0 +1,129 @@
+{
+ "nonmem_version": "7.6.0",
+ "data_file": "mbma_canakinumab.csv",
+ "data_records": 140,
+ "observations": 140,
+ "individuals": 9,
+ "nmtran_warnings": [2],
+ "markers": [
+  "MINIMIZATION SUCCESSFUL",
+  "PROBLEMS OCCURRED WITH THE MINIMIZATION"
+ ],
+ "steps": [
+  {
+   "method": "First Order Conditional Estimation with Interaction",
+   "objv": -277.862,
+   "objv_without_constant": -277.86235425800453,
+   "objv_with_constant": -20.559564960696207,
+   "function_evaluations": 443,
+   "significant_digits": 5.6,
+   "etabar": [
+    [-0.0023421, -0.039591, -0.036303]
+   ],
+   "etabar_se": [
+    [0.10793, 0.18179, 0.16639]
+   ],
+   "p_val": [
+    [0.98269, 0.8276, 0.82729]
+   ],
+   "etashrinksd": [
+    [5.6143, 53.866, 57.775]
+   ],
+   "etashrinkvr": [
+    [10.913, 78.716, 82.171]
+   ],
+   "ebvshrinksd": [
+    [5.4103, 54.918, 56.689]
+   ],
+   "ebvshrinkvr": [
+    [10.528, 79.676, 81.242]
+   ],
+   "relativeinf": [
+    [12.684, 1.3083, 1.1237]
+   ],
+   "epsshrinksd": [
+    [4.2093]
+   ],
+   "epsshrinkvr": [
+    [8.2415]
+   ],
+   "final": {
+    "theta": [0.426, 1.51, 1.32, 1.15, 4.12, -0.711, 2.46],
+    "omega": {
+     "ETA1": [0.118],
+     "ETA2": [0.0, 1.4],
+     "ETA3": [0.0, 0.0, 1.4]
+    },
+    "sigma": {
+     "EPS1": [1.0]
+    }
+   },
+   "standard_error": {
+    "theta": [0.0399, 0.126, 0.134, 0.373, 0.11, 0.0866, 0.14],
+    "omega": {
+     "ETA1": [0.0774],
+     "ETA2": [null, 1.87],
+     "ETA3": [null, null, null]
+    },
+    "sigma": {
+     "EPS1": [null]
+    }
+   },
+   "markers": [
+    "MINIMIZATION SUCCESSFUL",
+    "PROBLEMS OCCURRED WITH THE MINIMIZATION"
+   ]
+  }
+ ],
+ "control_stream_as_run": [
+  "$PROBLEM canakinumab RA MBMA, Bracis et al. 2026 Case Study 2 final model (r03), FOCE-I (#1913)",
+  "; The NONMEM twin of tests/data/mbma_canakinumab/mbma_canakinumab.ferx.",
+  "; The data are NOT in the repository (CC BY-NC-ND 4.0); provision them with",
+  ";   python3 tools/mbma_canakinumab_fetch.py --out mbma_canakinumab.csv",
+  "; next to this file. Written for the anchor image: nm3 mbma_canakinumab.ctl",
+  ";",
+  "; NONMEM has no weight on an $OMEGA, so the between-arm kappa is written out by",
+  "; hand: one ETA per arm (ARM 0 / ARM 1, OMEGA SAME), divided by SQRT(NARM). The",
+  "; residual SD is THETA(7) scaled by 1/SQRT(NARM) with SIGMA fixed to 1 -- the same",
+  "; likelihood as ferx's `additive(ADD_ERR) weight = 1 / sqrt(NARM)`, Jacobian included,",
+  "; so the two objective values are directly comparable.",
+  "$INPUT ID ARM TIME DV NARM ABATA ADALI CANAKI MDV",
+  "$DATA mbma_canakinumab.csv IGNORE=@",
+  "",
+  "$PRED",
+  "OC1 = 0",
+  "IF (ARM.EQ.0) OC1 = 1",
+  "OC2 = 1 - OC1",
+  "KAP = (OC1*ETA(2) + OC2*ETA(3)) / SQRT(NARM)",
+  "",
+  "LTV = LOG(THETA(1)/(1 - THETA(1)))",
+  "LEM = LTV + THETA(2)*ABATA + THETA(3)*ADALI + THETA(4)*CANAKI + ETA(1) + KAP",
+  "EM  = EXP(LEM)/(1 + EXP(LEM))",
+  "T50 = THETA(5)*EXP(THETA(6)*ADALI)",
+  "",
+  "ACR = EM*TIME/(TIME + T50)",
+  "IF (ACR.LT.0.01) ACR = 0.01",
+  "IF (ACR.GT.0.99) ACR = 0.99",
+  "IPRED = LOG(ACR/(1 - ACR))",
+  "",
+  "W = THETA(7)/SQRT(NARM)",
+  "Y = IPRED + W*EPS(1)",
+  "",
+  "$THETA",
+  "(0.001, 0.40, 0.999)  ; EMAX_POP",
+  "(-10, 1.5, 10)        ; B_EMAX_ABA",
+  "(-10, 1.0, 10)        ; B_EMAX_ADA",
+  "(-10, 1.0, 10)        ; B_EMAX_CAN",
+  "(0.1, 4.0, 100)       ; T50_POP",
+  "(-10, -0.5, 10)       ; B_T50_ADA",
+  "(0.01, 2.5)           ; ADD_ERR (SD)",
+  "",
+  "$OMEGA 0.09                 ; ETA_BSV_EMAX",
+  "$OMEGA BLOCK(1) 4.0         ; KAPPA_EMAX, ARM 0",
+  "$OMEGA BLOCK(1) SAME        ; KAPPA_EMAX, ARM 1",
+  "$SIGMA 1 FIX",
+  "",
+  "$ESTIMATION METHOD=1 INTER MAXEVAL=9999 PRINT=5 NOABORT SIGDIG=5 FORMAT=s1PE23.16",
+  "$COVARIANCE MATRIX=R UNCONDITIONAL"
+ ]
+}

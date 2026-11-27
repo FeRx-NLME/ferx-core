@@ -1,17 +1,17 @@
 //! `ferx covsearch` — stepwise covariate modelling (#1180).
 //!
 //! Thin by construction (#1114 A5): parse flags, load the `.ferxsearch`
-//! file, call [`ferx_tools::covsearch::run_covsearch`], print the step table,
+//! file, call [`ferx_search::covsearch::run_covsearch`], print the step table,
 //! pick an exit code. Every decision about candidates, tests and selection
-//! lives in `ferx-tools`.
+//! lives in `ferx-search`.
 
 use std::path::PathBuf;
 
-use ferx_tools::covsearch::{
+use ferx_search::covsearch::{
     default_dir, render_summary, run_covsearch, CovsearchEvent, CovsearchOptions, CovsearchRun,
     Phase,
 };
-use ferx_tools::search::SearchConfig;
+use ferx_search::search::SearchConfig;
 
 pub const COVSEARCH_USAGE: &str = "\
 Usage: ferx covsearch <search.ferxsearch> [options]
@@ -212,8 +212,8 @@ fn run_covsearch_command(args: &[String]) -> Result<i32, String> {
     }
     eprintln!(
         "Step table written to {}; final model to {}",
-        ferx_tools::covsearch::steps_path(&dir).display(),
-        ferx_tools::covsearch::final_model_path(&dir).display()
+        ferx_search::covsearch::steps_path(&dir).display(),
+        ferx_search::covsearch::final_model_path(&dir).display()
     );
     Ok(if result.cancelled { 130 } else { 0 })
 }

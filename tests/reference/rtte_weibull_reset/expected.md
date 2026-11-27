@@ -44,7 +44,7 @@ single realization (weakly identified), consistently for both tools.
 - **NONMEM control stream.** Pure-TTE (`$EST … LIKELIHOOD`, no `F_FLAG`). Constant-shape
   Weibull needs no `$DES`: a `TLAST` reset in `$PRED` makes each row contribute the
   Weibull survival/density over its inter-event gap `DEL = TIME − TLAST`. Full output in
-  `nonmem.lst` / `nonmem.ext`.
+  `nonmem.nm.json` / `nonmem.ext`.
 - **Clock-reset ≠ clock-forward here.** Because `shape > 1`, evaluating the hazard on the
   gap (reset) rather than absolute time (forward) changes the likelihood — the unit tests
   in `src/survival/mod.rs` pin both closed forms and assert they differ.

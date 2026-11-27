@@ -1,5 +1,43 @@
 pub mod ferx_core
 pub mod ferx_core::api
+#[non_exhaustive] pub enum ferx_core::api::AdaptiveBandStatus
+pub ferx_core::api::AdaptiveBandStatus::NotDrawn
+pub ferx_core::api::AdaptiveBandStatus::Quantiles(ferx_core::AdaptiveQuantiles)
+#[non_exhaustive] pub enum ferx_core::api::AdaptiveComponentStatus
+pub ferx_core::api::AdaptiveComponentStatus::Estimated
+pub ferx_core::api::AdaptiveComponentStatus::Estimated::mc_se: core::option::Option<f64>
+pub ferx_core::api::AdaptiveComponentStatus::Estimated::value: f64
+pub ferx_core::api::AdaptiveComponentStatus::NotDrawn
+pub ferx_core::api::AdaptiveComponentStatus::Supplied
+#[non_exhaustive] pub enum ferx_core::api::AdaptiveSummaryMetric
+pub ferx_core::api::AdaptiveSummaryMetric::AucTargetAttainment
+pub ferx_core::api::AdaptiveSummaryMetric::CumulativeDose
+pub ferx_core::api::AdaptiveSummaryMetric::Discontinued
+pub ferx_core::api::AdaptiveSummaryMetric::NDecreases
+pub ferx_core::api::AdaptiveSummaryMetric::NDoses
+pub ferx_core::api::AdaptiveSummaryMetric::NHolds
+pub ferx_core::api::AdaptiveSummaryMetric::NIncreases
+pub ferx_core::api::AdaptiveSummaryMetric::NNotDue
+pub ferx_core::api::AdaptiveSummaryMetric::PctReadingsInWindow
+pub ferx_core::api::AdaptiveSummaryMetric::Signal
+pub ferx_core::api::AdaptiveSummaryMetric::Signal::analyte: alloc::string::String
+pub ferx_core::api::AdaptiveSummaryMetric::Signal::decision_idx: usize
+pub ferx_core::api::AdaptiveSummaryMetric::SignalMax
+pub ferx_core::api::AdaptiveSummaryMetric::SignalMean
+pub ferx_core::api::AdaptiveSummaryMetric::SignalMin
+#[non_exhaustive] pub enum ferx_core::api::AdaptiveSummaryStatistic
+pub ferx_core::api::AdaptiveSummaryStatistic::FractionAtLeast(f64)
+pub ferx_core::api::AdaptiveSummaryStatistic::Mean
+pub ferx_core::api::AdaptiveSummaryStatistic::Median
+#[non_exhaustive] pub enum ferx_core::api::AdaptiveVarianceLayer
+pub ferx_core::api::AdaptiveVarianceLayer::BetweenRow
+pub ferx_core::api::AdaptiveVarianceLayer::Bsv
+pub ferx_core::api::AdaptiveVarianceLayer::Parameter
+pub ferx_core::api::AdaptiveVarianceLayer::Total
+pub ferx_core::api::AdaptiveVarianceLayer::Within
+#[non_exhaustive] pub enum ferx_core::api::AdaptiveVarianceScope
+pub ferx_core::api::AdaptiveVarianceScope::Population
+pub ferx_core::api::AdaptiveVarianceScope::Subject(alloc::string::String)
 #[non_exhaustive] pub enum ferx_core::api::UnmatchedSubjects
 pub ferx_core::api::UnmatchedSubjects::Draw
 pub ferx_core::api::UnmatchedSubjects::Refuse
@@ -14,6 +52,16 @@ pub enum ferx_core::api::VpcStratify
 pub ferx_core::api::VpcStratify::Covariate(alloc::string::String)
 pub ferx_core::api::VpcStratify::Dose
 pub ferx_core::api::VpcStratify::None
+#[non_exhaustive] pub struct ferx_core::api::AdaptiveDecomposition
+pub ferx_core::api::AdaptiveDecomposition::components: alloc::vec::Vec<ferx_core::AdaptiveVarianceComponent>
+pub ferx_core::api::AdaptiveDecomposition::n_draws: usize
+pub ferx_core::api::AdaptiveDecomposition::n_reps: usize
+pub ferx_core::api::AdaptiveDecomposition::n_sims: usize
+pub ferx_core::api::AdaptiveDecomposition::skipped: alloc::vec::Vec<ferx_core::AdaptiveDecompositionSkip>
+#[non_exhaustive] pub struct ferx_core::api::AdaptiveDecompositionSkip
+pub ferx_core::api::AdaptiveDecompositionSkip::metric: ferx_core::AdaptiveSummaryMetric
+pub ferx_core::api::AdaptiveDecompositionSkip::n_missing: usize
+pub ferx_core::api::AdaptiveDecompositionSkip::subject: alloc::string::String
 #[non_exhaustive] pub struct ferx_core::api::AdaptiveInputs<'a>
 pub ferx_core::api::AdaptiveInputs::etas: core::option::Option<&'a ferx_core::SuppliedEtas>
 pub ferx_core::api::AdaptiveInputs::params: &'a ferx_core::ModelParameters
@@ -23,11 +71,25 @@ pub fn ferx_core::AdaptiveInputs<'a>::new(params: &'a ferx_core::ModelParameters
 pub fn ferx_core::AdaptiveInputs<'a>::with_etas(self, etas: &'a ferx_core::SuppliedEtas) -> Self
 pub fn ferx_core::AdaptiveInputs<'a>::with_uncertainty(self, fit: &'a ferx_core::FitResult, spec: ferx_core::UncertaintySpec) -> Self
 pub fn ferx_core::AdaptiveInputs<'a>::with_unmatched(self, policy: ferx_core::UnmatchedSubjects) -> Self
+#[non_exhaustive] pub struct ferx_core::api::AdaptivePopulationSummary
+pub ferx_core::api::AdaptivePopulationSummary::bands: alloc::vec::Vec<ferx_core::AdaptiveSummaryBand>
+pub ferx_core::api::AdaptivePopulationSummary::n_draws: usize
+pub ferx_core::api::AdaptivePopulationSummary::prediction_intervals: alloc::vec::Vec<ferx_core::AdaptivePredictionInterval>
+pub ferx_core::api::AdaptivePopulationSummary::rows: alloc::vec::Vec<ferx_core::AdaptiveSummaryRow>
+#[non_exhaustive] pub struct ferx_core::api::AdaptivePredictionInterval
+pub ferx_core::api::AdaptivePredictionInterval::metric: ferx_core::AdaptiveSummaryMetric
+pub ferx_core::api::AdaptivePredictionInterval::n_missing: usize
+pub ferx_core::api::AdaptivePredictionInterval::n_runs: usize
+pub ferx_core::api::AdaptivePredictionInterval::quantiles: ferx_core::AdaptiveQuantiles
+#[non_exhaustive] pub struct ferx_core::api::AdaptiveQuantiles
+pub ferx_core::api::AdaptiveQuantiles::probs: [f64; 3]
+pub ferx_core::api::AdaptiveQuantiles::values: [core::option::Option<f64>; 3]
 #[non_exhaustive] pub struct ferx_core::api::AdaptiveSimulateOptions
 pub ferx_core::api::AdaptiveSimulateOptions::decision_covariates: core::option::Option<ferx_core::sim::adaptive::DecisionCovariates>
 pub ferx_core::api::AdaptiveSimulateOptions::decision_times: alloc::vec::Vec<f64>
 pub ferx_core::api::AdaptiveSimulateOptions::max_decisions: usize
 pub ferx_core::api::AdaptiveSimulateOptions::monitors: alloc::vec::Vec<ferx_core::sim::adaptive::MonitorSpec>
+pub ferx_core::api::AdaptiveSimulateOptions::n_reps: usize
 pub ferx_core::api::AdaptiveSimulateOptions::seed: core::option::Option<u64>
 pub ferx_core::api::AdaptiveSimulateOptions::start_interval: core::option::Option<f64>
 pub ferx_core::api::AdaptiveSimulateOptions::verify: bool
@@ -40,6 +102,55 @@ pub ferx_core::api::AdaptiveSimulationResult::metrics: alloc::vec::Vec<ferx_core
 pub ferx_core::api::AdaptiveSimulationResult::parameters: alloc::vec::Vec<ferx_core::DrawnParameters>
 pub ferx_core::api::AdaptiveSimulationResult::trajectories: alloc::vec::Vec<ferx_core::SimulationResult>
 pub ferx_core::api::AdaptiveSimulationResult::warnings: alloc::vec::Vec<alloc::string::String>
+#[non_exhaustive] pub struct ferx_core::api::AdaptiveSummaryBand
+pub ferx_core::api::AdaptiveSummaryBand::metric: ferx_core::AdaptiveSummaryMetric
+pub ferx_core::api::AdaptiveSummaryBand::n_draws_missing: usize
+pub ferx_core::api::AdaptiveSummaryBand::n_draws_present: usize
+pub ferx_core::api::AdaptiveSummaryBand::statistic: ferx_core::AdaptiveSummaryStatistic
+pub ferx_core::api::AdaptiveSummaryBand::status: ferx_core::AdaptiveBandStatus
+#[non_exhaustive] pub struct ferx_core::api::AdaptiveSummaryOptions
+pub ferx_core::api::AdaptiveSummaryOptions::probs: [f64; 3]
+pub ferx_core::api::AdaptiveSummaryOptions::thresholds: alloc::vec::Vec<(ferx_core::AdaptiveSummaryMetric, f64)>
+impl core::default::Default for ferx_core::AdaptiveSummaryOptions
+pub fn ferx_core::AdaptiveSummaryOptions::default() -> Self
+#[non_exhaustive] pub struct ferx_core::api::AdaptiveSummaryRow
+pub ferx_core::api::AdaptiveSummaryRow::draw: usize
+pub ferx_core::api::AdaptiveSummaryRow::metric: ferx_core::AdaptiveSummaryMetric
+pub ferx_core::api::AdaptiveSummaryRow::n_missing: usize
+pub ferx_core::api::AdaptiveSummaryRow::n_runs: usize
+pub ferx_core::api::AdaptiveSummaryRow::statistic: ferx_core::AdaptiveSummaryStatistic
+pub ferx_core::api::AdaptiveSummaryRow::value: core::option::Option<f64>
+#[non_exhaustive] pub struct ferx_core::api::AdaptiveVarianceComponent
+pub ferx_core::api::AdaptiveVarianceComponent::layer: ferx_core::AdaptiveVarianceLayer
+pub ferx_core::api::AdaptiveVarianceComponent::metric: ferx_core::AdaptiveSummaryMetric
+pub ferx_core::api::AdaptiveVarianceComponent::n_subjects: usize
+pub ferx_core::api::AdaptiveVarianceComponent::scope: ferx_core::AdaptiveVarianceScope
+pub ferx_core::api::AdaptiveVarianceComponent::status: ferx_core::AdaptiveComponentStatus
+pub struct ferx_core::api::CifCauseBand
+pub ferx_core::api::CifCauseBand::band: ferx_core::CifVpcBand
+pub ferx_core::api::CifCauseBand::cmt: usize
+pub struct ferx_core::api::CifVpc
+pub ferx_core::api::CifVpc::censoring: ferx_core::VpcCensoring
+pub ferx_core::api::CifVpc::cmts: alloc::vec::Vec<usize>
+pub ferx_core::api::CifVpc::horizon: f64
+pub ferx_core::api::CifVpc::n_sim: usize
+pub ferx_core::api::CifVpc::probs: [f64; 3]
+pub ferx_core::api::CifVpc::strata: alloc::vec::Vec<ferx_core::CifVpcStratum>
+pub ferx_core::api::CifVpc::warnings: alloc::vec::Vec<alloc::string::String>
+pub struct ferx_core::api::CifVpcBand
+pub ferx_core::api::CifVpcBand::hi: alloc::vec::Vec<core::option::Option<f64>>
+pub ferx_core::api::CifVpcBand::lo: alloc::vec::Vec<core::option::Option<f64>>
+pub ferx_core::api::CifVpcBand::med: alloc::vec::Vec<core::option::Option<f64>>
+pub ferx_core::api::CifVpcBand::n_used: alloc::vec::Vec<usize>
+pub ferx_core::api::CifVpcBand::obs_on_grid: alloc::vec::Vec<core::option::Option<f64>>
+pub struct ferx_core::api::CifVpcStratum
+pub ferx_core::api::CifVpcStratum::causes: alloc::vec::Vec<ferx_core::CifCauseBand>
+pub ferx_core::api::CifVpcStratum::grid: alloc::vec::Vec<f64>
+pub ferx_core::api::CifVpcStratum::label: alloc::string::String
+pub ferx_core::api::CifVpcStratum::n_subjects: usize
+pub ferx_core::api::CifVpcStratum::observed: ferx_core::stats::cif::CifCurve
+pub ferx_core::api::CifVpcStratum::survival: ferx_core::CifVpcBand
+pub ferx_core::api::CifVpcStratum::value: core::option::Option<f64>
 #[non_exhaustive] pub struct ferx_core::api::DrawnParameters
 pub ferx_core::api::DrawnParameters::draw: usize
 pub ferx_core::api::DrawnParameters::parameters: ferx_core::ModelParameters
@@ -228,6 +339,15 @@ pub ferx_core::api::TteVpcStratum::value: core::option::Option<f64>
 pub struct ferx_core::api::UncertaintySpec
 pub ferx_core::api::UncertaintySpec::method: ferx_core::estimation::uncertainty_samples::UncertaintyMethod
 pub ferx_core::api::UncertaintySpec::n_draws: usize
+pub struct ferx_core::api::VpcCifOptions
+pub ferx_core::api::VpcCifOptions::censoring: ferx_core::VpcCensoring
+pub ferx_core::api::VpcCifOptions::grid: ferx_core::VpcGrid
+pub ferx_core::api::VpcCifOptions::n_sim: usize
+pub ferx_core::api::VpcCifOptions::probs: [f64; 3]
+pub ferx_core::api::VpcCifOptions::sim: ferx_core::SimulateOptions
+pub ferx_core::api::VpcCifOptions::stratify: ferx_core::VpcStratify
+impl core::default::Default for ferx_core::VpcCifOptions
+pub fn ferx_core::VpcCifOptions::default() -> Self
 #[non_exhaustive] pub struct ferx_core::api::VpcKmmcOptions
 pub ferx_core::api::VpcKmmcOptions::covariate: alloc::string::String
 pub ferx_core::api::VpcKmmcOptions::level: core::option::Option<f64>
@@ -271,6 +391,7 @@ pub fn ferx_core::api::check_model_data_rule(model: &ferx_core::CompiledModel, p
 pub fn ferx_core::api::check_model_data_warnings(model: &ferx_core::CompiledModel, population: &ferx_core::Population, init_params: &ferx_core::ModelParameters) -> alloc::vec::Vec<ferx_core::diagnostics::Diagnostic>
 pub fn ferx_core::api::check_model_options(model: &ferx_core::CompiledModel, options: &ferx_core::FitOptions) -> alloc::vec::Vec<ferx_core::diagnostics::Diagnostic>
 pub fn ferx_core::api::configure_global_thread_pool(n_threads: usize) -> core::result::Result<(), alloc::string::String>
+pub fn ferx_core::api::decompose_adaptive(result: &ferx_core::AdaptiveSimulationResult) -> core::result::Result<ferx_core::AdaptiveDecomposition, ferx_core::diagnostics::EngineError>
 pub fn ferx_core::api::fit(model: &ferx_core::CompiledModel, population: &ferx_core::Population, init_params: &ferx_core::ModelParameters, options: &ferx_core::FitOptions) -> core::result::Result<ferx_core::FitResult, ferx_core::diagnostics::EngineError>
 pub fn ferx_core::api::fit_from_files(model_path: &str, data_path: core::option::Option<&str>, covariate_columns: core::option::Option<&[&str]>, options: core::option::Option<ferx_core::FitOptions>) -> core::result::Result<ferx_core::FitResult, ferx_core::diagnostics::EngineError>
 pub fn ferx_core::api::install_on_engine_pool<R: core::marker::Send>(f: impl core::ops::function::FnOnce() -> R + core::marker::Send) -> R
@@ -303,12 +424,14 @@ pub fn ferx_core::api::simulate_with_options_diag(model: &ferx_core::CompiledMod
 pub fn ferx_core::api::simulate_with_seed(model: &ferx_core::CompiledModel, population: &ferx_core::Population, params: &ferx_core::ModelParameters, n_sim: usize, seed: u64) -> core::result::Result<alloc::vec::Vec<ferx_core::SimulationResult>, ferx_core::diagnostics::EngineError>
 pub fn ferx_core::api::simulate_with_uncertainty(model: &ferx_core::CompiledModel, population: &ferx_core::Population, fit_result: &ferx_core::FitResult, opts: &ferx_core::SimulateUncertaintyOptions) -> core::result::Result<alloc::vec::Vec<ferx_core::SimulationResult>, ferx_core::diagnostics::EngineError>
 pub fn ferx_core::api::simulate_with_uncertainty_diag(model: &ferx_core::CompiledModel, population: &ferx_core::Population, fit_result: &ferx_core::FitResult, opts: &ferx_core::SimulateUncertaintyOptions) -> core::result::Result<ferx_core::SimulationOutput, ferx_core::diagnostics::EngineError>
+pub fn ferx_core::api::summarize_adaptive(result: &ferx_core::AdaptiveSimulationResult, opts: &ferx_core::AdaptiveSummaryOptions) -> core::result::Result<ferx_core::AdaptivePopulationSummary, ferx_core::diagnostics::EngineError>
 pub fn ferx_core::api::tafd_tad_for_subject(subject: &ferx_core::Subject, obs_idx: usize, dose_lagtimes: &[f64]) -> (f64, f64)
 pub fn ferx_core::api::theta_level_map(model: &ferx_core::CompiledModel) -> std::collections::hash::map::HashMap<alloc::string::String, alloc::vec::Vec<alloc::string::String>>
 pub fn ferx_core::api::theta_level_values(model: &ferx_core::CompiledModel, theta: &[f64], covariance: core::option::Option<&nalgebra::base::alias::DMatrix<f64>>, sir_resamples_packed: core::option::Option<&[alloc::vec::Vec<f64>]>) -> core::result::Result<std::collections::hash::map::HashMap<alloc::string::String, alloc::vec::Vec<ferx_core::api::ThetaLevelValue>>, alloc::string::String>
 pub fn ferx_core::api::validate_model_file(model_path: &str, data_path: core::option::Option<&str>) -> ferx_core::diagnostics::CheckReport
 pub fn ferx_core::api::validate_model_file_with(model_path: &str, data_path: core::option::Option<&str>, overrides: &[(alloc::string::String, alloc::string::String)]) -> ferx_core::diagnostics::CheckReport
 pub fn ferx_core::api::validate_output_columns(model: &ferx_core::CompiledModel, population: &ferx_core::Population) -> alloc::vec::Vec<ferx_core::diagnostics::Diagnostic>
+pub fn ferx_core::api::vpc_cif(model: &ferx_core::CompiledModel, population: &ferx_core::Population, params: &ferx_core::ModelParameters, opts: &ferx_core::VpcCifOptions) -> core::result::Result<ferx_core::CifVpc, ferx_core::diagnostics::EngineError>
 pub fn ferx_core::api::vpc_kmmc(model: &ferx_core::CompiledModel, population: &ferx_core::Population, params: &ferx_core::ModelParameters, opts: &ferx_core::VpcKmmcOptions) -> core::result::Result<ferx_core::KmmcVpc, ferx_core::diagnostics::EngineError>
 pub fn ferx_core::api::vpc_rtte(model: &ferx_core::CompiledModel, population: &ferx_core::Population, params: &ferx_core::ModelParameters, opts: &ferx_core::VpcRtteOptions) -> core::result::Result<ferx_core::RtteVpc, ferx_core::diagnostics::EngineError>
 pub fn ferx_core::api::vpc_tte(model: &ferx_core::CompiledModel, population: &ferx_core::Population, params: &ferx_core::ModelParameters, opts: &ferx_core::VpcTteOptions) -> core::result::Result<ferx_core::TteVpc, ferx_core::diagnostics::EngineError>
@@ -2317,7 +2440,8 @@ pub ferx_core::sim::adaptive::AdaptiveSubjectMetrics::n_doses: usize
 pub ferx_core::sim::adaptive::AdaptiveSubjectMetrics::n_holds: usize
 pub ferx_core::sim::adaptive::AdaptiveSubjectMetrics::n_increases: usize
 pub ferx_core::sim::adaptive::AdaptiveSubjectMetrics::n_not_due: usize
-pub ferx_core::sim::adaptive::AdaptiveSubjectMetrics::pct_time_in_window: core::option::Option<f64>
+pub ferx_core::sim::adaptive::AdaptiveSubjectMetrics::pct_readings_in_window: core::option::Option<f64>
+pub ferx_core::sim::adaptive::AdaptiveSubjectMetrics::rep: usize
 pub ferx_core::sim::adaptive::AdaptiveSubjectMetrics::signal_max: core::option::Option<f64>
 pub ferx_core::sim::adaptive::AdaptiveSubjectMetrics::signal_mean: core::option::Option<f64>
 pub ferx_core::sim::adaptive::AdaptiveSubjectMetrics::signal_min: core::option::Option<f64>
@@ -2340,10 +2464,11 @@ pub ferx_core::sim::adaptive::DecisionLogEntry::draw: usize
 pub ferx_core::sim::adaptive::DecisionLogEntry::interval: core::option::Option<f64>
 pub ferx_core::sim::adaptive::DecisionLogEntry::observed_signals: alloc::vec::Vec<ferx_core::sim::adaptive::ObservedSignal>
 pub ferx_core::sim::adaptive::DecisionLogEntry::outcome: ferx_core::sim::adaptive::DecisionOutcome
+pub ferx_core::sim::adaptive::DecisionLogEntry::rep: usize
 pub ferx_core::sim::adaptive::DecisionLogEntry::sim: usize
 pub ferx_core::sim::adaptive::DecisionLogEntry::subject: alloc::string::String
 pub ferx_core::sim::adaptive::DecisionLogEntry::time: f64
-pub struct ferx_core::sim::adaptive::DoseLedgerEntry
+#[non_exhaustive] pub struct ferx_core::sim::adaptive::DoseLedgerEntry
 pub ferx_core::sim::adaptive::DoseLedgerEntry::amt: f64
 pub ferx_core::sim::adaptive::DoseLedgerEntry::cmt: usize
 pub ferx_core::sim::adaptive::DoseLedgerEntry::decision_idx: usize
@@ -2354,6 +2479,7 @@ pub ferx_core::sim::adaptive::DoseLedgerEntry::observed_signals: alloc::vec::Vec
 pub ferx_core::sim::adaptive::DoseLedgerEntry::post_state: core::option::Option<alloc::vec::Vec<f64>>
 pub ferx_core::sim::adaptive::DoseLedgerEntry::pre_state: core::option::Option<alloc::vec::Vec<f64>>
 pub ferx_core::sim::adaptive::DoseLedgerEntry::rate: f64
+pub ferx_core::sim::adaptive::DoseLedgerEntry::rep: usize
 pub ferx_core::sim::adaptive::DoseLedgerEntry::rule_fired: alloc::string::String
 pub ferx_core::sim::adaptive::DoseLedgerEntry::sim: usize
 pub ferx_core::sim::adaptive::DoseLedgerEntry::subject: alloc::string::String
@@ -2364,12 +2490,37 @@ pub ferx_core::sim::adaptive::MonitorSpec::mode: ferx_core::sim::adaptive::Obser
 pub ferx_core::sim::adaptive::MonitorSpec::name: alloc::string::String
 impl ferx_core::sim::adaptive::MonitorSpec
 pub fn ferx_core::sim::adaptive::MonitorSpec::new(name: impl core::convert::Into<alloc::string::String>, cmt: usize, mode: ferx_core::sim::adaptive::ObserveMode) -> Self
-pub struct ferx_core::sim::adaptive::ObservedSignal
+#[non_exhaustive] pub struct ferx_core::sim::adaptive::ObservedSignal
+pub ferx_core::sim::adaptive::ObservedSignal::latent: f64
 pub ferx_core::sim::adaptive::ObservedSignal::mode: ferx_core::sim::adaptive::ObserveMode
 pub ferx_core::sim::adaptive::ObservedSignal::name: alloc::string::String
 pub ferx_core::sim::adaptive::ObservedSignal::value: f64
 pub mod ferx_core::sim::adaptive_control
 pub mod ferx_core::stats
+pub mod ferx_core::stats::cif
+pub enum ferx_core::stats::cif::CifInputError
+pub ferx_core::stats::cif::CifInputError::BadCause
+pub ferx_core::stats::cif::CifInputError::BadCause::index: usize
+pub ferx_core::stats::cif::CifInputError::BadCause::n_causes: usize
+pub ferx_core::stats::cif::CifInputError::BadCause::value: usize
+pub ferx_core::stats::cif::CifInputError::BadTime
+pub ferx_core::stats::cif::CifInputError::BadTime::index: usize
+pub ferx_core::stats::cif::CifInputError::BadTime::value: f64
+pub ferx_core::stats::cif::CifInputError::LengthMismatch
+pub ferx_core::stats::cif::CifInputError::LengthMismatch::causes: usize
+pub ferx_core::stats::cif::CifInputError::LengthMismatch::times: usize
+impl core::error::Error for ferx_core::stats::cif::CifInputError
+impl core::fmt::Display for ferx_core::stats::cif::CifInputError
+pub fn ferx_core::stats::cif::CifInputError::fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+pub struct ferx_core::stats::cif::CifCurve
+pub ferx_core::stats::cif::CifCurve::all_cause: ferx_core::stats::km::KmCurve
+pub ferx_core::stats::cif::CifCurve::cif: alloc::vec::Vec<alloc::vec::Vec<f64>>
+pub ferx_core::stats::cif::CifCurve::n_event: alloc::vec::Vec<alloc::vec::Vec<usize>>
+impl ferx_core::stats::cif::CifCurve
+pub fn ferx_core::stats::cif::CifCurve::at(&self, k: usize, t: f64) -> core::option::Option<f64>
+pub fn ferx_core::stats::cif::CifCurve::n_causes(&self) -> usize
+pub fn ferx_core::stats::cif::aalen_johansen(times: &[f64], causes: &[usize], n_causes: usize) -> core::result::Result<ferx_core::stats::cif::CifCurve, ferx_core::stats::cif::CifInputError>
+pub fn ferx_core::stats::cif::vpc_band_cif(curves: &[ferx_core::stats::cif::CifCurve], k: usize, grid: &[f64], probs: [f64; 3]) -> core::result::Result<ferx_core::stats::km::VpcBand, ferx_core::stats::km::KmInputError>
 pub mod ferx_core::stats::convergence
 pub fn ferx_core::stats::convergence::effective_sample_size(chains: &[alloc::vec::Vec<f64>]) -> f64
 pub fn ferx_core::stats::convergence::ess_bulk(chains: &[alloc::vec::Vec<f64>]) -> f64
@@ -3382,6 +3533,7 @@ pub ferx_core::types::FitOptions::impmap_seed: core::option::Option<u64>
 pub ferx_core::types::FitOptions::impmap_sobol: bool
 pub ferx_core::types::FitOptions::impmap_trace: bool
 pub ferx_core::types::FitOptions::inits_from_nca: core::option::Option<ferx_core::suggest_start::NcaInit>
+pub ferx_core::types::FitOptions::inner_kick: bool
 pub ferx_core::types::FitOptions::inner_maxiter: usize
 pub ferx_core::types::FitOptions::inner_optimizer: ferx_core::InnerOptimizer
 pub ferx_core::types::FitOptions::inner_restarts: usize
@@ -3411,6 +3563,7 @@ pub ferx_core::types::FitOptions::ode_abstol: f64
 pub ferx_core::types::FitOptions::ode_auto_switch: bool
 pub ferx_core::types::FitOptions::ode_max_steps: usize
 pub ferx_core::types::FitOptions::ode_method: ferx_core::ode::OdeMethod
+pub ferx_core::types::FitOptions::ode_ofv_check: bool
 pub ferx_core::types::FitOptions::ode_reltol: f64
 pub ferx_core::types::FitOptions::ode_stiff_abort_after: core::option::Option<u32>
 pub ferx_core::types::FitOptions::optimizer: ferx_core::Optimizer
@@ -3573,6 +3726,7 @@ pub ferx_core::types::FitResult::ode_linear_exact: bool
 pub ferx_core::types::FitResult::ofv: f64
 pub ferx_core::types::FitResult::ofv_data: f64
 pub ferx_core::types::FitResult::ofv_prior: f64
+pub ferx_core::types::FitResult::ofv_settlement_wall_time_secs: f64
 pub ferx_core::types::FitResult::omega: nalgebra::base::alias::DMatrix<f64>
 pub ferx_core::types::FitResult::omega_fixed: alloc::vec::Vec<bool>
 pub ferx_core::types::FitResult::omega_init: nalgebra::base::alias::DMatrix<f64>
@@ -3626,6 +3780,7 @@ pub ferx_core::types::FitResult::sir_seed: core::option::Option<u64>
 pub ferx_core::types::FitResult::sir_settings: core::option::Option<ferx_core::estimation::sir::SirSettings>
 pub ferx_core::types::FitResult::starts: alloc::vec::Vec<ferx_core::StartRecord>
 pub ferx_core::types::FitResult::stationary_start: bool
+pub ferx_core::types::FitResult::subject_results_wall_time_secs: f64
 pub ferx_core::types::FitResult::subjects: alloc::vec::Vec<ferx_core::SubjectResult>
 pub ferx_core::types::FitResult::theta: alloc::vec::Vec<f64>
 pub ferx_core::types::FitResult::theta_fixed: alloc::vec::Vec<bool>
@@ -4049,12 +4204,50 @@ pub ferx_core::AdaptiveAction::Hold
 pub ferx_core::AdaptiveAction::Increase(ferx_core::sim::adaptive::DoseStep)
 pub ferx_core::AdaptiveAction::Maintain
 pub ferx_core::AdaptiveAction::Stop
+#[non_exhaustive] pub enum ferx_core::AdaptiveBandStatus
+pub ferx_core::AdaptiveBandStatus::NotDrawn
+pub ferx_core::AdaptiveBandStatus::Quantiles(ferx_core::AdaptiveQuantiles)
+#[non_exhaustive] pub enum ferx_core::AdaptiveComponentStatus
+pub ferx_core::AdaptiveComponentStatus::Estimated
+pub ferx_core::AdaptiveComponentStatus::Estimated::mc_se: core::option::Option<f64>
+pub ferx_core::AdaptiveComponentStatus::Estimated::value: f64
+pub ferx_core::AdaptiveComponentStatus::NotDrawn
+pub ferx_core::AdaptiveComponentStatus::Supplied
 pub enum ferx_core::AdaptiveRoute
 pub ferx_core::AdaptiveRoute::Bolus
 pub ferx_core::AdaptiveRoute::Bolus::cmt: usize
 pub ferx_core::AdaptiveRoute::Infuse
 pub ferx_core::AdaptiveRoute::Infuse::cmt: usize
 pub ferx_core::AdaptiveRoute::Infuse::over: f64
+#[non_exhaustive] pub enum ferx_core::AdaptiveSummaryMetric
+pub ferx_core::AdaptiveSummaryMetric::AucTargetAttainment
+pub ferx_core::AdaptiveSummaryMetric::CumulativeDose
+pub ferx_core::AdaptiveSummaryMetric::Discontinued
+pub ferx_core::AdaptiveSummaryMetric::NDecreases
+pub ferx_core::AdaptiveSummaryMetric::NDoses
+pub ferx_core::AdaptiveSummaryMetric::NHolds
+pub ferx_core::AdaptiveSummaryMetric::NIncreases
+pub ferx_core::AdaptiveSummaryMetric::NNotDue
+pub ferx_core::AdaptiveSummaryMetric::PctReadingsInWindow
+pub ferx_core::AdaptiveSummaryMetric::Signal
+pub ferx_core::AdaptiveSummaryMetric::Signal::analyte: alloc::string::String
+pub ferx_core::AdaptiveSummaryMetric::Signal::decision_idx: usize
+pub ferx_core::AdaptiveSummaryMetric::SignalMax
+pub ferx_core::AdaptiveSummaryMetric::SignalMean
+pub ferx_core::AdaptiveSummaryMetric::SignalMin
+#[non_exhaustive] pub enum ferx_core::AdaptiveSummaryStatistic
+pub ferx_core::AdaptiveSummaryStatistic::FractionAtLeast(f64)
+pub ferx_core::AdaptiveSummaryStatistic::Mean
+pub ferx_core::AdaptiveSummaryStatistic::Median
+#[non_exhaustive] pub enum ferx_core::AdaptiveVarianceLayer
+pub ferx_core::AdaptiveVarianceLayer::BetweenRow
+pub ferx_core::AdaptiveVarianceLayer::Bsv
+pub ferx_core::AdaptiveVarianceLayer::Parameter
+pub ferx_core::AdaptiveVarianceLayer::Total
+pub ferx_core::AdaptiveVarianceLayer::Within
+#[non_exhaustive] pub enum ferx_core::AdaptiveVarianceScope
+pub ferx_core::AdaptiveVarianceScope::Population
+pub ferx_core::AdaptiveVarianceScope::Subject(alloc::string::String)
 pub enum ferx_core::AggFunction
 pub ferx_core::AggFunction::Max
 pub ferx_core::AggFunction::Min
@@ -4613,6 +4806,16 @@ pub ferx_core::WarningSeverity::Critical
 pub ferx_core::WarningSeverity::Info
 pub ferx_core::WarningSeverity::Warning
 pub struct ferx_core::AbsorptionOdeEquivalent
+#[non_exhaustive] pub struct ferx_core::AdaptiveDecomposition
+pub ferx_core::AdaptiveDecomposition::components: alloc::vec::Vec<ferx_core::AdaptiveVarianceComponent>
+pub ferx_core::AdaptiveDecomposition::n_draws: usize
+pub ferx_core::AdaptiveDecomposition::n_reps: usize
+pub ferx_core::AdaptiveDecomposition::n_sims: usize
+pub ferx_core::AdaptiveDecomposition::skipped: alloc::vec::Vec<ferx_core::AdaptiveDecompositionSkip>
+#[non_exhaustive] pub struct ferx_core::AdaptiveDecompositionSkip
+pub ferx_core::AdaptiveDecompositionSkip::metric: ferx_core::AdaptiveSummaryMetric
+pub ferx_core::AdaptiveDecompositionSkip::n_missing: usize
+pub ferx_core::AdaptiveDecompositionSkip::subject: alloc::string::String
 #[non_exhaustive] pub struct ferx_core::AdaptiveDosingSpec
 pub ferx_core::AdaptiveDosingSpec::assay_cmt: core::option::Option<usize>
 pub ferx_core::AdaptiveDosingSpec::at: alloc::vec::Vec<f64>
@@ -4643,6 +4846,19 @@ pub fn ferx_core::AdaptiveInputs<'a>::new(params: &'a ferx_core::ModelParameters
 pub fn ferx_core::AdaptiveInputs<'a>::with_etas(self, etas: &'a ferx_core::SuppliedEtas) -> Self
 pub fn ferx_core::AdaptiveInputs<'a>::with_uncertainty(self, fit: &'a ferx_core::FitResult, spec: ferx_core::UncertaintySpec) -> Self
 pub fn ferx_core::AdaptiveInputs<'a>::with_unmatched(self, policy: ferx_core::UnmatchedSubjects) -> Self
+#[non_exhaustive] pub struct ferx_core::AdaptivePopulationSummary
+pub ferx_core::AdaptivePopulationSummary::bands: alloc::vec::Vec<ferx_core::AdaptiveSummaryBand>
+pub ferx_core::AdaptivePopulationSummary::n_draws: usize
+pub ferx_core::AdaptivePopulationSummary::prediction_intervals: alloc::vec::Vec<ferx_core::AdaptivePredictionInterval>
+pub ferx_core::AdaptivePopulationSummary::rows: alloc::vec::Vec<ferx_core::AdaptiveSummaryRow>
+#[non_exhaustive] pub struct ferx_core::AdaptivePredictionInterval
+pub ferx_core::AdaptivePredictionInterval::metric: ferx_core::AdaptiveSummaryMetric
+pub ferx_core::AdaptivePredictionInterval::n_missing: usize
+pub ferx_core::AdaptivePredictionInterval::n_runs: usize
+pub ferx_core::AdaptivePredictionInterval::quantiles: ferx_core::AdaptiveQuantiles
+#[non_exhaustive] pub struct ferx_core::AdaptiveQuantiles
+pub ferx_core::AdaptiveQuantiles::probs: [f64; 3]
+pub ferx_core::AdaptiveQuantiles::values: [core::option::Option<f64>; 3]
 #[non_exhaustive] pub struct ferx_core::AdaptiveRule
 pub ferx_core::AdaptiveRule::action: ferx_core::sim::adaptive::AdaptiveAction
 pub ferx_core::AdaptiveRule::interval: core::option::Option<ferx_core::sim::adaptive::IntervalStep>
@@ -4653,6 +4869,7 @@ pub ferx_core::AdaptiveSimulateOptions::decision_covariates: core::option::Optio
 pub ferx_core::AdaptiveSimulateOptions::decision_times: alloc::vec::Vec<f64>
 pub ferx_core::AdaptiveSimulateOptions::max_decisions: usize
 pub ferx_core::AdaptiveSimulateOptions::monitors: alloc::vec::Vec<ferx_core::sim::adaptive::MonitorSpec>
+pub ferx_core::AdaptiveSimulateOptions::n_reps: usize
 pub ferx_core::AdaptiveSimulateOptions::seed: core::option::Option<u64>
 pub ferx_core::AdaptiveSimulateOptions::start_interval: core::option::Option<f64>
 pub ferx_core::AdaptiveSimulateOptions::verify: bool
@@ -4677,13 +4894,38 @@ pub ferx_core::AdaptiveSubjectMetrics::n_doses: usize
 pub ferx_core::AdaptiveSubjectMetrics::n_holds: usize
 pub ferx_core::AdaptiveSubjectMetrics::n_increases: usize
 pub ferx_core::AdaptiveSubjectMetrics::n_not_due: usize
-pub ferx_core::AdaptiveSubjectMetrics::pct_time_in_window: core::option::Option<f64>
+pub ferx_core::AdaptiveSubjectMetrics::pct_readings_in_window: core::option::Option<f64>
+pub ferx_core::AdaptiveSubjectMetrics::rep: usize
 pub ferx_core::AdaptiveSubjectMetrics::signal_max: core::option::Option<f64>
 pub ferx_core::AdaptiveSubjectMetrics::signal_mean: core::option::Option<f64>
 pub ferx_core::AdaptiveSubjectMetrics::signal_min: core::option::Option<f64>
 pub ferx_core::AdaptiveSubjectMetrics::sim: usize
 pub ferx_core::AdaptiveSubjectMetrics::subject: alloc::string::String
 pub ferx_core::AdaptiveSubjectMetrics::time_to_discontinuation: core::option::Option<f64>
+#[non_exhaustive] pub struct ferx_core::AdaptiveSummaryBand
+pub ferx_core::AdaptiveSummaryBand::metric: ferx_core::AdaptiveSummaryMetric
+pub ferx_core::AdaptiveSummaryBand::n_draws_missing: usize
+pub ferx_core::AdaptiveSummaryBand::n_draws_present: usize
+pub ferx_core::AdaptiveSummaryBand::statistic: ferx_core::AdaptiveSummaryStatistic
+pub ferx_core::AdaptiveSummaryBand::status: ferx_core::AdaptiveBandStatus
+#[non_exhaustive] pub struct ferx_core::AdaptiveSummaryOptions
+pub ferx_core::AdaptiveSummaryOptions::probs: [f64; 3]
+pub ferx_core::AdaptiveSummaryOptions::thresholds: alloc::vec::Vec<(ferx_core::AdaptiveSummaryMetric, f64)>
+impl core::default::Default for ferx_core::AdaptiveSummaryOptions
+pub fn ferx_core::AdaptiveSummaryOptions::default() -> Self
+#[non_exhaustive] pub struct ferx_core::AdaptiveSummaryRow
+pub ferx_core::AdaptiveSummaryRow::draw: usize
+pub ferx_core::AdaptiveSummaryRow::metric: ferx_core::AdaptiveSummaryMetric
+pub ferx_core::AdaptiveSummaryRow::n_missing: usize
+pub ferx_core::AdaptiveSummaryRow::n_runs: usize
+pub ferx_core::AdaptiveSummaryRow::statistic: ferx_core::AdaptiveSummaryStatistic
+pub ferx_core::AdaptiveSummaryRow::value: core::option::Option<f64>
+#[non_exhaustive] pub struct ferx_core::AdaptiveVarianceComponent
+pub ferx_core::AdaptiveVarianceComponent::layer: ferx_core::AdaptiveVarianceLayer
+pub ferx_core::AdaptiveVarianceComponent::metric: ferx_core::AdaptiveSummaryMetric
+pub ferx_core::AdaptiveVarianceComponent::n_subjects: usize
+pub ferx_core::AdaptiveVarianceComponent::scope: ferx_core::AdaptiveVarianceScope
+pub ferx_core::AdaptiveVarianceComponent::status: ferx_core::AdaptiveComponentStatus
 #[non_exhaustive] pub struct ferx_core::AnalyticReadout
 pub ferx_core::AnalyticReadout::program: core::option::Option<ferx_core::parser::model_parser::OdeOutputProgram>
 pub ferx_core::AnalyticReadout::readout: ferx_core::ode::OdeReadout
@@ -4728,6 +4970,31 @@ pub fn ferx_core::diagnostics::CheckReport::error_count(&self) -> usize
 pub fn ferx_core::diagnostics::CheckReport::info_count(&self) -> usize
 pub fn ferx_core::diagnostics::CheckReport::new(model: impl core::convert::Into<alloc::string::String>, data: core::option::Option<alloc::string::String>, diagnostics: alloc::vec::Vec<ferx_core::diagnostics::Diagnostic>) -> Self
 pub fn ferx_core::diagnostics::CheckReport::warning_count(&self) -> usize
+pub struct ferx_core::CifCauseBand
+pub ferx_core::CifCauseBand::band: ferx_core::CifVpcBand
+pub ferx_core::CifCauseBand::cmt: usize
+pub struct ferx_core::CifVpc
+pub ferx_core::CifVpc::censoring: ferx_core::VpcCensoring
+pub ferx_core::CifVpc::cmts: alloc::vec::Vec<usize>
+pub ferx_core::CifVpc::horizon: f64
+pub ferx_core::CifVpc::n_sim: usize
+pub ferx_core::CifVpc::probs: [f64; 3]
+pub ferx_core::CifVpc::strata: alloc::vec::Vec<ferx_core::CifVpcStratum>
+pub ferx_core::CifVpc::warnings: alloc::vec::Vec<alloc::string::String>
+pub struct ferx_core::CifVpcBand
+pub ferx_core::CifVpcBand::hi: alloc::vec::Vec<core::option::Option<f64>>
+pub ferx_core::CifVpcBand::lo: alloc::vec::Vec<core::option::Option<f64>>
+pub ferx_core::CifVpcBand::med: alloc::vec::Vec<core::option::Option<f64>>
+pub ferx_core::CifVpcBand::n_used: alloc::vec::Vec<usize>
+pub ferx_core::CifVpcBand::obs_on_grid: alloc::vec::Vec<core::option::Option<f64>>
+pub struct ferx_core::CifVpcStratum
+pub ferx_core::CifVpcStratum::causes: alloc::vec::Vec<ferx_core::CifCauseBand>
+pub ferx_core::CifVpcStratum::grid: alloc::vec::Vec<f64>
+pub ferx_core::CifVpcStratum::label: alloc::string::String
+pub ferx_core::CifVpcStratum::n_subjects: usize
+pub ferx_core::CifVpcStratum::observed: ferx_core::stats::cif::CifCurve
+pub ferx_core::CifVpcStratum::survival: ferx_core::CifVpcBand
+pub ferx_core::CifVpcStratum::value: core::option::Option<f64>
 pub struct ferx_core::CmtToggle
 pub ferx_core::CmtToggle::on: bool
 pub ferx_core::CmtToggle::pk_only: usize
@@ -4935,6 +5202,7 @@ pub ferx_core::DecisionLogEntry::draw: usize
 pub ferx_core::DecisionLogEntry::interval: core::option::Option<f64>
 pub ferx_core::DecisionLogEntry::observed_signals: alloc::vec::Vec<ferx_core::sim::adaptive::ObservedSignal>
 pub ferx_core::DecisionLogEntry::outcome: ferx_core::sim::adaptive::DecisionOutcome
+pub ferx_core::DecisionLogEntry::rep: usize
 pub ferx_core::DecisionLogEntry::sim: usize
 pub ferx_core::DecisionLogEntry::subject: alloc::string::String
 pub ferx_core::DecisionLogEntry::time: f64
@@ -5008,7 +5276,7 @@ pub fn ferx_core::DoseEvent::modeled(time: f64, amt: f64, cmt: usize, ss: bool, 
 pub fn ferx_core::DoseEvent::new(time: f64, amt: f64, cmt: usize, rate: f64, ss: bool, ii: f64) -> Self
 impl core::fmt::Debug for ferx_core::DoseEvent
 pub fn ferx_core::DoseEvent::fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result
-pub struct ferx_core::DoseLedgerEntry
+#[non_exhaustive] pub struct ferx_core::DoseLedgerEntry
 pub ferx_core::DoseLedgerEntry::amt: f64
 pub ferx_core::DoseLedgerEntry::cmt: usize
 pub ferx_core::DoseLedgerEntry::decision_idx: usize
@@ -5019,6 +5287,7 @@ pub ferx_core::DoseLedgerEntry::observed_signals: alloc::vec::Vec<ferx_core::sim
 pub ferx_core::DoseLedgerEntry::post_state: core::option::Option<alloc::vec::Vec<f64>>
 pub ferx_core::DoseLedgerEntry::pre_state: core::option::Option<alloc::vec::Vec<f64>>
 pub ferx_core::DoseLedgerEntry::rate: f64
+pub ferx_core::DoseLedgerEntry::rep: usize
 pub ferx_core::DoseLedgerEntry::rule_fired: alloc::string::String
 pub ferx_core::DoseLedgerEntry::sim: usize
 pub ferx_core::DoseLedgerEntry::subject: alloc::string::String
@@ -5129,6 +5398,7 @@ pub ferx_core::FitOptions::impmap_seed: core::option::Option<u64>
 pub ferx_core::FitOptions::impmap_sobol: bool
 pub ferx_core::FitOptions::impmap_trace: bool
 pub ferx_core::FitOptions::inits_from_nca: core::option::Option<ferx_core::suggest_start::NcaInit>
+pub ferx_core::FitOptions::inner_kick: bool
 pub ferx_core::FitOptions::inner_maxiter: usize
 pub ferx_core::FitOptions::inner_optimizer: ferx_core::InnerOptimizer
 pub ferx_core::FitOptions::inner_restarts: usize
@@ -5158,6 +5428,7 @@ pub ferx_core::FitOptions::ode_abstol: f64
 pub ferx_core::FitOptions::ode_auto_switch: bool
 pub ferx_core::FitOptions::ode_max_steps: usize
 pub ferx_core::FitOptions::ode_method: ferx_core::ode::OdeMethod
+pub ferx_core::FitOptions::ode_ofv_check: bool
 pub ferx_core::FitOptions::ode_reltol: f64
 pub ferx_core::FitOptions::ode_stiff_abort_after: core::option::Option<u32>
 pub ferx_core::FitOptions::optimizer: ferx_core::Optimizer
@@ -5320,6 +5591,7 @@ pub ferx_core::FitResult::ode_linear_exact: bool
 pub ferx_core::FitResult::ofv: f64
 pub ferx_core::FitResult::ofv_data: f64
 pub ferx_core::FitResult::ofv_prior: f64
+pub ferx_core::FitResult::ofv_settlement_wall_time_secs: f64
 pub ferx_core::FitResult::omega: nalgebra::base::alias::DMatrix<f64>
 pub ferx_core::FitResult::omega_fixed: alloc::vec::Vec<bool>
 pub ferx_core::FitResult::omega_init: nalgebra::base::alias::DMatrix<f64>
@@ -5373,6 +5645,7 @@ pub ferx_core::FitResult::sir_seed: core::option::Option<u64>
 pub ferx_core::FitResult::sir_settings: core::option::Option<ferx_core::estimation::sir::SirSettings>
 pub ferx_core::FitResult::starts: alloc::vec::Vec<ferx_core::StartRecord>
 pub ferx_core::FitResult::stationary_start: bool
+pub ferx_core::FitResult::subject_results_wall_time_secs: f64
 pub ferx_core::FitResult::subjects: alloc::vec::Vec<ferx_core::SubjectResult>
 pub ferx_core::FitResult::theta: alloc::vec::Vec<f64>
 pub ferx_core::FitResult::theta_fixed: alloc::vec::Vec<bool>
@@ -5561,7 +5834,8 @@ pub ferx_core::NeuralNetworkInfo::output_activation: alloc::string::String
 pub ferx_core::NeuralNetworkInfo::output_names: alloc::vec::Vec<alloc::string::String>
 pub ferx_core::NeuralNetworkInfo::shape: alloc::vec::Vec<usize>
 pub ferx_core::NeuralNetworkInfo::weights_offset: usize
-pub struct ferx_core::ObservedSignal
+#[non_exhaustive] pub struct ferx_core::ObservedSignal
+pub ferx_core::ObservedSignal::latent: f64
 pub ferx_core::ObservedSignal::mode: ferx_core::sim::adaptive::ObserveMode
 pub ferx_core::ObservedSignal::name: alloc::string::String
 pub ferx_core::ObservedSignal::value: f64
@@ -5759,6 +6033,7 @@ pub ferx_core::SaemObjective::n_samples: core::option::Option<usize>
 pub struct ferx_core::ScoringSettings
 pub ferx_core::ScoringSettings::ebe_warm_start: bool
 pub ferx_core::ScoringSettings::gradient_method: ferx_core::GradientMethod
+pub ferx_core::ScoringSettings::inner_kick: bool
 pub ferx_core::ScoringSettings::inner_maxiter: usize
 pub ferx_core::ScoringSettings::inner_optimizer: ferx_core::InnerOptimizer
 pub ferx_core::ScoringSettings::inner_restarts: usize
@@ -6007,6 +6282,15 @@ pub ferx_core::ViResult::n_mc_samples: usize
 pub ferx_core::ViResult::neg_two_elbo: f64
 pub ferx_core::ViResult::objective_trace: alloc::vec::Vec<f64>
 pub ferx_core::ViResult::superseded_by: core::option::Option<alloc::string::String>
+pub struct ferx_core::VpcCifOptions
+pub ferx_core::VpcCifOptions::censoring: ferx_core::VpcCensoring
+pub ferx_core::VpcCifOptions::grid: ferx_core::VpcGrid
+pub ferx_core::VpcCifOptions::n_sim: usize
+pub ferx_core::VpcCifOptions::probs: [f64; 3]
+pub ferx_core::VpcCifOptions::sim: ferx_core::SimulateOptions
+pub ferx_core::VpcCifOptions::stratify: ferx_core::VpcStratify
+impl core::default::Default for ferx_core::VpcCifOptions
+pub fn ferx_core::VpcCifOptions::default() -> Self
 #[non_exhaustive] pub struct ferx_core::VpcKmmcOptions
 pub ferx_core::VpcKmmcOptions::covariate: alloc::string::String
 pub ferx_core::VpcKmmcOptions::level: core::option::Option<f64>
@@ -6074,6 +6358,7 @@ pub fn ferx_core::check_model_options(model: &ferx_core::CompiledModel, options:
 pub fn ferx_core::check_strictness(result: &ferx_core::FitResult, s: &ferx_core::model_selection::Strictness) -> ferx_core::model_selection::StrictnessVerdict
 pub fn ferx_core::classify_warning(raw: &str) -> ferx_core::WarningEntry
 pub fn ferx_core::configure_global_thread_pool(n_threads: usize) -> core::result::Result<(), alloc::string::String>
+pub fn ferx_core::decompose_adaptive(result: &ferx_core::AdaptiveSimulationResult) -> core::result::Result<ferx_core::AdaptiveDecomposition, ferx_core::diagnostics::EngineError>
 pub fn ferx_core::estimate_near_boundary(result: &ferx_core::FitResult) -> bool
 pub fn ferx_core::fit(model: &ferx_core::CompiledModel, population: &ferx_core::Population, init_params: &ferx_core::ModelParameters, options: &ferx_core::FitOptions) -> core::result::Result<ferx_core::FitResult, ferx_core::diagnostics::EngineError>
 pub fn ferx_core::fit_from_files(model_path: &str, data_path: core::option::Option<&str>, covariate_columns: core::option::Option<&[&str]>, options: core::option::Option<ferx_core::FitOptions>) -> core::result::Result<ferx_core::FitResult, ferx_core::diagnostics::EngineError>
@@ -6122,10 +6407,12 @@ pub fn ferx_core::simulate_with_seed(model: &ferx_core::CompiledModel, populatio
 pub fn ferx_core::simulate_with_uncertainty(model: &ferx_core::CompiledModel, population: &ferx_core::Population, fit_result: &ferx_core::FitResult, opts: &ferx_core::SimulateUncertaintyOptions) -> core::result::Result<alloc::vec::Vec<ferx_core::SimulationResult>, ferx_core::diagnostics::EngineError>
 pub fn ferx_core::simulate_with_uncertainty_diag(model: &ferx_core::CompiledModel, population: &ferx_core::Population, fit_result: &ferx_core::FitResult, opts: &ferx_core::SimulateUncertaintyOptions) -> core::result::Result<ferx_core::SimulationOutput, ferx_core::diagnostics::EngineError>
 pub fn ferx_core::stalled_at_init(result: &ferx_core::FitResult) -> core::option::Option<bool>
+pub fn ferx_core::summarize_adaptive(result: &ferx_core::AdaptiveSimulationResult, opts: &ferx_core::AdaptiveSummaryOptions) -> core::result::Result<ferx_core::AdaptivePopulationSummary, ferx_core::diagnostics::EngineError>
 pub fn ferx_core::theta_level_map(model: &ferx_core::CompiledModel) -> std::collections::hash::map::HashMap<alloc::string::String, alloc::vec::Vec<alloc::string::String>>
 pub fn ferx_core::theta_level_values(model: &ferx_core::CompiledModel, theta: &[f64], covariance: core::option::Option<&nalgebra::base::alias::DMatrix<f64>>, sir_resamples_packed: core::option::Option<&[alloc::vec::Vec<f64>]>) -> core::result::Result<std::collections::hash::map::HashMap<alloc::string::String, alloc::vec::Vec<ferx_core::api::ThetaLevelValue>>, alloc::string::String>
 pub fn ferx_core::validate_model_file(model_path: &str, data_path: core::option::Option<&str>) -> ferx_core::diagnostics::CheckReport
 pub fn ferx_core::validate_model_file_with(model_path: &str, data_path: core::option::Option<&str>, overrides: &[(alloc::string::String, alloc::string::String)]) -> ferx_core::diagnostics::CheckReport
+pub fn ferx_core::vpc_cif(model: &ferx_core::CompiledModel, population: &ferx_core::Population, params: &ferx_core::ModelParameters, opts: &ferx_core::VpcCifOptions) -> core::result::Result<ferx_core::CifVpc, ferx_core::diagnostics::EngineError>
 pub fn ferx_core::vpc_kmmc(model: &ferx_core::CompiledModel, population: &ferx_core::Population, params: &ferx_core::ModelParameters, opts: &ferx_core::VpcKmmcOptions) -> core::result::Result<ferx_core::KmmcVpc, ferx_core::diagnostics::EngineError>
 pub fn ferx_core::vpc_rtte(model: &ferx_core::CompiledModel, population: &ferx_core::Population, params: &ferx_core::ModelParameters, opts: &ferx_core::VpcRtteOptions) -> core::result::Result<ferx_core::RtteVpc, ferx_core::diagnostics::EngineError>
 pub fn ferx_core::vpc_tte(model: &ferx_core::CompiledModel, population: &ferx_core::Population, params: &ferx_core::ModelParameters, opts: &ferx_core::VpcTteOptions) -> core::result::Result<ferx_core::TteVpc, ferx_core::diagnostics::EngineError>

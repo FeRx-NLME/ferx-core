@@ -6,17 +6,18 @@
 # of your branch). See #1114.
 #
 # Boundary rule: `ferx-core` = one model, one dataset, one fit. `ferx-tools` =
-# many fits, resampling, model-space search. Statistical kernels stay in core;
-# orchestration of repeated fits lives in tools. `ferx-core` never depends on
-# either member (A1); the public-API baseline in `api/ferx-core-public-api.txt`
-# is what keeps the boundary honest (A2).
+# many fits of a given model (resampling, screening), `ferx-search` = many fits
+# over a space of models. Statistical kernels stay in core; orchestration of
+# repeated fits lives in the members. `ferx-search` -> `ferx-tools` ->
+# `ferx-core`, never the reverse (A1, #3185); the public-API baseline in
+# `api/ferx-core-public-api.txt` is what keeps the boundary honest (A2).
 [workspace]
 # `crates/docs-lint` is dev tooling, not part of the boundary above: it is a
 # member so it gets rustfmt / clippy / `cargo test`, it depends on nothing (not
 # even `ferx-core`), and nothing depends on it. See #1163. `crates/patterns-lint`
 # (#2634) is the same kind of member: source-pattern lints over test code, which
 # depends on no workspace crate (only `syn`) and which nothing depends on.
-members = ["crates/ferx-tools", "crates/ferx-cli", "crates/docs-lint", "crates/patterns-lint"]
+members = ["crates/ferx-tools", "crates/ferx-search", "crates/ferx-cli", "crates/docs-lint", "crates/patterns-lint"]
 # Required to PRESERVE existing behaviour, not to change it: a standalone
 # edition-2021 package gets resolver v2 implicitly, but inside a workspace the
 # root package's edition no longer implies it — cargo would warn and fall back
@@ -55,6 +56,9 @@ readme = "README.md"
 exclude = [
   "data/mbma_naproxen*",
   "examples/mbma_naproxen.ferx",
+  # Regenerates tools/peak-memory/stiff_pkpd.csv (#3081) from repo paths that are
+  # themselves excluded (`tools/*`), so in the tarball it is an example that cannot run.
+  "examples/generate_peak_memory.rs",
   "api/*",
   # Repo infrastructure, not crate content. None of it is needed to build or
   # document the crate, and together it is roughly 7.5 MB of a 19.6 MB tarball.
@@ -132,7 +136,7 @@ tempfile = "3"
 sha2 = "0.11"
 sobol = "1.0"
 # Native code for the ODE right-hand side (`parser/rhs_jit.rs`). Not a feature: every
-# consumer (`ferx-cli`, `ferx-tools`, ferx-r) depends on `ferx-core` with
+# consumer (`ferx-cli`, `ferx-tools`, `ferx-search`, ferx-r) depends on `ferx-core` with
 # `default-features = false`, so a default feature would be off exactly where it matters.
 # A host Cranelift cannot target falls back to the register code at runtime.
 # No default features: `timing` (pass timers nothing reads) is the one default we can

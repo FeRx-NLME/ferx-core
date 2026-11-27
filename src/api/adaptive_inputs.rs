@@ -154,7 +154,7 @@ impl<'a> AdaptiveInputs<'a> {
             return Ok(None);
         };
         if spec.n_draws == 0 {
-            return Err(super::entry_refusals::adaptive_options(
+            return Err(crate::entry_refusals::adaptive_options(
                 "`UncertaintySpec::n_draws` must be at least 1; omit `with_uncertainty` to \
                  simulate at the point estimate",
             ));
@@ -162,7 +162,7 @@ impl<'a> AdaptiveInputs<'a> {
         let template =
             crate::estimation::uncertainty_samples::fitted_params_from_result(fit, model)?;
         if let Some(what) = first_value_difference(self.params, &template) {
-            return Err(super::entry_refusals::adaptive_options(format!(
+            return Err(crate::entry_refusals::adaptive_options(format!(
                 "`with_uncertainty` draws around the fit's point estimate, but the run's \
                  parameters differ from it: {what}. Pass the fit's parameters (for example \
                  `fitted_params_from_result(&fit, &model)`) as the run's `params`"
@@ -176,7 +176,7 @@ impl<'a> AdaptiveInputs<'a> {
                 "Refit with `covariance_fallback = sir` and `sir_keep_samples = true` to draw \
                  from the SIR pool instead (#223)."
             };
-            return Err(super::entry_refusals::fit_input_missing(format!(
+            return Err(crate::entry_refusals::fit_input_missing(format!(
                 "Asymptotic uncertainty requires FitResult.covariance_matrix, and this fit has \
                  none (its covariance step did not run or did not succeed). {remedy}"
             )));
@@ -278,9 +278,11 @@ pub(crate) fn resolve_supplied_etas(
     if etas.names != model.eta_names {
         return Err(refusal(format!(
             "the supplied η are named [{}] but the model's are [{}]; supply every η of \
-             the model, in the model's order",
+             the model, in the model's order{}",
             etas.names.join(", "),
-            model.eta_names.join(", ")
+            model.eta_names.join(", "),
+            crate::types::dropped_zero_eta_note(model)
+                .map_or(String::new(), |n| format!(". Note: {n}"))
         )));
     }
     let resolved: Vec<Option<Vec<f64>>> =
@@ -493,5 +495,5 @@ pub(crate) fn list_ids(ids: &[&str]) -> String {
 }
 
 fn refusal(message: String) -> EngineError {
-    super::entry_refusals::supplied_etas(message)
+    crate::entry_refusals::supplied_etas(message)
 }

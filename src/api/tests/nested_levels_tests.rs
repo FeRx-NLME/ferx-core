@@ -286,7 +286,7 @@ fn a_record_without_a_level_label_is_refused() {
     pop.subjects[0].pk_only_covariates[0].remove("STUDY");
     let msg = code_in(&check_model_data(&m, &pop), "E_LEVEL_MISSING_LABEL").expect("refused");
     assert!(msg.contains("level `STUDY` reads column `STUDY`"), "{msg}");
-    assert!(msg.contains("non-observation (EVID=2 or MDV=1) record of subject `1`"), "{msg}");
+    assert!(msg.contains("EVID=2, MDV=1, missing-DV or endpoint (TTE, count or discrete-state) record of subject `1`"), "{msg}");
 }
 
 #[test]
@@ -386,7 +386,7 @@ fn a_single_study_per_subject_twins_the_study_kappa_with_the_subject_eta() {
 
 /// A θ level block whose levels each sit inside one arm or one study is no longer
 /// refused by the data check (#2034): the binder measures the kappas on their own
-/// levels' groups (`api::levels`' `nested_units` tests). Mutation — restore the
+/// levels' groups (`levels`' `nested_units` tests). Mutation — restore the
 /// refusal: the nested cells carry it.
 #[test]
 fn a_theta_block_nested_in_a_kappa_level_is_left_to_the_binder() {

@@ -209,7 +209,7 @@ pub(crate) fn check_cross_level_omega_iov(
         for j in 0..i {
             let (li, lj) = (levels.kappa_level[i], levels.kappa_level[j]);
             if li != lj && omega_iov[(i, j)] != 0.0 {
-                return Err(crate::api::param_shape(format!(
+                return Err(crate::entry_refusals::param_shape(format!(
                     "omega_iov[{i}, {j}] = {} correlates kappa `{}` at level `{}` with `{}` at \
                      level `{}`, but kappas at two levels are independent (a `block_kappa` lives \
                      at one level). Set the entry to 0.",

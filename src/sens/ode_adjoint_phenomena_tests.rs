@@ -14,7 +14,7 @@
 
 use super::tests::{
     censor, ebe_for, fd_oracle, hessian_gaps, hessian_gaps_for, laplace_prod, moved_params,
-    objective_gaps, oracle_jacobian, parity, subject, subject_shell, tight, with_tol,
+    objective_gaps, oracle_cells, oracle_jacobian, parity, subject, subject_shell, tight, with_tol,
 };
 use super::*;
 use crate::estimation::parameterization::pack_params;
@@ -4301,17 +4301,25 @@ fn clock_subject(m: &CompiledModel, inf: bool) -> Subject {
 /// pre-arrival `TAD` anchored at the previous cycle's pulse).
 #[test]
 fn ss_into_a_clock_reading_rhs_is_served_and_matches_fd() {
-    for (factor, lag, inf) in [
-        ("1 + 0.05 * TIME", false, false),
-        ("1 + 0.05 * T", true, false),
-        ("1 + 0.05 * TIME", true, false),
-        ("1 + 0.3 * exp(-0.5 * TAD)", true, false),
-        ("1 + 0.05 * TIME + 0.3 * exp(-0.5 * TAD)", true, false),
-        ("1 + 0.05 * TIME", false, true),
-        ("1 + 0.05 * TIME", true, true),
-        ("1 + 0.3 * exp(-0.5 * TAD)", true, true),
-        ("1 + 0.05 * TIME + 0.3 * exp(-0.5 * TAD)", true, true),
-    ] {
+    // All nine cells took ~130 s locally. Per PR: the lagged bolus and the lagged infusion on
+    // the combined `TIME + TAD` clock (the lagged seed's pre-arrival `TAD`, and the infusion
+    // cells where the flow-extension gap showed), plus the unlagged infusion (the quiet
+    // window's local `TIME`). The rest run under `slow-tests`.
+    let cells = oracle_cells(
+        vec![
+            ("1 + 0.05 * TIME", false, false),
+            ("1 + 0.05 * T", true, false),
+            ("1 + 0.05 * TIME", true, false),
+            ("1 + 0.3 * exp(-0.5 * TAD)", true, false),
+            ("1 + 0.05 * TIME + 0.3 * exp(-0.5 * TAD)", true, false),
+            ("1 + 0.05 * TIME", false, true),
+            ("1 + 0.05 * TIME", true, true),
+            ("1 + 0.3 * exp(-0.5 * TAD)", true, true),
+            ("1 + 0.05 * TIME + 0.3 * exp(-0.5 * TAD)", true, true),
+        ],
+        &[4, 5, 8],
+    );
+    for (factor, lag, inf) in cells {
         let label = format!("SS clock `{factor}` lag={lag} inf={inf}");
         let m = clock_model(factor, lag);
         let s = clock_subject(&m, inf);
@@ -5184,7 +5192,12 @@ const LAGGED_INFUSION_CASES: &[(&str, f64, f64, f64)] = &[
 /// lag.
 #[test]
 fn a_lagged_infusion_into_a_weibull_or_transit_kernel_matches_reconverged_fd() {
-    for &(kernel, shape, jac_bound, grad_bound) in LAGGED_INFUSION_CASES {
+    // ~57 s for all twelve cells locally. Per PR: β = 0.5 (no continuation at the onset), and
+    // β = 1.5 and n = 0.5, whose unanchored mutations are measured below; the rest under
+    // `slow-tests`.
+    for (kernel, shape, jac_bound, grad_bound) in
+        oracle_cells(LAGGED_INFUSION_CASES.to_vec(), &[0, 2, 4])
+    {
         for lag in ["alag", "route"] {
             let label = format!("infusion, {kernel} {shape} {lag}");
             let m = tight(parse_model_string(&lagged_kernel_model(kernel, shape, lag)).unwrap());
@@ -5303,11 +5316,17 @@ fn ss_only_subject(m: &CompiledModel, inf: bool) -> Subject {
 /// each cycle after the lagged arrival), as `dosing::tad_referent` does for the value.
 #[test]
 fn a_lagged_ss_dose_re_anchors_tad_at_every_later_cycle() {
-    for (factor, inf) in [
-        ("1 + 0.3 * exp(-0.5 * TAD)", false),
-        ("1 + 0.3 * exp(-0.5 * TAD)", true),
-        ("1 + 0.01 * TIME + 0.3 * exp(-0.5 * TAD)", false),
-    ] {
+    // ~77 s for the three cells locally; the plain-`TAD` bolus is contained in the combined
+    // clock's bolus, so it runs under `slow-tests` only.
+    let cells = oracle_cells(
+        vec![
+            ("1 + 0.3 * exp(-0.5 * TAD)", false),
+            ("1 + 0.3 * exp(-0.5 * TAD)", true),
+            ("1 + 0.01 * TIME + 0.3 * exp(-0.5 * TAD)", false),
+        ],
+        &[1, 2],
+    );
+    for (factor, inf) in cells {
         let label = format!("SS-only TAD `{factor}` inf={inf}");
         let m = clock_model(factor, true);
         let s = ss_only_subject(&m, inf);

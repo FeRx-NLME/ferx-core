@@ -401,8 +401,10 @@ fn a_feasible_fit_is_untouched() {
          which would mean the fix damaged a run it has no business touching; got {}",
         result.ofv
     );
-    assert_eq!(
-        result.n_iterations, 20,
+    // L-BFGS checks `maxeval` only between line searches, so a run can end a few evaluations
+    // past it (20 measured on macOS arm64, 21 on Linux x86_64 since #3153).
+    assert!(
+        (20..=22).contains(&result.n_iterations),
         "this test is the *bounded* control: it must stop on its 4·(n+1) = 20-evaluation \
          budget rather than run to convergence, which is `a_healthy_fit_still_converges_to_\
          its_optimum`'s job behind the `slow-tests` gate. It made {} evaluations.",

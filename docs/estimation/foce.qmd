@@ -62,6 +62,15 @@ A warm start is often close to the mode of the previous outer evaluation, a few 
 - **A short step still teaches curvature.** BFGS updates its metric from each accepted step's pair $(s, y)$ when $s^\top y > 10^{-12}$, *or* when $s^\top y > 10^{-8}\lVert s\rVert\lVert y\rVert$. Near the mode $s^\top y \approx \lambda\lVert s\rVert^2$ is tiny for every step, so the absolute test alone stopped updating the metric, and the search zigzagged to `inner_maxiter`. On `examples/warfarin` the inner objective evaluations fell from 143,927 to 18,424 with both rules, and the BFGS failures from 63 to 2. With every IOV warm start at the previous mode (η̂, κ̂), as #2271 makes it, `nested_levels_3` had 24 such failures and went from 100,960 to 16,879 evaluations. An ODE objective keeps the absolute test only: there a short step's $y$ is the solver's noise, which the relative test would admit as curvature.
 - **On an exact objective, the gradient verifies a step the objective cannot resolve.** When a step's predicted gain is below $10^{-11}(1+|f|)$, the same verification as at an ODE's noise floor runs first: the full step is taken when it keeps the objective within that resolution and at least halves the gradient norm. Otherwise the line search runs as before. This only accepts steps. The solve still counts as converged only at $\lVert\nabla_\eta\rVert < \texttt{inner\_tol}$.
 
+#### A kink in the individual objective {#inner-loop-kinks}
+
+A prediction clipped at a threshold (`y = if (x - TH < 0) 0 else x - TH`) puts a kink in a subject's individual objective wherever a record crosses it, and the inner search can go wrong there in two ways (#3159).
+
+- **A stall on a kink's valley floor.** BFGS arrives on the kink, where the gradient is large and points across the valley, and every step along the valley gains less than the objective-stall stop treats as flat. The stop certifies that point at $\lVert\nabla\rVert \approx 10$, up to 0.175 above the minimum of the individual objective, with nothing flagged. A large gradient is not what is wrong: the *minimum* of such an objective is itself a kink minimum, also certified at a large gradient. So with `[fit_options] inner_kick = true`, when the stall stop fires at $\lVert\nabla\rVert \ge 1$ (the noise floor of a smooth ODE objective is at most about $6 \times 10^{-3}$), the gradients at the point and at $\pm 10^{-5}$ along each axis are taken, and their convex hull is asked whether it contains zero (gradient sampling, Burke–Lewis–Overton). If it does, the point is a minimum and is certified as before. If not, the hull's minimum-norm element is a descent direction along the valley; the search steps along it and restarts. It is opt-in because a smooth ODE objective can reach it too: in a one-η flip-flop transit fit the stall stop fired at $\lVert\nabla\rVert$ up to 27 and the escape moved 55 of 390 solves by up to 0.75. Each move was a real descent, but they came and went between outer evaluations, so BOBYQA could not settle.
+- **A second mode a barrier away.** A record that crosses the threshold between two points makes a second local minimum close to the first (0.011 away in the fixture) that no descent from the incumbent reaches. With `[fit_options] inner_kick = true`, every inner solve kicks each informative coordinate (at most 16, widest prior first) by $\pm 0.25$ prior standard deviations and keeps a descent of at most 12 iterations from each when it ends lower by more than $10^{-9}$. A subject with one mode ends where it started. The search's solves kick too: kicked in the final pass only, a fit's final EBE check (#833) compared the kicked EBE with the search's unkicked one by OFV, where the unkicked one scores lower (the log-determinant jumps at the kink), and reported it. **Off by default**: the kicks run whether or not the model has a kink, and cost 2-20× on four fast ODE examples without one (`mm_iv`, `one_cpt_iv_ode`, `emax_pkpd`, `mm_oral`) — turn it on for a model with a clipped or thresholded prediction.
+
+On the fixture of #3159 (40 subjects, one subject objective each), 4 subjects ended 0.175, 0.165, 0.055 and 0.032 above the minimum; with both, none does. Fitted (6 subjects of it, `tests/fixtures/clipped_decay`), the default stays on its initial estimates at OFV −4826.2194; with `inner_kick = true` it converges at −4844.3147, the point a restart from a perturbation also reaches. The OFV of a fit that has an EBE on a kink also depends on which side of the kink it lands: the FOCE log-determinant jumps there, so the individual objective, not the OFV, is the quantity that is minimised.
+
 #### Where the residual variance is taken {#inner-loop-residual-variance}
 
 Under **FOCEI** (and Laplace/AGQ) $V_{ij} = V(f_{ij}(\eta_i))$, the variance at the
@@ -165,7 +174,7 @@ Because the gradient at the reported estimates is then exact for every subject s
 
 The count is **recorded as the fit runs**, from the gradient evaluations that actually happened — not predicted by probing the provider at some chosen parameter point. That distinction is load-bearing, because a decline is not purely a property of the subject's records: the separability check on modeled infusion windows reads the *resolved* durations and lag times, so a subject can decline at `η = 0` and be served at its EBE. A probe would announce a fallback that never occurred.
 
-Recording also means the warning is self-gating. A derivative-free BOBYQA fit (including a `[mixture]` model left on `optimizer = auto`, which resolves to BOBYQA), a Gauss-Newton or trust-region fit, a `reconverge_gradient_interval = 1` fit that forces the reconverged gradient on every evaluation, and an `outer_maxiter = 0` evaluation-only run never select the analytic branch for the optimizer, so they have nothing to record and say nothing. The one outer gradient most of them do evaluate — the flat-θ pre-flight check at the start estimates — keeps its own record, which is discarded. Conversely, any recorded decline is by construction a mismatch with the model-level label — including when *every* subject declines, which is the case that label gets most wrong.
+Recording also means the warning is self-gating. A derivative-free BOBYQA fit (including a `[mixture]` model on `optimizer = auto` without an analytic outer gradient, which resolves to BOBYQA as a single population does), a Gauss-Newton or trust-region fit, a `reconverge_gradient_interval = 1` fit that forces the reconverged gradient on every evaluation, and an `outer_maxiter = 0` evaluation-only run never select the analytic branch for the optimizer, so they have nothing to record and say nothing. The one outer gradient most of them do evaluate — the flat-θ pre-flight check at the start estimates — keeps its own record, which is discarded. Conversely, any recorded decline is by construction a mismatch with the model-level label — including when *every* subject declines, which is the case that label gets most wrong.
 
 #### Declines at a non-positive-definite inner Hessian {#declines-at-a-non-pd-inner-hessian}
 
@@ -309,6 +318,26 @@ Measured on an 8-state neutropenia model with an `if` in `[odes]`, 5112 subjects
 
 The spread that remains is the fit's own tolerance acting on predictions and on which EBE mode a subject lands in. It is not specific to the FD route. A state far below `ode_abstol`, as in `log(state + c)` at its floor, has no usable derivative on any route.
 
+### The FD gradient of the EBE search {#fd-ebe-gradient}
+
+The EBE search takes an exact gradient of the inner objective wherever the recorders serve the subject. Under `gradient = fd`, or for a subject they decline, it takes a central difference. An adaptive integrator does not solve two nearby points with the same step sequence, so their values differ by up to about `ode_reltol` for reasons unrelated to $\eta$. A step of `1e-7` reads that jump as slope, and the search stops short of the mode wherever the jump is larger than the true slope.
+
+So on a model with an integrator, the search differences with a step of `1e-3` per unit of $1 + |\eta|$ at the default `ode_reltol = 1e-4`, the step the [FD Jacobian](#fd-jacobian-tolerance) uses. At a tighter tolerance the step shrinks as `ode_reltol^(1/3)`: truncation error grows as the square of the step and integration noise as its inverse, so the best step follows the cube root of the noise. At a looser tolerance the step stays at `1e-3`; that direction has not been measured on a fit. A model on the exact matrix-exponential path (`ode_method = linear`, or `auto` on an affine `[odes]` block) keeps a step of `1e-7`, because its solve has no step sequence to jump between. A closed form keeps it too, except where a transit or inverse-Gaussian absorption subject is solved on its ODE twin. That solve integrates, so it takes the integrating step; no measurement above covers that case. An IOV search with μ-referencing scales the step by $|\eta|$, not by the μ-shifted coordinate it searches over.
+
+The integrating step assumes an integration error of about `ode_reltol`. Where a solve behind the difference stops at its step budget (`ode_max_steps`) before the end of a segment, that does not hold, and the gradient at that point uses the `1e-7` step ([#3145](https://github.com/FeRx-NLME/ferx-core/issues/3145)). This is reached mostly on outer line-search trials the EBE guard goes on to reject, including in fits whose inner gradient is otherwise exact.
+
+Measured on the full-TMDD model of [#2845](https://github.com/FeRx-NLME/ferx-core/issues/2845), 30 subjects, FOCEI, `maxiter = 0`, at 25 values of `TVKON` from 1.300 to 1.348, macOS arm64 ([#2868](https://github.com/FeRx-NLME/ferx-core/issues/2868)). Each cell is the worst distance from the analytic route's objective at the same settings:
+
+| `ode_method`, `ode_reltol` / `ode_abstol` | step `1e-7` (before) | integrating step (now) |
+|---|---|---|
+| `rodas4`, `1e-4` / `1e-6` (default) | 2.0 | 0.0059 |
+| `rodas4`, `1e-5` / `1e-8` | 0.57 | 0.0011 |
+| `rodas4`, `1e-6` / `1e-9` | 0.0007 | 0.0007 |
+| `rk45`, `1e-4` / `1e-6` | 109.3 | 0.125 |
+| `auto`, `1e-4` / `1e-6` | 19.9 | 0.0093 |
+
+Where the search stalls it also costs more, because it keeps iterating on noise: under `rk45` the 25 points took 54 s against 68 s, and the other rows took the same wall. On `examples/warfarin_sde` (macOS arm64, every θ scaled by 0.90 to 1.10) the step makes no difference: seven starts at the default tolerance and six at `1e-6` / `1e-8` ending at the same OFV in a median 0.998 and 1.001 of the old wall.
+
 ### Moving boundaries and one-sided derivatives {#moving-boundaries}
 
 A moving boundary — a lagged dose arrival, the rate-on of a lagged infusion, an infusion or zero-order window end — is **not a data record**, so it supplies no parameters of its own: it subdivides the interval that the next record terminates, and every piece of that interval runs on that record's snapshot (#1073). A boundary falling *strictly inside* a record interval therefore has the same covariate snapshot on both sides, and the covariate field jump that used to be injected there is simply absent. Any forcing that straddles the instant — another dose's infusion, a zero-order window, a built-in `R_in` — is still carried in both velocities, so the rate and mass jumps stay exact.
@@ -399,7 +428,7 @@ A larger `reconverge_gradient_interval` trades that accuracy back for speed: rec
 
 #### The step of a small θ {#small-theta-fd-step}
 
-A small identity-packed θ (declared at $0 < |\theta_0| < 1$) is stepped relative to $|\theta_0|$ ([#2187](https://github.com/FeRx-NLME/ferx-core/issues/2187)). That is the right step when the objective's sensitivity scales as $1/\theta_0$, e.g. a volume written `TVV/k`. It is the wrong step when the sensitivity is O(1), e.g. a covariate exponent declared near 0: the probes move too little for their re-solves to follow, so they stop inside the inner tolerance and the difference is that of a part-reconverged objective. Which case a coordinate is in cannot be read off the model, so ferx measures it ([#2406](https://github.com/FeRx-NLME/ferx-core/issues/2406)). It re-solves that coordinate's probes a second time, at a hundredth of the tolerance, and keeps the step only when the two differences agree to $10^{-5}$ relative and the difference's numerator clears about $\sqrt{\varepsilon}\,|f|$. That is the noise floor of a re-solved objective: the inner solve resolves η only to about $\sqrt{\varepsilon}$, while the marginal's $\log\det H$ term reads that η error at first order. Below it a re-solve can stop where the first one did, and the two differences agree because neither measured anything. Otherwise the step grows ×10, at most to the step a θ declared at 1 takes, and the tighter difference is used. Growth stops early once the tighter difference moves, from one step to the next, by more than a hundred times the two steps' disagreements between the two tolerances. Such a move is the larger step's own truncation error, not resolution, so the smaller step's difference is kept. A re-solve that falls back to Nelder–Mead or does not converge counts as a disagreement. When that happens at every step, nothing was measured, and the first step's difference is kept. A step whose probe goes missing, e.g. one through `V ≤ 0`, keeps what the smaller steps measured. On the first 8 subjects of `data/two_cpt_oral_cov.csv`, with an exponent `BETA` on CRCL added to `examples/two_cpt_oral_cov.ferx` and declared at $10^{-4}$, the reconverged gradient's relative error in `BETA` falls from $2.8 \times 10^{-3}$ to $5.8 \times 10^{-9}$, at 20 re-solves of the population instead of 2. A `TVV/k` volume is accepted at its first step. At its stationary point (the estimate), its gradient is too small for either test to pass, and growth stops on the truncation test at the second step. It keeps the first step's difference, as close to the exact gradient as the ungated step. Without that stop the step grew until truncation made the difference pass: 2550× worse on a scaled-volume fixture. Every other coordinate is stepped exactly as before. The covariance step's finite-difference R-matrix runs the same test on each such θ's diagonal entry, re-solving at a hundredth of `cov_inner_tol`, and takes the pairs that θ enters at the grown step. On the same model at its estimate with `BETA` declared at $10^{-4}$, the finite-difference SE(`BETA`) is $4 \times 10^{-5}$ relative from the analytic R-matrix's, where it was 96% off.
+A small identity-packed θ (declared at $0 < |\theta_0| < 1$) is stepped relative to $|\theta_0|$ ([#2187](https://github.com/FeRx-NLME/ferx-core/issues/2187)). That is the right step when the objective's sensitivity scales as $1/\theta_0$, e.g. a volume written `TVV/k`. It is the wrong step when the sensitivity is O(1), e.g. a covariate exponent declared near 0: the probes move too little for their re-solves to follow, so they stop inside the inner tolerance and the difference is that of a part-reconverged objective. Which case a coordinate is in cannot be read off the model, so ferx measures it ([#2406](https://github.com/FeRx-NLME/ferx-core/issues/2406)). It re-solves that coordinate's probes a second time, at a hundredth of the tolerance, and keeps the step only when the two differences agree to $10^{-5}$ relative and the difference's numerator clears about $\sqrt{\varepsilon}\,|f|$. That is the noise floor of a re-solved objective: the inner solve resolves η only to about $\sqrt{\varepsilon}$, while the marginal's $\log\det H$ term reads that η error at first order. Below it a re-solve can stop where the first one did, and the two differences agree because neither measured anything. Otherwise the step grows ×10, at most to the step a θ declared at 1 takes, and the tighter difference is used. Growth stops early once the tighter difference moves, from one step to the next, by more than a hundred times the two steps' disagreements between the two tolerances. Such a move is the larger step's own truncation error, not resolution, so the smaller step's difference is kept. A re-solve that falls back to Nelder–Mead or does not converge counts as a disagreement. When that happens at every step, nothing was measured, and the first step's difference is kept. A step whose probe goes missing, e.g. one through `V ≤ 0`, keeps what the smaller steps measured. On the first 8 subjects of `data/two_cpt_oral_cov.csv`, with an exponent `BETA` on CRCL added to `examples/two_cpt_oral_cov.ferx` and declared at $10^{-4}$, the reconverged gradient's relative error in `BETA` falls from $2.8 \times 10^{-3}$ to $5.8 \times 10^{-9}$, at 20 re-solves of the population instead of 2. A `TVV/k` volume is accepted at its first step. At its stationary point (the estimate), its gradient is too small for either test to pass, and growth stops on the truncation test at the second step. It keeps the first step's difference, as close to the exact gradient as the ungated step. Without that stop the step grew until truncation made the difference pass: 2550× worse on a scaled-volume fixture. Every other coordinate is stepped exactly as before. The covariance step's finite-difference R-matrix runs the same test on each such θ's diagonal entry, re-solving at a hundredth of `cov_inner_tol`, and takes the pairs that θ enters at the grown step. On the same model at its estimate with `BETA` declared at $10^{-4}$, the finite-difference SE(`BETA`) is $4 \times 10^{-5}$ relative from the analytic R-matrix's, where it was 96% off. Since [#2678](https://github.com/FeRx-NLME/ferx-core/issues/2678) the same gate also serves the reconverged finite-difference score of an AGQ or Laplace subject the adjoint declines, and the profiled covariance step's structural stencils, the population's and a declined subject's own. The level blocks' θ steps (`Bᵢ`) are not gated yet. An AGQ or Laplace subject's score is declined, as before, only when a probe at the coordinate's first step goes missing: one that goes missing at a larger step keeps what the smaller steps measured.
 
 ## FOCE vs FOCEI
 
@@ -628,7 +657,7 @@ Before #2974 the score held each subject's EBEs and their linearisation at the e
 
 #### NONMEM cross-check at a common point (S, R, RSR)
 
-`S` contains no `R`, so it is the like-for-like comparison with NONMEM's `MATRIX=S`: both engines are evaluated at one fixed point, NONMEM 7.6's own MLE printed to six significant figures (`$ESTIMATION MAXEVAL=0`; ferx `outer_maxiter = 0`), and both re-estimate the EBEs there. Control streams are `nonmem_anchor/wf_{focei,foce,iov}_*.ctl` and their outputs `nonmem_anchor/results/wf_{focei,foce,iov}_*.{ext,lst}`, guarded by `tests/covariance_s_nonmem_eval_anchor.rs`. Worst relative SE gap over θ, Ω (and the IOV variance):
+`S` contains no `R`, so it is the like-for-like comparison with NONMEM's `MATRIX=S`: both engines are evaluated at one fixed point, NONMEM 7.6's own MLE printed to six significant figures (`$ESTIMATION MAXEVAL=0`; ferx `outer_maxiter = 0`), and both re-estimate the EBEs there. Control streams are `nonmem_anchor/wf_{focei,foce,iov}_*.ctl` and their outputs `nonmem_anchor/results/wf_{focei,foce,iov}_*.{ext,nm.json}`, guarded by `tests/covariance_s_nonmem_eval_anchor.rs`. Worst relative SE gap over θ, Ω (and the IOV variance):
 
 | Model | `s` vs `MATRIX=S` | `s` before #2974 | `r` vs `MATRIX=R` | `rsr` vs default `$COV` |
 |---|---|---|---|---|
@@ -776,7 +805,8 @@ When they do not, the optimizer is **restarted once from the best point it reach
 ([#1277](https://github.com/FeRx-NLME/ferx-core/issues/1277)), on whatever is left of the
 fit's `maxiter` budget. It usually costs nothing in the sense that matters: the restart is
 adopted only if it ends at a **strictly lower** objective, so it can never make a reported
-fit worse. On the two-compartment deep-compartment model in
+fit worse. The one tie it wins is a restart that
+[the check below](#restart-at-its-own-start) verified as an optimum. On the two-compartment deep-compartment model in
 `tests/fixtures/two_cpt_dcm_regularized.ferx`, started without an `init` line, L-BFGS quit
 at evaluation 12 with the trace
 still falling ~2600 OFV per evaluation; the restart ran to convergence 3886 OFV units lower
@@ -1201,9 +1231,9 @@ and a gap ends the leg for the restart. Before, a trapped leg ran until NLopt it
 On a 10-subject subset of the Michaelis–Menten benchmark below (`tests/ebe_basin_shift.rs`)
 the probe stops the trapped first leg at its 33rd evaluation, where a cold solve scores
 68.08, and the restart converges at 63.29. A leg the probe clears runs on unchanged, at the
-cost of one cold inner pass per probe. On `examples/warfarin_dcm.ferx` (Linux) the probe
-catches a trapped first leg at its 64th evaluation instead of the 96th, and the restart
-converges at −1173.56 either way (#2204).
+cost of one cold inner pass per probe. On `examples/warfarin_dcm.ferx` as it was before it declared `init`
+(Linux), the probe caught a trapped first leg at its 64th evaluation instead of the 96th, and
+the restart converged at −1173.56 either way (#2204).
 
 A probe ends the leg only when the gap comes from at least **1 % of the subjects** (#2600).
 On a large population a handful of subjects almost always sits in a lower cold mode: a
@@ -1223,6 +1253,41 @@ mode. The restart reaches 775.39 with different estimates (TVVMAX 1.261 → 1.19
 search gets enough starts (`MCETA=200`), a gap of 8.935 against ferx's 8.938. Without
 `MCETA`, NONMEM's cold η search puts one subject in the higher mode at the optimum. Its own
 estimation from these starting values stops with rounding errors at 814.84.
+
+#### A restart that does not leave its own start {#restart-at-its-own-start}
+
+A restart, for a basin shift or a [mid-descent stall](#stopping-without-converging), starts at
+the previous leg's estimates. A basin-shift restart's gain is mostly the EBE modes the cold
+solve found, not a step in θ, so it often ends closer to its own start than the escape step of
+0.01 in the optimizer's scaled space. The plateau rule and the
+verified-stop rule both require that step of a stop NLopt reported as a bare `Failure`, to
+tell a fit that descended from one that twitched and died at its start (#751). Before
+[#2707](https://github.com/FeRx-NLME/ferx-core/issues/2707), that alone made such a restart
+`converged: false`, however sound its stop: flat tail, a cold solve that reproduces the best
+objective seen, no subject off its modes.
+
+Now a restart rejected on that one ground is asked the question a
+[warm start at an optimum](optimizers.qmd#warm-start-at-an-optimum) is asked: the optimizer is
+restarted from a perturbation of the restart's point, and if it comes back to within 0.01 OFV,
+the point is reported converged. On a multimodal inner problem that perturbed run can trap in
+a higher mode as the fit did, so it runs the same restart chain before its answer is read.
+Only the fit's own restarts are announced in `FitResult.warnings`, not the perturbed run's.
+
+The check costs nothing on a restart that converged on its own terms, or that was rejected
+for any other reason. When the perturbed run instead ends more than 0.01 below the restart,
+the restart was not finished, and the perturbed run's result is reported, with its own
+`converged` verdict. That is not done on the first attempt, whose stall at the user's
+initial estimates stays flagged; a restart's start is not the user's. When it reaches no
+verdict, the restart is reported `converged: false` as before. The perturbed run spends what
+is left of the fit's `maxiter` budget; when it runs out, the fit reports the budget spent
+(`eval_budget_spent`) and the advice to increase `maxiter`. Either way the restart's
+notice in `FitResult.warnings` says which run the reported estimates come from.
+
+On a simulated population of 80 subjects, 24 of them flip-flop
+(`tests/fixtures/flip_flop_pop/`, fitted in closed form and as an ODE), both fits end at the
+optimum, OFV −3392.235417, and are now reported converged. The closed form stops through the
+verified-stop rule and the ODE twin through the plateau rule. The check costs about 85–95 more
+objective evaluations (73 → 156 and 112 → 208), about twice each fit's run time (Linux).
 
 ## Configuration Example
 

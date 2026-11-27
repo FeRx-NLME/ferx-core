@@ -1,5 +1,5 @@
 //! Tier-1 tests for #1774: the predict / simulate / adaptive refusals `ferx check` cannot
-//! reach carry a code, one per cause, assigned in `api/entry_refusals.rs`.
+//! reach carry a code, one per cause, assigned in `entry_refusals.rs`.
 //!
 //! One row per refusal **text**, through the public entry point that raises it. Each row
 //! asserts three things, and each has its own mutation:

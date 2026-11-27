@@ -58,7 +58,7 @@ of the parameter vector over the final `imp_averaging` iterations, and `ofv` is
 a final FOCE Laplace pass for AIC/BIC comparability.
 
 > **Which number matches NONMEM's reported OFV?** NONMEM `METHOD=IMP` reports the
-> importance-sampling Monte-Carlo **marginal** `−2 log L` (the `.ext`/`.lst`
+> importance-sampling Monte-Carlo **marginal** `−2 log L` (the `.ext`/listing
 > `#OBJV`), *not* a Laplace value. ferx's `ofv` is a Laplace pass, so it will
 > **not** equal NONMEM's IMP `#OBJV` on data where the Laplace approximation and
 > the true marginal diverge (sparse / strongly nonlinear). The NONMEM-comparable

@@ -578,12 +578,19 @@ fn a2_a_profiled_bobyqa_fit_is_converged_only_on_nonmems_optimum() {
 /// unprofiled alike (Linux aarch64, `main` at `35a417ff`; 51 still landed). NONMEM reaches
 /// its optimum from TVE0 = 55 (`nonmem_anchor/profile_mbma_tve0_55.ctl`, pinned here too). The
 /// floor escape probes TVE0 just above the floor, finds the objective lower, and restarts
-/// with TVE0 at its start. Each fit must name that restart in its warnings, so a fixture
+/// with TVE0 at its start. Each profiled fit must name that restart in its warnings, so a fixture
 /// that stopped reaching the floor fails here rather than passing without testing it.
 ///
 /// Realised (Linux aarch64): profiled from (55, 8, 2) Δ 2.7e-8 and from (52, 8, 2) 4.1e-8,
 /// inside [`A2_FIT_OFV`]; all 16 TVE0 = 55 starts of #2339's grid land within 4.2e-8. The
 /// unprofiled restart is held to [`A2_UNPROFILED_RESTART_OFV`] instead: see there.
+///
+/// Since #3153 the unprofiled fit never reaches the floor: its first L-BFGS leg minimises
+/// `f / c` with `∇f / c`, so the first line search no longer steps TVE0 onto it. From every
+/// start of a 36-start grid (TVE0 52 to 100 × EMAX/EC50 (8, 2), (6, 2), (12, 2), (8, 3.2))
+/// it converges 2.7e-7 to 3.2e-7 above NONMEM with no restart (Linux x86_64, and the same
+/// on CI's x86_64 from (55, 8, 2)). So the unprofiled row asserts the opposite: no floor
+/// escape, on the optimum. The profiled rows still floor and still need the escape.
 #[test]
 #[cfg_attr(
     any(not(feature = "slow-tests"), feature = "nn"),
@@ -602,10 +609,10 @@ fn a2_a_start_that_floors_tve0_reaches_nonmems_optimum() {
         "nonmem_anchor/profile_mbma.csv",
         Some("](0.0, -50.0, 50.0)"),
     );
-    for (label, p, start, band) in [
-        ("profiled", &prof, [55.0, 8.0, 2.0], A2_FIT_OFV),
-        ("profiled", &prof, [52.0, 8.0, 2.0], A2_FIT_OFV),
-        ("unprofiled", &plain, [55.0, 8.0, 2.0], A2_UNPROFILED_RESTART_OFV),
+    for (label, p, start, band, floors) in [
+        ("profiled", &prof, [55.0, 8.0, 2.0], A2_FIT_OFV, true),
+        ("profiled", &prof, [52.0, 8.0, 2.0], A2_FIT_OFV, true),
+        ("unprofiled", &plain, [55.0, 8.0, 2.0], A2_UNPROFILED_RESTART_OFV, false),
     ] {
         let mut params = p.init_params.clone();
         params.theta[..3].copy_from_slice(&start);
@@ -618,10 +625,11 @@ fn a2_a_start_that_floors_tve0_reaches_nonmems_optimum() {
             f.theta[0],
             f.n_iterations
         );
-        assert!(
+        assert_eq!(
             f.warnings.iter().any(|w| w.contains("log-packing floor")
                 && w.contains("resumed from the best point seen")),
-            "{label} {start:?}: the floor escape did not run: {:?}",
+            floors,
+            "{label} {start:?}: the floor escape ran ≠ {floors}: {:?}",
             f.warnings
         );
         assert!(f.converged && f.ofv.is_finite(), "{label} {start:?}: {:?}", f.warnings);

@@ -1,0 +1,140 @@
+{
+ "nonmem_version": "7.6.0",
+ "data_file": "mbma_nokappa.csv",
+ "data_records": 88,
+ "observations": 88,
+ "individuals": 6,
+ "nmtran_warnings": [2],
+ "markers": [
+  "MINIMIZATION SUCCESSFUL"
+ ],
+ "steps": [
+  {
+   "method": "First Order Conditional Estimation with Interaction",
+   "objv": 165.826,
+   "objv_without_constant": 165.82602320808007,
+   "objv_with_constant": 327.55920505210247,
+   "function_evaluations": 956,
+   "significant_digits": 3.1,
+   "etabar": [
+    [0.0029658]
+   ],
+   "etabar_se": [
+    [0.92151]
+   ],
+   "p_val": [
+    [0.99743]
+   ],
+   "etashrinksd": [
+    [0.49321]
+   ],
+   "etashrinkvr": [
+    [0.98399]
+   ],
+   "ebvshrinksd": [
+    [0.4847]
+   ],
+   "ebvshrinkvr": [
+    [0.96704]
+   ],
+   "relativeinf": [
+    [99.033]
+   ],
+   "epsshrinksd": [
+    [1e-10]
+   ],
+   "epsshrinkvr": [
+    [1e-10]
+   ],
+   "final": {
+    "theta": [48.8, 13.5, 31.4, 3.53, 2.42, 0.464, -0.403, 1.49, -0.851, -0.374, 4.28, 0.236, -2.03, 2.99, -0.38, -0.366, 2.14, 0.753, -1.3, -0.325, 0.49, -0.151],
+    "omega": {
+     "ETA1": [5.15]
+    },
+    "sigma": {
+     "EPS1": [1.0]
+    }
+   },
+   "standard_error": {
+    "theta": [0.939, 1.74, 5.29, 1.16, 0.396, 0.436, 0.383, 0.437, 0.488, 0.476, 0.493, 0.476, 0.474, 0.387, 0.374, 0.369, 0.316, 0.341, 0.306, 0.402, 0.402, 0.38],
+    "omega": {
+     "ETA1": [3.0]
+    },
+    "sigma": {
+     "EPS1": [null]
+    }
+   },
+   "eigenvalues": [0.0367, 0.218, 0.273, 0.292, 0.306, 0.314, 0.32, 0.767, 0.925, 0.985, 1.01, 1.02, 1.07, 1.12, 1.16, 1.22, 1.25, 1.26, 1.28, 1.29, 1.37, 2.03, 3.49],
+   "markers": [
+    "MINIMIZATION SUCCESSFUL"
+   ]
+  }
+ ],
+ "control_stream_as_run": [
+  "$PROBLEM ferx #1890 level SE anchor, variant a (last visit dependent)",
+  "$INPUT ID STUDY OCC TIME DV MDV NARM SE DOSE",
+  "$DATA mbma_nokappa.csv IGNORE=@",
+  "$PRED",
+  " TVE0 = THETA(1)",
+  " EMAX = THETA(2)",
+  " ED50 = THETA(3)",
+  " ET50 = THETA(4)",
+  " PLA = 0",
+  " IF (STUDY.EQ.1.AND.TIME.EQ.0) PLA = THETA(5)",
+  " IF (STUDY.EQ.1.AND.TIME.EQ.2) PLA = THETA(6)",
+  " IF (STUDY.EQ.1.AND.TIME.EQ.8) PLA = THETA(7)",
+  " IF (STUDY.EQ.1.AND.TIME.EQ.12) PLA = -(THETA(5)+THETA(6)+THETA(7))",
+  " IF (STUDY.EQ.2.AND.TIME.EQ.0) PLA = THETA(8)",
+  " IF (STUDY.EQ.2.AND.TIME.EQ.2) PLA = THETA(9)",
+  " IF (STUDY.EQ.2.AND.TIME.EQ.8) PLA = THETA(10)",
+  " IF (STUDY.EQ.2.AND.TIME.EQ.12) PLA = -(THETA(8)+THETA(9)+THETA(10))",
+  " IF (STUDY.EQ.3.AND.TIME.EQ.0) PLA = THETA(11)",
+  " IF (STUDY.EQ.3.AND.TIME.EQ.2) PLA = THETA(12)",
+  " IF (STUDY.EQ.3.AND.TIME.EQ.4) PLA = THETA(13)",
+  " IF (STUDY.EQ.3.AND.TIME.EQ.12) PLA = -(THETA(11)+THETA(12)+THETA(13))",
+  " IF (STUDY.EQ.4.AND.TIME.EQ.0) PLA = THETA(14)",
+  " IF (STUDY.EQ.4.AND.TIME.EQ.4) PLA = THETA(15)",
+  " IF (STUDY.EQ.4.AND.TIME.EQ.8) PLA = THETA(16)",
+  " IF (STUDY.EQ.4.AND.TIME.EQ.12) PLA = -(THETA(14)+THETA(15)+THETA(16))",
+  " IF (STUDY.EQ.5.AND.TIME.EQ.0) PLA = THETA(17)",
+  " IF (STUDY.EQ.5.AND.TIME.EQ.2) PLA = THETA(18)",
+  " IF (STUDY.EQ.5.AND.TIME.EQ.4) PLA = THETA(19)",
+  " IF (STUDY.EQ.5.AND.TIME.EQ.12) PLA = -(THETA(17)+THETA(18)+THETA(19))",
+  " IF (STUDY.EQ.6.AND.TIME.EQ.0) PLA = THETA(20)",
+  " IF (STUDY.EQ.6.AND.TIME.EQ.2) PLA = THETA(21)",
+  " IF (STUDY.EQ.6.AND.TIME.EQ.4) PLA = THETA(22)",
+  " IF (STUDY.EQ.6.AND.TIME.EQ.8) PLA = -(THETA(20)+THETA(21)+THETA(22))",
+  " BASE = TVE0 + PLA + ETA(1)",
+  " DRUG = EMAX * DOSE / (ED50 + DOSE) * TIME / (TIME + ET50)",
+  " IPRED = BASE - DRUG",
+  " Y = IPRED + SE * EPS(1)",
+  "$THETA",
+  " (0, 45, 200)     ; TVE0",
+  " (0, 8, 100)      ; EMAX",
+  " (0.1, 20, 1000)  ; ED50",
+  " (0.01, 2, 100)   ; ET50",
+  " (-50, 0.1, 50) ; PLACEBO[STUDY=1,TIME=0]",
+  " (-50, 0.1, 50) ; PLACEBO[STUDY=1,TIME=2]",
+  " (-50, 0.1, 50) ; PLACEBO[STUDY=1,TIME=8]",
+  " (-50, 0.1, 50) ; PLACEBO[STUDY=2,TIME=0]",
+  " (-50, 0.1, 50) ; PLACEBO[STUDY=2,TIME=2]",
+  " (-50, 0.1, 50) ; PLACEBO[STUDY=2,TIME=8]",
+  " (-50, 0.1, 50) ; PLACEBO[STUDY=3,TIME=0]",
+  " (-50, 0.1, 50) ; PLACEBO[STUDY=3,TIME=2]",
+  " (-50, 0.1, 50) ; PLACEBO[STUDY=3,TIME=4]",
+  " (-50, 0.1, 50) ; PLACEBO[STUDY=4,TIME=0]",
+  " (-50, 0.1, 50) ; PLACEBO[STUDY=4,TIME=4]",
+  " (-50, 0.1, 50) ; PLACEBO[STUDY=4,TIME=8]",
+  " (-50, 0.1, 50) ; PLACEBO[STUDY=5,TIME=0]",
+  " (-50, 0.1, 50) ; PLACEBO[STUDY=5,TIME=2]",
+  " (-50, 0.1, 50) ; PLACEBO[STUDY=5,TIME=4]",
+  " (-50, 0.1, 50) ; PLACEBO[STUDY=6,TIME=0]",
+  " (-50, 0.1, 50) ; PLACEBO[STUDY=6,TIME=2]",
+  " (-50, 0.1, 50) ; PLACEBO[STUDY=6,TIME=4]",
+  "$OMEGA 16          ; ETA_E0",
+  "$SIGMA 1 FIX       ; ADD_ERR (weight = SE)",
+  "$ESTIMATION METHOD=1 INTERACTION MAXEVAL=9999 PRINT=10 NSIG=3 SIGL=9 NOABORT",
+  "$COVARIANCE MATRIX=R PRINT=E",
+  "$TABLE ID STUDY TIME IPRED NOPRINT ONEHEADER FILE=sdtab FORMAT=s1PE15.8"
+ ]
+}

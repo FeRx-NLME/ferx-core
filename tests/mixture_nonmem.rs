@@ -762,18 +762,96 @@ fn merged_class_warning_straddles_identical_and_separated_starts() {
     assert_eq!(merged_warning(&res), None, "{:?}", res.warnings);
 }
 
-/// The case #2907 exists for. From clearances 1.70 / 1.71, which the start check of #2749
-/// cannot call symmetric, L-BFGS ends in the collapsed optimum (OFV 310.02) and BOBYQA in
-/// the two-class one (299.86). Measured (macOS arm64, `ci-fast`): at the collapsed optimum
-/// the largest per-subject log Bayes factor between the classes is 0.092 (TVCL 1.707 /
-/// 1.762, ω_CL 0.353); at the two-class optimum it is 15.05. The threshold of 1 sits 11×
-/// above the first and 15× below the second.
+/// `free_omega_model` started at a converged point: class clearances, `TVV`, the mixing
+/// logit, ω_CL (variance) and σ (variance, `FitResult::sigma[0]` squared).
+fn at_point(cl: [&str; 2], tvv: &str, mixl: &str, omega: &str, sigma: &str) -> String {
+    free_omega_model(cl[0], cl[1])
+        .replace("TVV(10.0,", &format!("TVV({tvv},"))
+        .replace("MIXL(0.0,", &format!("MIXL({mixl},"))
+        .replace("ETA_CL ~ 0.09", &format!("ETA_CL ~ {omega}"))
+        .replace("EPS ~ 0.04", &format!("EPS ~ {sigma}"))
+}
+
+/// The two optima the check has to tell apart, each evaluated where an L-BFGS fit of
+/// `free_omega_model` stopped (Linux aarch64, at `2adf12df1`): the collapsed one (OFV
+/// 310.023414, from the near-symmetric start 1.70 / 1.701) and the two-class one (299.863507,
+/// from 1.70 / 1.71). Evaluation-only, so it returns immediately and does not depend on
+/// which optimizer path reaches either point: the collapsed optimum is a saddle (the analytic
+/// R-matrix at this point has min eigenvalue −3.950e-2 against a max of 5.490e3, measured by a
+/// covariance step here; at the two-class point it is positive definite), and since #2837's verification leg L-BFGS leaves it
+/// from every start probed but 1.70 / 1.701.
+///
+/// The largest per-subject log Bayes factor between the classes is 0.009 at this collapsed
+/// point (printed by the warning; the 1.70 / 1.71 collapse #2907 measured on macOS, at
+/// clearances 1.707 / 1.762, gave 0.092) and 15.05 at the two-class optimum (#2907). The
+/// threshold of 1 sits 111× above the first and 15× below the second, so a threshold moved
+/// below 0.009 or above 15.05 reddens this test; 0.05 does not. The OFV pins say each
+/// evaluation is at the optimum it names, so the straddle cannot quietly move.
+#[test]
+fn merged_class_warning_straddles_the_collapsed_and_two_class_optima() {
+    let pop: ferx_core::Population =
+        read_nonmem_csv(Path::new("tests/nonmem/mixture_iv.csv"), Some(&["WT"]), None).unwrap();
+    let mut opts = FitOptions::default();
+    opts.interaction = true;
+    opts.outer_maxiter = 0;
+    opts.run_covariance_step = false;
+
+    let collapsed = parse_model_string(&at_point(
+        ["1.7316342766132369", "1.737077753419827"],
+        "10.0020552886836",
+        "2.6722693344139327e-5",
+        "0.3533686843257903",
+        "0.04465298555116565",
+    ))
+    .unwrap();
+    let res = fit(&collapsed, &pop, &collapsed.default_params, &opts).expect("eval Ok");
+    eprintln!("collapsed point: OFV {:.9}, gap {:.3e}", res.ofv, res.ofv - 310.023414);
+    assert!(
+        (res.ofv - 310.023414).abs() < OPTIMUM_OFV_TOL,
+        "collapsed point OFV {}, expected 310.023414",
+        res.ofv
+    );
+    let w = merged_warning(&res).unwrap_or_else(|| panic!("{:?}", res.warnings));
+    eprintln!("collapsed point: {w}");
+    assert!(w.contains("classes 1 and 2 have merged"), "{w}");
+    assert!(!w.contains("empty"), "{w}");
+
+    let separated = parse_model_string(&at_point(
+        ["0.9849159310408131", "2.865842012891312"],
+        "10.011058212743439",
+        "-0.11034155617148868",
+        "0.06819704679148172",
+        "0.044572542095625216",
+    ))
+    .unwrap();
+    let res = fit(&separated, &pop, &separated.default_params, &opts).expect("eval Ok");
+    eprintln!("two-class point: OFV {:.9}, gap {:.3e}", res.ofv, res.ofv - 299.863507);
+    assert!(
+        (res.ofv - 299.863507).abs() < OPTIMUM_OFV_TOL,
+        "two-class point OFV {}, expected 299.863507",
+        res.ofv
+    );
+    assert_eq!(merged_warning(&res), None, "{:?}", res.warnings);
+}
+
+/// How far an evaluation at a stored optimum may sit from the OFV the fit reported there.
+/// Realised: −3.607e-7 (collapsed) and −4.840e-7 (two-class), identical on Linux aarch64 and
+/// macOS arm64, most of it the expected values' rounding to six decimals; 20× headroom. The
+/// two optima are 10.16 apart.
+const OPTIMUM_OFV_TOL: f64 = 1e-5;
+
+/// From clearances 1.70 / 1.71, which the start check of #2749 cannot call symmetric, both
+/// optimizers reach the two-class optimum. Before #2837 L-BFGS stopped on the collapsed
+/// saddle (310.02); its verification leg now leaves it. Measured (Linux aarch64, at
+/// `2adf12df1`): L-BFGS 299.863507 from 1.70 / 1.71 and from the eight other starts whose class
+/// clearances are 0.005 to 0.20 apart (1.705 / 1.71 to 1.60 / 1.80); only 1.70 / 1.701, 0.001
+/// apart, still ends at 310.023414.
 #[test]
 #[cfg_attr(
     not(feature = "slow-tests"),
     ignore = "slow: opt in with --features slow-tests (mixture fits to convergence)"
 )]
-fn near_symmetric_start_collapsed_optimum_warns_merged_classes() {
+fn near_symmetric_start_reaches_the_two_class_optimum() {
     let pop: ferx_core::Population =
         read_nonmem_csv(Path::new("tests/nonmem/mixture_iv.csv"), Some(&["WT"]), None).unwrap();
     let model = parse_model_string(&free_omega_model("1.70", "1.71")).unwrap();
@@ -782,16 +860,13 @@ fn near_symmetric_start_collapsed_optimum_warns_merged_classes() {
     opts.run_covariance_step = false;
 
     opts.optimizer = ferx_core::Optimizer::NloptLbfgs;
-    let collapsed = fit(&model, &pop, &model.default_params, &opts).expect("fit Ok");
-    // Pin that the fixture still reaches the collapsed optimum, or the warning below
-    // would be tested on a fit that never collapsed.
+    let lbfgs = fit(&model, &pop, &model.default_params, &opts).expect("fit Ok");
     assert!(
-        (collapsed.ofv - 310.02).abs() < 0.1,
-        "L-BFGS from 1.70 / 1.71 OFV {}, expected the collapsed 310.02",
-        collapsed.ofv
+        lbfgs.ofv < 300.5,
+        "L-BFGS from 1.70 / 1.71 OFV {}, expected the two-class 299.86",
+        lbfgs.ofv
     );
-    let w = merged_warning(&collapsed).unwrap_or_else(|| panic!("{:?}", collapsed.warnings));
-    assert!(w.contains("classes 1 and 2 have merged"), "{w}");
+    assert_eq!(merged_warning(&lbfgs), None, "{:?}", lbfgs.warnings);
 
     opts.optimizer = ferx_core::Optimizer::Bobyqa;
     let separated = fit(&model, &pop, &model.default_params, &opts).expect("fit Ok");

@@ -1,6 +1,6 @@
 # Dev tooling, not engine code. This crate is a workspace member for the tests
 # and the gates, NOT part of the
-# ferx-core / ferx-tools / ferx-cli layering: it depends on nothing, and nothing
+# ferx-core / ferx-tools / ferx-search / ferx-cli layering: it depends on nothing, and nothing
 # may depend on it. `cargo fmt --all` covers it; its `cargo test` and its
 # `cargo clippy` are BOTH in `tools/preflight.sh`'s `docs` group, because the
 # `clippy` group is scoped to ferx-core and its two members and would leave this
