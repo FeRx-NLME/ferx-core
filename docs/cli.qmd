@@ -85,7 +85,7 @@ ferx gam model.ferx --data data.csv --no-fit
 `--include-data`; the dataset must be the one the fit was run on, since ETAs are
 matched to covariates by subject position. `--no-fit` is refused for methods
 that would estimate anyway — SAEM, IMPMAP, Bayes, VI, and `gn_hybrid`, whose
-FOCEI polish runs on a fixed `maxiter = 100` regardless of `outer_maxiter`, an evaluation budget on its NLopt optimizer ([what it counts](model-file/fit-options.qmd#maxiter-budget)).
+FOCEI polish runs on a fixed `maxiter = 100` regardless of `outer_maxiter`, an evaluation budget when the polish runs an NLopt optimizer ([what it counts](model-file/fit-options.qmd#maxiter-budget)).
 
 | flag | default | meaning |
 |---|---|---|

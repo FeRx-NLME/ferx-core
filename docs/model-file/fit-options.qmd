@@ -222,7 +222,8 @@ The population-parameter search: which algorithm, when it stops, and whether a g
 
 On the NLopt optimizers (`nlopt_lbfgs`, which `auto` usually picks, `slsqp`, `mma` and
 `bobyqa`) `maxiter` caps **objective evaluations**, not iterations: `maxiter × (n + 1)` for
-`n` free parameters, plus `40 × (n + 1)` for `bobyqa`, and a fit's `n_iterations` counts those
+`n` packed parameters (FIXed ones and every Ω-block entry included; a fit with a `profile`d
+block counts only its free set), plus `40 × (n + 1)` for `bobyqa`, and a fit's `n_iterations` counts those
 evaluations (#1430). A mid-descent or basin-shift restart runs on what is left of that budget;
 a run resumed after a θ on the log-packing floor gets a fresh one, so its `n_iterations` can
 exceed it ([details](../estimation/optimizers.qmd#log-packing-floor)).
@@ -230,7 +231,7 @@ exceed it ([details](../estimation/optimizers.qmd#log-packing-floor)).
 Gauss–Newton phase on `maxiter` iterations and its FOCEI polish on a fixed `maxiter = 100`,
 whatever you set.
 
-`maxiter = 0` (evaluation only, see the row above): the reported fit is marked not-converged, and the parameters are returned unchanged — except that the start is still clamped into the optimizer's bounds, so a parameter that begins outside them is evaluated at the bound: a `theta` with a `W_THETA_INIT_OUTSIDE_BOUNDS` warning, a free `omega ~ 0.0` silently; `FIX` avoids both.
+`maxiter = 0` (evaluation only, see the row in [Run control](#run-control)): the reported fit is marked not-converged, and the parameters are returned unchanged — except that the start is still clamped into the optimizer's bounds, so a parameter that begins outside them is evaluated at the bound: a `theta` with a `W_THETA_INIT_OUTSIDE_BOUNDS` warning, a free `omega ~ 0.0` silently; `FIX` avoids both.
 
 #### Gradient method {#gradient-method}
 
