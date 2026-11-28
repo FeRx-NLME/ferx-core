@@ -567,7 +567,9 @@ ID,ETA_CL,ETA_V,ETA_KA,ofv_contribution,n_obs
 
 - `ID` — subject identifier as a string (matches `Population.subjects[i].id`).
 - ETA columns — named after `omega.names` from `fit.json`.
-- `ofv_contribution` — the subject's contribution to the total OFV.
+- `ofv_contribution` — the subject's contribution to the total OFV. For `foce`, `focei`,
+  `laplace` and AGQ fits they sum to it; for other objectives (`bayes`, mixtures, SAEM and
+  IMP readouts) it is the post-hoc FOCE/FOCEI score, which need not.
 - `n_obs_discrete` — the subject's `predictions_discrete.csv` rows, after `n_obs`.
   Present exactly when that entry is.
 - `n_obs_tte` — the subject's `predictions_tte.csv` rows, after `n_obs_discrete` (or

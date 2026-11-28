@@ -1,0 +1,99 @@
+# Peak-memory probe model (#3081): a synthetic stand-in for the private e7070 PK/PD
+# model on which #2939's compiled plans blew peak memory up from 86 MB to 3-4 GB on a
+# single evaluation and 11 GB on a full fit. tools/peak-memory/peakmem.py measures
+# the shipped `ferx` binary's peak RSS on it nightly (.github/workflows/peak-memory.yml).
+#
+# The SHAPE is what matters, not the drug:
+#   - 9 ODE states, nonlinear: a 2-compartment oral PK with saturable (Michaelis-Menten)
+#     elimination, an effect compartment, and a Friberg transit-chain myelosuppression
+#     PD (proliferating pool, three transit compartments, circulating cells) with the
+#     (BASE/CIRC)^GAM feedback;
+#   - stiff enough for `ode_method = auto` to escalate: the fast effect-compartment
+#     and central-distribution rates (KE0, Q/V1) against a ~5-day maturation chain;
+#   - 10 random effects, two endpoints (PK on central, PD on circ), and repeated
+#     dosing, so every subject carries several event segments.
+#
+# The data (stiff_pkpd.csv, 100 subjects) were simulated from this file at its
+# initial estimates: `cargo run --release --example generate_peak_memory`.
+# Changing this file or the CSV changes what the baseline measures — re-measure
+# and re-commit baseline.json in the same PR (docs/development/peak-memory.qmd).
+#
+# States (CMT): depot=1 central=2 periph=3 effect=4 prol=5 tr1=6 tr2=7 tr3=8 circ=9
+
+[parameters]
+  theta TVVMAX(60.0,  1.0, 1000.0)   # max elimination rate (mg/h)
+  theta TVKM(2.0,     0.05, 100.0)   # Michaelis constant (mg/L)
+  theta TVV1(10.0,    0.5,  200.0)   # central volume (L)
+  theta TVQ(40.0,     0.5,  500.0)   # intercompartmental clearance (L/h)
+  theta TVV2(60.0,    1.0, 1000.0)   # peripheral volume (L)
+  theta TVKA(1.5,     0.05,  20.0)   # absorption rate (1/h)
+  theta TVKE0(40.0,   0.5,  500.0)   # effect-compartment rate (1/h): the fast mode
+  theta TVBASE(5.0,   0.5,   50.0)   # baseline circulating cells (10^9/L)
+  theta TVMTT(110.0,  10.0, 500.0)   # mean maturation transit time (h)
+  theta TVEC50(3.0,   0.05, 100.0)   # concentration for half-maximal kill (mg/L)
+  theta TVGAM(0.2,    0.01,   2.0)   # rebound feedback exponent
+
+  omega ETA_VMAX ~ 0.09
+  omega ETA_KM   ~ 0.09
+  omega ETA_V1   ~ 0.09
+  omega ETA_Q    ~ 0.09
+  omega ETA_V2   ~ 0.09
+  omega ETA_KA   ~ 0.16
+  omega ETA_KE0  ~ 0.09
+  omega ETA_BASE ~ 0.04
+  omega ETA_MTT  ~ 0.04
+  omega ETA_EC50 ~ 0.09
+
+  sigma PROP_PK ~ 0.15 (sd)
+  sigma PROP_PD ~ 0.10 (sd)
+
+[individual_parameters]
+  VMAX = TVVMAX * exp(ETA_VMAX)
+  KM   = TVKM   * exp(ETA_KM)
+  V1   = TVV1   * exp(ETA_V1)
+  Q    = TVQ    * exp(ETA_Q)
+  V2   = TVV2   * exp(ETA_V2)
+  KA   = TVKA   * exp(ETA_KA)
+  KE0  = TVKE0  * exp(ETA_KE0)
+  BASE = TVBASE * exp(ETA_BASE)
+  KTR  = 4 / (TVMTT * exp(ETA_MTT))
+  EC50 = TVEC50 * exp(ETA_EC50)
+  GAM  = TVGAM
+
+[structural_model]
+  ode(states=[depot, central, periph, effect, prol, tr1, tr2, tr3, circ])
+
+[odes]
+  init(prol) = BASE
+  init(tr1)  = BASE
+  init(tr2)  = BASE
+  init(tr3)  = BASE
+  init(circ) = BASE
+
+  C     = central / V1
+  EDRUG = effect / (EC50 + effect)
+
+  d/dt(depot)   = -KA * depot
+  d/dt(central) =  KA * depot - VMAX * C / (KM + C) - Q * C + Q * periph / V2
+  d/dt(periph)  =  Q * C - Q * periph / V2
+  d/dt(effect)  =  KE0 * (C - effect)
+  d/dt(prol)    =  KTR * prol * (1 - EDRUG) * (BASE / circ)^GAM - KTR * prol
+  d/dt(tr1)     =  KTR * (prol - tr1)
+  d/dt(tr2)     =  KTR * (tr1 - tr2)
+  d/dt(tr3)     =  KTR * (tr2 - tr3)
+  d/dt(circ)    =  KTR * (tr3 - circ)
+
+[scaling]
+  y[CMT=2] = central / V1
+  y[CMT=9] = circ
+
+[error_model]
+  CMT=2: DV ~ proportional(PROP_PK)
+  CMT=9: DV ~ proportional(PROP_PD)
+
+[fit_options]
+  # The ONE evaluation peakmem.py measures (NONMEM MAXEVAL=0). Its `fit` case rewrites
+  # these two lines to `maxiter = 1` / `covariance = true`; keep them spelled exactly so.
+  method     = focei
+  maxiter    = 0
+  covariance = false

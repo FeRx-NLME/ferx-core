@@ -109,16 +109,16 @@ fn ferx_ofv(model: &str, data: &str) -> f64 {
 /// The repo's standard anchor tolerance: half an OFV unit.
 const TOL: f64 = 0.5;
 
-/// `nonmem_anchor/results/dose_form_lag_infusion.lst`.
+/// `nonmem_anchor/results/dose_form_lag_infusion.nm.json`.
 const NM_OBJV_INFUSION: f64 = -436.381_586_377_188_11;
 
-/// `nonmem_anchor/results/dose_form_lag_ss_flatwt.lst`.
+/// `nonmem_anchor/results/dose_form_lag_ss_flatwt.nm.json`.
 const NM_OBJV_SS_FLATWT: f64 = 2_968.202_993_378_170_5;
 
-/// `nonmem_anchor/results/dose_form_lag_ss_nolag.lst`.
+/// `nonmem_anchor/results/dose_form_lag_ss_nolag.nm.json`.
 const NM_OBJV_SS_NOLAG: f64 = 1_700.878_932_857_840_7;
 
-/// `nonmem_anchor/results/dose_form_lag_reset.lst`.
+/// `nonmem_anchor/results/dose_form_lag_reset.nm.json`.
 const NM_OBJV_RESET: f64 = -455.383_750_284_223_65;
 
 /// `nonmem_anchor/results/dose_form_lag_ss.ext` — the E3 triple itself.

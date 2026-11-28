@@ -43,22 +43,14 @@ pub struct BootstrapSummary {
     pub diagnostic_means: Vec<(String, f64)>,
 }
 
-/// PsN's percentile estimator: the weighted average at `x_((n+1)p)`.
+/// The type-6 sample quantile (Hyndman & Fan, *Am Stat* 1996), which is also the
+/// estimator PsN reports: with `h = (m + 1)·p` in a sample of size `m`, interpolate
+/// linearly between order statistics `⌊h⌋` and `⌊h⌋ + 1` (`h = m` gives the largest).
 ///
-/// Verbatim from the bootstrap user guide:
-///
-/// ```text
-/// n = number of observations + 1
-/// p = percentile / 100
-/// i = integer part of n*p
-/// f = decimal part of n*p
-/// percentile = (1-f)*x_i + f*x_(i+1)
-/// ```
-///
-/// Returns `None` when the sample is too small to resolve the tail — when
-/// `(n+1)p < 1` there is no `x_i` below the requested quantile and any answer
-/// would be an extrapolation past the smallest observation. That one condition
-/// reproduces every threshold the guide tabulates: **19** samples for 5–95%,
+/// Returns `None` outside `1 ≤ (m+1)p ≤ m`, where the usual type-6 definition would
+/// clamp to the smallest or largest observation: there is no order statistic beyond
+/// the requested quantile, so any answer would be an extrapolation. That condition
+/// gives the minimum sample counts **19** samples for 5–95%,
 /// **39** for 2.5–97.5%, **199** for 0.5–99.5%, **1999** for 0.05–99.95%.
 ///
 /// `sorted` must be ascending.
@@ -69,8 +61,9 @@ pub fn percentile(sorted: &[f64], pct: f64) -> Option<f64> {
     let p = pct / 100.0;
     let n = sorted.len() as f64 + 1.0;
     let np = n * p;
-    // Both tails: the upper one runs out of data at `(n+1)(1-p) < 1` by the same
-    // argument, which is why PsN quotes a single sample count per interval.
+    // `n` is `m + 1` and `np` is `h` in the doc above. Both tails: the upper one
+    // runs out of data at `n·(1-p) < 1` by the same argument, which is why PsN
+    // quotes a single sample count per interval.
     if np < 1.0 || np > sorted.len() as f64 {
         return None;
     }

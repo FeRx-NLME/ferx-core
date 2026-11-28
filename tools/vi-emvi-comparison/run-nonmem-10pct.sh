@@ -4,7 +4,7 @@
 # NONMEM is licensed and is not installed on every machine that runs the rest of this harness,
 # so this script does one job: put the control stream and its data in a scratch directory, run
 # whatever nmfe is available, and copy the outputs back next to the control stream where the
-# comparison expects them (.lst / .ext / sdtab).
+# comparison expects them (.nm.json / .ext / sdtab).
 #
 # Usage
 #   tools/vi-emvi-comparison/run-nonmem-10pct.sh                    # local nmfe on PATH
@@ -13,8 +13,8 @@
 #
 # The run takes seconds - 10 subjects, 110 observations, one FOCEI step.
 #
-# What comes back matters more than how it is run: commit warfarin_10pct.lst and .ext next to
-# the .ctl, exactly as warfarin_imp.lst/.ext are committed for the 1% arm, and the FOCEI column
+# What comes back matters more than how it is run: commit warfarin_10pct.nm.json and .ext next
+# to the .ctl, exactly as warfarin_imp.nm.json/.ext are committed for the 1% arm, and the FOCEI column
 # of VI_VALIDATION.md 4.15 can be filled from `TABLE NO. 1` of the .ext.
 set -euo pipefail
 REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
@@ -47,14 +47,15 @@ fi
 
 # .ext is the one that matters -- the .lst prints 3 significant figures, which is not enough to
 # compare against an engine that agrees to six.
-for f in "$LST" warfarin_10pct.ext warfarin_10pct.phi sdtab_10pct; do
+[ -f "$WORK/$LST" ] && "$REPO/tools/nonmem-extract.py" "$WORK/$LST" --out-dir "$NM_DIR"
+for f in warfarin_10pct.ext warfarin_10pct.phi sdtab_10pct; do
   [ -f "$WORK/$f" ] && cp "$WORK/$f" "$NM_DIR/" && echo "  -> tests/nonmem/$f"
 done
 
 echo
 echo "final estimates (TABLE NO. 1, last iteration):"
 awk '/TABLE NO./ {t++} t==1 && $1 == -1000000000 {print; exit}' "$NM_DIR/warfarin_10pct.ext" 2>/dev/null \
-  || echo "  (no .ext produced - check $NM_DIR/$LST)"
+  || echo "  (no .ext produced - check the NONMEM run)"
 echo
 echo "compare against ferx on the same file:"
 echo "  FERX_DATA=\$FERX_VI_STATE/warfarin_10pct.csv tools/vi-emvi-comparison/run.sh"

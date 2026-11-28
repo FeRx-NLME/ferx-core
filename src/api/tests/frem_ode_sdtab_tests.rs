@@ -155,6 +155,7 @@ fn postfit_ipred_and_iwres_of_an_ode_frem_row() {
             &[Vec::new()],
             true,
             None,
+            None,
             false,
         );
         let r = subjects.pop().expect("one subject");

@@ -409,9 +409,9 @@ fn walk_2cpt_matches_quadrature_and_twin() {
 /// / `convolve_2cpt` / `convolve_2cpt_peripheral` and the `*_depot` amounts, evaluated once
 /// from each arrival with no windows and no carried state. This pins the walk's **states**
 /// — the kernel `depot`, and the 2-cpt peripheral that the IPRED references only see
-/// through `k21` — which no other reference here can: the twin's states path holds the first
-/// observation's parameters for the whole timeline on a TV/IOV subject (documented, and
-/// warned as `W_DERIVED_CMT_TV_ODE`), so it is not an oracle for them.
+/// through `k21` — which no other reference here can: a closed-form subject the twin serves
+/// gets no states at all (warned `W_DERIVED_CMT_TWIN_ANALYTICAL`, #1580), so the twin is not
+/// an oracle for them.
 #[test]
 fn walk_reduces_to_the_static_superposition_including_states() {
     let static_subject = |doses: &[(f64, u32, f64)], obs: &[(f64, u32, f64)]| {

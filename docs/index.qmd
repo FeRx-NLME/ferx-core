@@ -45,7 +45,7 @@ NONMEM-compatible data through a command-line interface, Rust API, and
 | Analytical PK | Yes | Yes | Yes (`linCmt()`) | Yes | Yes |
 | ODE models | Yes | Yes | Yes | Yes | Yes |
 | Open source | Yes | No | Yes | No | No |
-| License | MIT | Proprietary | GPL (≥ 3) | Proprietary^[Free academic license for non-commercial use.] | Proprietary^[Free academic access for non-commercial research and education.] |
+| License | MIT; search tools LGPL (≥ 3) | Proprietary | GPL (≥ 3) | Proprietary^[Free academic license for non-commercial use.] | Proprietary^[Free academic access for non-commercial research and education.] |
 
 Method coverage is broadly the same across these engines: NONMEM has offered
 SAEM, importance sampling and Bayesian estimation alongside FOCE since NONMEM 7,
@@ -85,10 +85,14 @@ src/                -- the ferx-core engine (one model, one dataset, one fit)
   sens/             -- Analytic derivatives (PkNum kernels, the adjoint and its compiled per-subject plans)
   nn/               -- Neural network components (DCM / NODE)
 crates/
-  ferx-tools/       -- Workflows that run many fits (bootstrap, model searches)
+  ferx-tools/       -- Workflows that run many fits of one model (bootstrap, GAM screening)
+  ferx-search/      -- Model-space searches (structure, variability, covariates, amd)
   ferx-cli/         -- The `ferx` command-line binary
 ```
 
 ## License
 
-ferx-core is released under the [MIT License](https://github.com/FeRx-NLME/ferx-core/blob/main/LICENSE).
+ferx-core, ferx-tools and the ferx-cli source are released under the [MIT
+License](https://github.com/FeRx-NLME/ferx-core/blob/main/LICENSE). The
+model-search crate, ferx-search, is LGPL-3.0-or-later, and the `ferx` binary
+links it; see [License](license.qmd) for the details and `ferx --licenses`.

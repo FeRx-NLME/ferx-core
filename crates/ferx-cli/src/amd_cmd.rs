@@ -1,16 +1,16 @@
 //! `ferx amd` — the automatic model development pipeline (#1184).
 //!
 //! Thin by construction (#1114 A5): parse flags, load the `.ferxsearch` file,
-//! call [`ferx_tools::amd::run_amd`], print the report, pick an exit code.
+//! call [`ferx_search::amd::run_amd`], print the report, pick an exit code.
 //! Every decision about the order, the skips, the seeding and the retries
-//! policy lives in `ferx-tools`.
+//! policy lives in `ferx-search`.
 
 use std::path::PathBuf;
 
-use ferx_tools::amd::{
+use ferx_search::amd::{
     default_dir, render_summary, run_amd, AmdEvent, AmdOptions, AmdRun, Context,
 };
-use ferx_tools::search::SearchConfig;
+use ferx_search::search::SearchConfig;
 
 use crate::covsearch_cmd::{flag, parse_threads, scan_args, value};
 
@@ -114,7 +114,7 @@ fn run_amd_command(args: &[String]) -> Result<i32, String> {
 
     // The plan before the first fit, so a user sees what will and will not run
     // rather than discovering a skipped step in the report afterwards.
-    let plan = ferx_tools::amd::plan(&options, &config.mfl, &Context::from_base(&base))?;
+    let plan = ferx_search::amd::plan(&options, &config.mfl, &Context::from_base(&base))?;
     for step in &plan {
         match &step.skipped {
             Some(reason) => {
@@ -185,9 +185,9 @@ fn run_amd_command(args: &[String]) -> Result<i32, String> {
     }
     eprintln!(
         "Step table written to {}; every candidate to {}; final model to {}",
-        ferx_tools::amd::steps_path(&dir).display(),
-        ferx_tools::amd::candidates_path(&dir).display(),
-        ferx_tools::amd::final_model_path(&dir).display()
+        ferx_search::amd::steps_path(&dir).display(),
+        ferx_search::amd::candidates_path(&dir).display(),
+        ferx_search::amd::final_model_path(&dir).display()
     );
     // A step that failed leaves a usable model and a complete report, so the
     // run is not thrown away — but it did not do what was asked, and a

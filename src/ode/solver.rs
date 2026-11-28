@@ -359,11 +359,14 @@ impl OdeSolverOptions {
     }
 }
 
+/// The default `ode_reltol`.
+pub(crate) const DEFAULT_RELTOL: f64 = 1e-4;
+
 impl Default for OdeSolverOptions {
     fn default() -> Self {
         Self {
             abstol: 1e-6,
-            reltol: 1e-4,
+            reltol: DEFAULT_RELTOL,
             max_steps: 10000,
             initial_dt: 0.1,
             min_dt: 1e-12,
@@ -3352,6 +3355,18 @@ impl Drop for SolverStatsScope {
     }
 }
 
+/// Run `f` and return what it integrated on this thread next to its result. The counters are
+/// added to the enclosing [`SolverStatsScope`], if any, which a nested scope would leave short
+/// of `f`'s work.
+pub(crate) fn with_solver_stats<R>(f: impl FnOnce() -> R) -> (R, OdeSolverStats) {
+    let scope = SolverStatsScope::enter();
+    let out = f();
+    let stats = scope.collected();
+    drop(scope);
+    record_to_stats_sink(&stats);
+    (out, stats)
+}
+
 /// Whether a [`SolverStatsScope`] is collecting on this thread.
 #[inline]
 fn stats_sink_active() -> bool {
@@ -3360,7 +3375,7 @@ fn stats_sink_active() -> bool {
 
 /// Add one integration's counters to the active scope, if any.
 #[inline]
-fn record_to_stats_sink(stats: &OdeSolverStats) {
+pub(crate) fn record_to_stats_sink(stats: &OdeSolverStats) {
     STATS_SINK.with(|c| {
         if let Some(mut acc) = c.get() {
             acc.merge(stats);
@@ -5048,6 +5063,26 @@ mod tests {
         assert_eq!(outer.collected().attempted_steps, after_one.attempted_steps * 2);
         drop(outer);
         assert!(!stats_sink_active());
+    }
+
+    /// `with_solver_stats` reports its closure's work alone, hands it on to an enclosing scope
+    /// (the settlement check wraps a whole inner solve in one, #3145), and without one leaves
+    /// the sink unset.
+    #[test]
+    fn with_solver_stats_reports_its_own_work_and_passes_it_outward() {
+        let rhs = |u: &[f64], _p: &[f64], _t: f64, du: &mut [f64]| du[0] = -0.1 * u[0];
+        let opts = OdeSolverOptions::default();
+        let solve = || solve_ode(&rhs, &[1.0], (0.0, 10.0), &[], &[10.0], &opts).len();
+
+        let (n, one) = with_solver_stats(solve);
+        assert_eq!(n, 1);
+        assert!(one.attempted_steps > 0);
+        assert!(!stats_sink_active());
+
+        let outer = SolverStatsScope::enter();
+        solve();
+        assert_eq!(with_solver_stats(solve).1, one);
+        assert_eq!(outer.collected().attempted_steps, 2 * one.attempted_steps);
     }
 
     /// A caller that passes its own `&mut OdeSolverStats` keeps getting exactly that, scope or

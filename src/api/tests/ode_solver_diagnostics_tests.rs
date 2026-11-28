@@ -480,7 +480,7 @@ fn a_jet_rejection_says_the_derivatives_overflowed_not_that_the_method_failed() 
 
 /// A jet rejection on an otherwise clean fit still warns. The prediction pass can be spotless
 /// — it is a different solve — so `unclean` has to count this counter or the one failure only
-/// the sensitivity sweep can see would be reported as an `Info` escalation note.
+/// a dual sensitivity solve can see would be reported as an `Info` escalation note.
 #[test]
 fn a_jet_rejection_alone_is_a_warning_not_an_info_note() {
     let stats = OdeSolverStats {
@@ -529,42 +529,70 @@ fn an_ordinary_rejection_carries_no_jet_clause() {
     assert_eq!(details["auto_stiff_rejected_jets"], serde_json::json!(0));
 }
 
-/// The second half of the post-fit sweep (#1204): the diagnostic scope has to observe a
-/// **dual** solve, not only the `f64` prediction pass.
+/// Why `fit()` runs no sensitivity sweep for `auto_stiff_rejected_jets` (#3076), stated as a
+/// test: the derivative solves are compiled plans, and a plan's ODE loop integrates on the
+/// value lane, where the jet clause cannot fire. The fixture is the `stiffness_tests.rs` #1204
+/// repro as a model — a fast mode that makes `auto` escalate, and `u' = P·u` driven to
+/// `6e303`, whose η-Hessian `(Pt)²·u` overflows while its value does not. The plan's solve
+/// escalates and its Hessian is unusable, yet no jet rejection is counted.
 ///
-/// Without this the jet-rejection clause could never fire in production — `f64` carries no
-/// jets, so the only path that can take that decision is the sensitivity solve — and the
-/// counter would be exactly the dead diagnostic #1080 item 3 existed to remove. Asserting the
-/// sweep deposits counters of its own is what pins that it runs at all.
+/// If this ever fails on the counter, a plan has learned to take the jet decision, and
+/// `fit_inner` must collect the counter again (the removed sweep ran exactly this solve, per
+/// subject, at the estimates). The direct dual solve still takes it:
+/// `auto_rejects_an_escalation_whose_jets_overflowed_while_its_values_did_not`.
 #[test]
-fn the_post_fit_sweep_observes_the_sensitivity_solve_too() {
-    let model = two_state_model(1000.0);
-    let pop = population();
-    let result = fit(&model, &pop, &model.default_params, &one_iteration_opts()).expect("fit");
-
-    let mut params = model.default_params.clone();
-    params.theta = result.theta.clone();
-    let etas: Vec<DVector<f64>> = result.subjects.iter().map(|s| s.eta.clone()).collect();
-    // Read from the **return value**, not from a scope opened here: the sweep is
-    // parallel over subjects and `SolverStatsScope` is thread-local, so a
-    // caller-side scope sees this thread's work and the sweep does none on it
-    // (#1329). That is the counter-loss the merge exists to prevent, and this
-    // test is where it would have shown up.
-    let stats = sweep_sensitivity_solver_stats(&model, &pop, &params, &etas, None);
-    assert!(stats.accepted_steps > 0, "the sensitivity sweep integrated nothing: {stats:?}");
-    assert!(
-        stats.auto_stiff_segments > 0,
-        "and it should see the same escalations the prediction pass does: {stats:?}"
+fn the_plan_sensitivity_solve_cannot_take_the_jet_decision() {
+    let model = parse_model_string(
+        r#"
+[parameters]
+  theta TVP(3.5, 0.1, 10.0)
+  omega ETA_P ~ 0.04
+  sigma PROP ~ 0.04
+[individual_parameters]
+  P = TVP * exp(ETA_P)
+[structural_model]
+  ode(obs_cmt=grow, states=[fast, grow])
+[odes]
+  init(fast) = 1
+  init(grow) = 1
+  d/dt(fast) = -100 * fast / (1 + fast * 1e-12)
+  d/dt(grow) = grow * P
+[error_model]
+  DV ~ proportional(PROP)
+[fit_options]
+  ode_reltol = 1e-2
+  ode_abstol = 1e-2
+"#,
+    )
+    .expect("parse");
+    let subject = Subject {
+        id: "1".into(),
+        doses: vec![DoseEvent::new(0.0, 0.0, 1, 0.0, false, 0.0)],
+        obs_times: vec![200.0],
+        observations: vec![1e300],
+        obs_cmts: vec![2],
+        cens: vec![0],
+        ..Default::default()
+    };
+    let params = model.default_params.clone();
+    assert!(crate::sens::provider::analytic_outer_gradient_available(&model));
+    let scope = crate::ode::solver::SolverStatsScope::enter();
+    let h = crate::sens::ode_provider::adjoint::exact_inner_hessian_or_decline(
+        &model,
+        &subject,
+        &params,
+        &[0.0],
     );
-    // …and it must be the *second-order* provider for a model with an analytic outer
-    // gradient (#1207 review). The overflow this counter exists for reaches the Hessian
-    // first and the gradient only later, so a `Dual2` sweep would miss the very case #1204
-    // documents. This fixture has to take that branch, or the assertions above are only
-    // testing the first-order path.
-    assert!(
-        crate::sens::provider::analytic_outer_gradient_available(&model),
-        "the fixture must exercise the Dual2 branch of the sweep"
-    );
+    let stats = scope.collected();
+    // The premise: the plan's solve ran, escalated, and lost its second derivatives.
+    assert!(stats.auto_stiff_segments > 0, "{stats:?}");
+    assert!(h.is_err(), "the η-Hessian must overflow: {h:?}");
+    let pred = predict(&model, &Population { subjects: vec![subject], ..population() }, &params)
+        .expect("predict");
+    assert!(pred[0].pred.is_finite() && pred[0].pred > 1e300, "{:?}", pred[0].pred);
+    // …and yet nothing on this path can count the jet rejection.
+    assert_eq!(stats.auto_stiff_rejected_jets, 0, "{stats:?}");
+    assert_eq!(stats.auto_stiff_rejected, 0, "{stats:?}");
 }
 
 /// The post-fit passes are parallel over subjects (#1329), and both things that makes fragile
@@ -638,47 +666,6 @@ fn the_parallel_post_fit_pass_is_worker_count_independent() {
             a.id
         );
     }
-}
-
-/// …and it costs nothing on a model that has no ODE sensitivity path to sweep. The helper is
-/// called on every ODE fit, so a model on a closed-form solution must exit before it
-/// integrates anything.
-#[test]
-fn the_sensitivity_sweep_is_a_no_op_off_the_analytic_ode_path() {
-    let model = closed_form_model();
-    let pop = population();
-    let result = fit(&model, &pop, &model.default_params, &one_iteration_opts()).expect("fit");
-
-    let mut params = model.default_params.clone();
-    params.theta = result.theta.clone();
-    let etas: Vec<DVector<f64>> = result.subjects.iter().map(|s| s.eta.clone()).collect();
-    let stats = sweep_sensitivity_solver_stats(&model, &pop, &params, &etas, None);
-    assert_eq!(stats.accepted_steps, 0, "{stats:?}");
-    assert_eq!(stats.attempted_steps, 0, "{stats:?}");
-}
-
-/// A one-compartment closed-form twin of [`two_state_model`]: no `[odes]`, so
-/// the sweep's `model.ode_spec.is_none()` guard fires and it has nothing to do.
-fn closed_form_model() -> CompiledModel {
-    parse_model_string(crate::test_models::ONE_CPT_IV_3).expect("parse")
-}
-
-/// An **FD fit** must sweep nothing (#1207 review). `adjoint::recorder_in_scope` describes
-/// the ODE provider's analytical reach and says nothing about `gradient_method`, so gating on
-/// it alone swept a dual solve for a fit that computed every gradient by finite differences —
-/// and then reported solver counters from a code path that fit never took.
-#[test]
-fn the_sensitivity_sweep_is_a_no_op_when_the_fit_asked_for_fd_gradients() {
-    let mut model = two_state_model(1000.0);
-    model.gradient_method = GradientMethod::Fd;
-    let pop = population();
-    let params = model.default_params.clone();
-    let etas: Vec<DVector<f64>> =
-        pop.subjects.iter().map(|_| DVector::zeros(model.n_eta)).collect();
-
-    let stats = sweep_sensitivity_solver_stats(&model, &pop, &params, &etas, None);
-    assert_eq!(stats.accepted_steps, 0, "{stats:?}");
-    assert_eq!(stats.attempted_steps, 0, "{stats:?}");
 }
 
 // ── abandoned non-finite timelines (#1234) ───────────────────────────────────
@@ -1283,7 +1270,7 @@ fn the_solver_advice_is_dropped_only_when_every_damaged_segment_diverged() {
     assert!(msg.contains("consider a different ode_method"), "{msg}");
     assert!(msg.contains("stability-limited"), "{msg}");
 
-    // Leg 5 — a divergence beside a jet-only rejection from the sensitivity sweep. The jet
+    // Leg 5 — a divergence beside a jet-only rejection from a sensitivity solve. The jet
     // clause itself says a different `ode_method` will not help, so the knob advice is dropped
     // here too rather than contradicting it (#1577 review, row 1: `rejected_jets` is
     // deliberately not a conjunct of the gate).

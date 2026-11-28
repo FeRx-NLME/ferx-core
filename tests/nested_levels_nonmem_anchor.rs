@@ -207,13 +207,13 @@ fn the_anchor_files_are_where_the_tests_read_them() {
     for f in [
         "nested_levels_3.ctl",
         "results/nested_levels_3.ext",
-        "results/nested_levels_3.lst",
+        "results/nested_levels_3.nm.json",
         "nested_levels_3_eval.ctl",
         "results/nested_levels_3_eval.ext",
         "results/nested_levels_3_eval.phi",
         "nested_levels_3_cov.ctl",
         "results/nested_levels_3_cov.ext",
-        "results/nested_levels_3_cov.lst",
+        "results/nested_levels_3_cov.nm.json",
         "results/nested_levels_3_cov.cov",
     ] {
         assert!(Path::new("nonmem_anchor").join(f).exists(), "{f}");

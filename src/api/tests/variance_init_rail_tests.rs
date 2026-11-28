@@ -123,6 +123,11 @@ fn free_zero_omega_is_rejected_naming_the_eta_and_fix() {
 /// coordinate at `lower == upper == packed`, so the bare predicate
 /// `packed <= lower` is **true** here — dropping the mask check would reject the
 /// one spelling the diagnostic tells users to write.
+///
+/// The model's only η is the placeholder, so the parser keeps it (#3150 removes a `0 FIX` η only
+/// when another η remains); it is the η-free-model guard that gives this test its coordinate.
+/// Beside a live η the placeholder is gone and never meets the rail: see
+/// `a_fixed_zero_beside_a_live_eta_is_removed_so_it_never_meets_the_rail`.
 #[test]
 fn fixed_zero_omega_is_accepted_even_though_it_sits_on_its_pinned_bound() {
     use crate::estimation::parameterization::{compute_bounds, pack_params};
@@ -146,6 +151,22 @@ fn fixed_zero_omega_is_accepted_even_though_it_sits_on_its_pinned_bound() {
     );
 
     assert!(rails_with_default_options(p).is_empty(), "{:#?}", rails_with_default_options(p));
+}
+
+/// #3150: a `0 FIX` placeholder beside a live η is removed from the model, so Ω has one diagonal,
+/// there is no pinned-at-its-bound coordinate to be accepted, and nothing is on the rail.
+#[test]
+fn a_fixed_zero_beside_a_live_eta_is_removed_so_it_never_meets_the_rail() {
+    use crate::estimation::parameterization::{coordinate_kinds, PackedCoordKind};
+    let model =
+        model_with_parameters(&params_with_omega("omega ETA_CL ~ 0.09\n  omega ETA_Z ~ 0.0 FIX"));
+    assert_eq!(model.eta_names, ["ETA_CL"]);
+    let diagonals = coordinate_kinds(&model.default_params)
+        .iter()
+        .filter(|k| **k == PackedCoordKind::OmegaDiagonal)
+        .count();
+    assert_eq!(diagonals, 1, "no coordinate for the placeholder");
+    assert!(rails_with_default_options(&model.default_params).is_empty());
 }
 
 // ── the rail straddle ───────────────────────────────────────────────────────

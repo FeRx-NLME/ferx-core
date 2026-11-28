@@ -503,14 +503,19 @@ pub(crate) fn check_param_shape(
         )
     };
     let want = &model.default_params;
+    // The placeholder ηs a model dropped (#3150) are why its Ω is smaller than the one written.
+    let dropped_note = |m: &CompiledModel| {
+        crate::types::dropped_zero_eta_note(m).map_or(String::new(), |n| format!(". Note: {n}"))
+    };
     for block in supplied {
         let message = match *block {
             ParamBlock::Omega((r, c)) if r != c => not_square("omega", (r, c)),
             ParamBlock::OmegaIov(Some((r, c))) if r != c => not_square("omega_iov", (r, c)),
             ParamBlock::Omega((got, _)) if got != want.omega.dim() => format!(
-                "the supplied omega is {got}×{got} but this model has {} eta; {}",
+                "the supplied omega is {got}×{got} but this model has {} eta; {}{}",
                 want.omega.dim(),
-                by_position("random effects")
+                by_position("random effects"),
+                dropped_note(model),
             ),
             ParamBlock::Sigma(got) if got != want.sigma.values.len() => format!(
                 "the supplied sigma has {got} values but this model has {}; {}",

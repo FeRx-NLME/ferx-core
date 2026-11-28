@@ -1,0 +1,39 @@
+# One-state turnover with a weekly time-varying driver X (#3153): first-order KIN and KOUT, no
+# random effects, a θ residual SD. Data: turnover.csv in this directory, simulated by
+# sim_turnover_collapse.py (seed 4, 40 subjects). True values KIN = 0.0195, KOUT = 0.0514,
+# OFFSET = 9.77, SD = 0.497; the start is within a factor of 4.3 of each.
+# tests/opening_step_scale.rs fits it.
+[parameters]
+  theta TH_KIN(0.083, 0.0)
+  theta TH_KOUT(0.17, 0.0)
+  theta TH_OFFSET(7.4, 0.0)
+  theta TH_SD(0.17, 0.0)
+  sigma SIG ~ 1.0 FIX
+
+[covariates]
+  X continuous
+  H0 continuous
+
+[individual_parameters]
+  KIN = TH_KIN
+  KOUT = TH_KOUT
+  OFFSET = TH_OFFSET
+  XD = X
+  HB0 = H0
+
+[structural_model]
+  ode(obs_cmt=h, states=[h])
+
+[odes]
+  init(h) = HB0
+  d/dt(h) = KIN * (XD + OFFSET) - KOUT * h
+
+[error_model]
+  DV ~ additive(SIG * TH_SD)
+
+[fit_options]
+  method     = focei
+  maxiter    = 500
+  covariance = false
+  ode_reltol = 1e-9
+  ode_abstol = 1e-12

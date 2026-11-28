@@ -22,13 +22,40 @@ SOFTWARE.
 
 -----------------------------------------------------------------------
 
+Everything in this repository is MIT-licensed as above, EXCEPT
+`crates/ferx-search` and `data/mbma_naproxen.csv`, described below.
+
+-----------------------------------------------------------------------
+
+Directory exception: `crates/ferx-search`
+
+Everything under `crates/ferx-search` -- its sources, tests and test fixtures
+-- is licensed under the GNU Lesser General Public License, version 3 or (at
+your option) any later version (LGPL-3.0-or-later), not under the MIT grant
+above. See `crates/ferx-search/NOTICE`, `crates/ferx-search/COPYING.LESSER`
+(LGPL-3.0) and `crates/ferx-search/COPYING` (GPL-3.0). This is not
+retroactive: the model-search code was MIT-licensed in earlier ferx-tools
+releases, up to and including ferx-tools 0.4.0, and those releases remain MIT
+(`crates/ferx-search/LICENSE-MIT`).
+
+The rest of the repository stays MIT, including:
+
+  - ferx-core (the root package, `src/`), `crates/ferx-tools` and
+    `crates/ferx-cli`. Only ferx-cli depends on ferx-search, and its own
+    source is MIT; the compiled `ferx` binary links ferx-search and so
+    carries the LGPL notices (`ferx --licenses`).
+  - `tools/pharmpy-*`, the scripts that run Pharmpy in a container to produce
+    the anchor fixtures under `crates/ferx-search/tests/data/`. They call
+    Pharmpy as a program and contain none of its code.
+
+-----------------------------------------------------------------------
+
 Per-file exception: `data/mbma_naproxen.csv`
 
-Everything in this repository is MIT-licensed as above, EXCEPT
-`data/mbma_naproxen.csv`. That test fixture is derived from an open access
-publication licensed CC BY-NC 4.0 (Boucher M, Bennetts M, CPT:PSP
-2018;7:288-297, doi:10.1002/psp4.12299) and carries that licence, not this
-one -- so commercial use of that file is not granted. See
+`data/mbma_naproxen.csv` is not MIT-licensed either. That test fixture is
+derived from an open access publication licensed CC BY-NC 4.0 (Boucher M,
+Bennetts M, CPT:PSP 2018;7:288-297, doi:10.1002/psp4.12299) and carries that
+licence, not this one -- so commercial use of that file is not granted. See
 `data/mbma_naproxen.LICENSE` for the terms and `data/mbma_naproxen.README.md`
 for the provenance. It is test data only: it is never linked into the `ferx`
 binary, and `Cargo.toml` excludes the whole `data/mbma_naproxen.*` group from

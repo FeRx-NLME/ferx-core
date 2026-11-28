@@ -1,16 +1,16 @@
 //! `ferx iivsearch` — variability-structure search (#1183).
 //!
 //! Thin by construction (#1114 A5): parse flags, load the `.ferxsearch`
-//! file, call [`ferx_tools::iivsearch::run_iivsearch`], print the model
+//! file, call [`ferx_search::iivsearch::run_iivsearch`], print the model
 //! table, pick an exit code. Every decision about candidates, ranking and
-//! selection lives in `ferx-tools`.
+//! selection lives in `ferx-search`.
 
 use std::path::PathBuf;
 
-use ferx_tools::iivsearch::{
+use ferx_search::iivsearch::{
     default_dir, render_summary, run_iivsearch, IivsearchEvent, IivsearchOptions, IivsearchRun,
 };
-use ferx_tools::search::SearchConfig;
+use ferx_search::search::SearchConfig;
 
 use crate::covsearch_cmd::{flag, parse_threads, scan_args, value};
 
@@ -165,8 +165,8 @@ fn run_iivsearch_command(args: &[String]) -> Result<i32, String> {
     }
     eprintln!(
         "Model table written to {}; final model to {}",
-        ferx_tools::iivsearch::models_path(&dir).display(),
-        ferx_tools::iivsearch::final_model_path(&dir).display()
+        ferx_search::iivsearch::models_path(&dir).display(),
+        ferx_search::iivsearch::final_model_path(&dir).display()
     );
     Ok(if result.cancelled { 130 } else { 0 })
 }

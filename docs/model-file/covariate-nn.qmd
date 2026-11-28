@@ -107,9 +107,11 @@ A fit warns when it is handed inputs like these. `W_NN_UNSCALED_INPUT` names eve
 whose values in the data, after the block's `center`/`scale`, reach past `3/a` (`6/a` for a
 sigmoid), where `a = √(6/(fan_in + fan_out))` is the first layer's Glorot weight scale: past
 that, one input alone drives a hidden unit into saturation at its initial weights. On such a
-network which optimum a fit reaches can depend on the path to it — without normalisation,
-`examples/warfarin_dcm.ferx` ends at very different objectives depending only on how the
-inner loop is warm-started (#2549).
+network which optimum a fit reaches can depend on the path to it — with a bare head and no
+normalisation, `examples/warfarin_dcm.ferx` ended at very different objectives depending only
+on how the inner loop was warm-started (#2549). The example now declares `init`, which is what
+removes that dependence there (all of 42 starts near it end below −1194); its inputs
+are still unnormalised, so it still carries this warning.
 
 Use the covariate's mean and SD in your dataset, or any round numbers near them —
 the network does not care whether the standardization is exact, only that its

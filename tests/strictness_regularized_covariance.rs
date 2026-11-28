@@ -228,8 +228,8 @@ fn a_collapsed_peripheral_fails_strictness_on_its_regularized_covariance() {
 /// The second leg is `run_covariance` re-running the `r` fit under `s`: the incoming fit
 /// carries the floor warning, and a re-run that kept it would have the gate exclude the fit
 /// over a step that no longer exists. On this fixture the `s` step itself *fails* ("the score
-/// cross-product matrix S is singular or rank-deficient", measured under FOCE and again under
-/// FOCEI), so the re-run stores no matrix. That is why there is no fresh-`s`-fit leg here: it
+/// cross-product matrix S is singular", measured under FOCE and again under FOCEI), so the
+/// re-run stores no matrix. That is why there is no fresh-`s`-fit leg here: it
 /// would pass by skipping (no matrix, nothing to read), whatever the estimator gating did —
 /// measured under FOCE, making the floor warning fire under `s` too left such a leg green.
 /// The re-run leg is live regardless, since the stale warning is carried in on `r`: dropping

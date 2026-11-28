@@ -1939,7 +1939,7 @@ median-one-observation dataset (`nonmem_anchor/saem_sparse_combined_saem.ctl`
 and `data/saem_sparse_combined.csv`, which is the fixture
 `tests/saem_combined_error.rs` scores; results in
 `nonmem_anchor/results/saem_sparse_combined_saem.ext`, read from the `.ext`
-because a SAEM+IMP chain truncates its `.lst`):
+because a SAEM+IMP chain truncates its listing):
 
 | | additive SD (truth 1.8) | proportional SD (truth 0.13) |
 |---|---|---|

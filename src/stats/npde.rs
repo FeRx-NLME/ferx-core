@@ -196,11 +196,13 @@ pub fn compute_npde_npd_diag(
     )
     .into_iter()
     .collect();
-    crate::diagnostics::first_error(&crate::api::check_covariate_levels(model, population))?;
+    crate::diagnostics::first_error(&crate::model_checks::check_covariate_levels(
+        model, population,
+    ))?;
     // Nested levels (#1082 PR4): the κ draw groups records by their level labels, so a
     // record with none is refused as `simulate()` refuses it (review r1 #1), and a
     // derived occasion rule, which would regroup the levels, as `fit()` refuses it.
-    crate::diagnostics::first_error(&crate::api::check_level_labels(model, population))?;
+    crate::diagnostics::first_error(&crate::model_checks::check_level_labels(model, population))?;
     if let Some(levels) = model.nested_levels() {
         if iov_occasion.is_some_and(|r| *r != IovOccasionRule::Column) {
             return Err(crate::entry_refusals::level_mixed_with_iov_rule(&levels.levels[0].name));
@@ -224,10 +226,10 @@ pub fn compute_npde_npd_diag(
     // A bound level block on a population never bound for it gathers `NaN` on every
     // record, and every npd came back `NaN` with `Ok` (#1647); one bound for other levels
     // read the wrong level's θ (#1762).
-    crate::diagnostics::first_error(&crate::api::check_level_index_columns(
+    crate::diagnostics::first_error(&crate::model_checks::check_level_index_columns(
         model,
         population,
-        crate::api::LevelDataEntry::Run,
+        crate::model_checks::LevelDataEntry::Run,
     ))?;
     // A covariate the data lacks reads as 0.0 in the simulated reference (#1763).
     crate::diagnostics::first_error(&crate::api::check_covariates(model, population))?;

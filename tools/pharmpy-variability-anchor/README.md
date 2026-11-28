@@ -4,9 +4,9 @@ The external references for `ferx iivsearch` and `ferx iovsearch` are
 Pharmpy 2.2.0's own runs of `iivsearch` / `iovsearch`, driving NONMEM 7.5.1,
 on simulated datasets whose variability structure has something to find.
 The inputs, the run scripts and the serialised trajectories live under
-`crates/ferx-tools/tests/pharmpy/{iivsearch,iovsearch}_anchor/` (each has a
+`crates/ferx-search/tests/pharmpy/{iivsearch,iovsearch}_anchor/` (each has a
 README with the numbers), and the slow-gated tests
-`crates/ferx-tools/tests/{iivsearch,iovsearch}_pharmpy_anchor.rs` replay
+`crates/ferx-search/tests/{iivsearch,iovsearch}_pharmpy_anchor.rs` replay
 ferx on the same inputs.
 
 `pmx.sh` is the one piece of tooling: it runs a command inside the licensed
@@ -25,7 +25,7 @@ tools/pharmpy-variability-anchor/pmx.sh iivsearch_anchor python3 run_iivsearch.p
 tools/pharmpy-variability-anchor/pmx.sh iovsearch_anchor python3 run_iovsearch.py
 
 # replay ferx against them
-cargo test -p ferx-tools --release --features slow-tests \
+cargo test -p ferx-search --release --features slow-tests \
   --test iivsearch_pharmpy_anchor --test iovsearch_pharmpy_anchor -- --nocapture
 ```
 

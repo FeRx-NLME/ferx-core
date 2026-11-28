@@ -309,7 +309,7 @@ mod tests {
     }
 
     #[test]
-    fn defaults_match_psn() {
+    fn defaults_are_200_samples_with_retry() {
         let o = parse_options(&args(&["m.ferx"]), Some("m.ferx")).unwrap();
         assert_eq!(o.samples, 200);
         assert!(o.update_inits);
@@ -363,7 +363,7 @@ mod tests {
     }
 
     #[test]
-    fn negated_flags_turn_the_psn_defaults_off() {
+    fn negated_flags_turn_the_defaults_off() {
         let o = parse_options(
             &args(&[
                 "m.ferx",

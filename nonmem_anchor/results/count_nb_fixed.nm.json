@@ -1,0 +1,78 @@
+{
+ "nonmem_version": "7.5.1",
+ "data_file": "count_nb.csv",
+ "data_records": 360,
+ "observations": 360,
+ "individuals": 60,
+ "nmtran_warnings": [2],
+ "markers": [
+  "MINIMIZATION TERMINATED",
+  "ROUNDING ERRORS"
+ ],
+ "steps": [
+  {
+   "method": "Laplacian Conditional Estimation",
+   "objv": 1739.162,
+   "objv_without_constant": 1739.162052786698,
+   "objv_with_constant": 1739.162052786698,
+   "function_evaluations": 1418,
+   "significant_digits": 2.5,
+   "etabar": [
+    [0.0]
+   ],
+   "etabar_se": [
+    [0.0]
+   ],
+   "p_val": [
+    [1.0]
+   ],
+   "etashrinksd": [
+    [0.0]
+   ],
+   "etashrinkvr": [
+    [0.0]
+   ],
+   "ebvshrinksd": [
+    [0.0]
+   ],
+   "ebvshrinkvr": [
+    [0.0]
+   ],
+   "relativeinf": [
+    [0.0]
+   ],
+   "epsshrinksd": [
+    [100.0]
+   ],
+   "epsshrinkvr": [
+    [100.0]
+   ],
+   "final": {
+    "theta": [4.8, 0.412, -0.62, 1.54],
+    "omega": {
+     "ETA1": [0.0]
+    }
+   },
+   "markers": [
+    "MINIMIZATION TERMINATED",
+    "ROUNDING ERRORS"
+   ]
+  }
+ ],
+ "control_stream_as_run": [
+  "$PROBLEM ferx #2877 count endpoint (nb, fixed): -2 log PMF with ln Gamma(k+1) kept, LAPLACE",
+  "$INPUT ID TIME DV CMT EVID MDV WT TRT",
+  "$DATA count_nb.csv IGNORE=@",
+  "$PRED",
+  " LAM = EXP(LOG(THETA(1)) + THETA(2)*(WT/70 - 1) + THETA(3)*TRT + ETA(1))",
+  " R = THETA(4)",
+  " Y = -2*(GAMLN(DV+R) - GAMLN(R) - GAMLN(DV+1) + R*LOG(R/(R+LAM)) + DV*LOG(LAM/(R+LAM)))",
+  "$THETA",
+  " (0.01, 3, 100)   ; BASE",
+  " (-10, 0.1, 10)   ; BETA",
+  " (-10, -0.1, 10)  ; GAM",
+  " (0.01, 5, 1000)  ; R (size)",
+  "$OMEGA 0 FIX  ; no random effect: fixed-effects-only case",
+  "$ESTIMATION METHOD=COND LAPLACE -2LL MAXEVAL=9999 NSIG=4 SIGL=12 PRINT=10 NOABORT FORMAT=s1PE23.16"
+ ]
+}

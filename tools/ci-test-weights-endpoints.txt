@@ -36,7 +36,7 @@
 50 lib:api
 50 lib:estimation::bayes
 47 lib:ode::predictions
-36 lib:api::levels
+36 lib:levels
 25 lib:estimation::run_covariance::from_fit_bindings
 24 lib:estimation::vi::elbo
 18 lib:api::fit

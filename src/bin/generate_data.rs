@@ -176,6 +176,7 @@ fn bare_model(default_params: ModelParameters) -> CompiledModel {
         gradient_method: GradientMethod::default(),
         parse_warnings: Vec::new(),
         has_conditional_eta_params: false,
+        prediction_has_kink: false,
         eta_param_info: Vec::new(),
         kappa_param_types: Vec::new(),
         theta_transform: Vec::new(),
