@@ -267,6 +267,32 @@ jobs:
       - name: cargo test --lib with debug-assertions OFF (via tools/preflight.sh)
         run: tools/preflight.sh release-semantics
 
+  # `ferx-cli` without its default-on `search` feature (#3187). Every other job that
+  # builds the CLI names `ferx-cli/search` alongside its `--no-default-features`, so
+  # this is the one place the no-search binary's tests run and its dependency graph is
+  # checked. Its compile and `-Dunused` lint are in `Check` and `Clippy`. Commands live
+  # in `tools/preflight.sh` (group `no-search`) for the same reason as those (#1157).
+  no-search:
+    name: No-search build
+    runs-on: ubuntu-latest
+    # Not in the merge queue: it already ran on the PR (#2042, see `on:`).
+    if: github.event_name != 'merge_group'
+    # Stable, like `release-semantics`: `rust-cache` keys on the rustc version, so
+    # nightly would cold-rebuild the dep graph daily.
+    env:
+      RUSTUP_TOOLCHAIN: stable
+    steps:
+      - uses: actions/checkout@v7
+      - name: Install stable toolchain
+        run: rustup toolchain install stable --profile minimal
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: ci-no-search
+
+      - name: ferx-cli tests and dependency graph without search (via tools/preflight.sh)
+        run: tools/preflight.sh no-search
+
   clippy:
     name: Clippy
     runs-on: ubuntu-latest
@@ -319,8 +345,8 @@ jobs:
       - name: cargo doc (ferx-core + members, via tools/preflight.sh)
         run: tools/preflight.sh rustdoc
 
-  # A2 of #1114 — the enforcement that keeps the ferx-core/ferx-tools boundary
-  # from becoming paperwork. `ferx-tools` can only touch `pub` items, so the way
+  # A2 of #1114 — the enforcement that keeps the ferx-core/member boundary
+  # from becoming paperwork. The members can only touch `pub` items, so the way
   # the boundary rots is `ferx-core` growing an ad-hoc `pub` in the same PR that
   # needs it. Diffing a committed surface snapshot turns every widening into one
   # explicit reviewable line. Doubles as semver protection for the crates.io
@@ -397,6 +423,22 @@ jobs:
       # changes — this file deliberately does not.
       - name: Validate changelog.d fragments (via tools/preflight.sh)
         run: tools/preflight.sh changelog
+
+  licenses:
+    name: Licenses
+    runs-on: ubuntu-latest
+    # #3183: license fields, SPDX headers on ferx-search, the license files in
+    # each crate's `cargo package --list`, and the generated third-party notices
+    # behind `ferx --licenses`. Compiles nothing; `cargo metadata` downloads the
+    # dependency sources whose license files the notices copy.
+    env:
+      RUSTUP_TOOLCHAIN: stable
+    steps:
+      - uses: actions/checkout@v7
+      - name: Install stable toolchain
+        run: rustup toolchain install stable --profile minimal
+      - name: Check licenses (via tools/preflight.sh)
+        run: tools/preflight.sh licenses
 
   docs-lint:
     name: Docs lint
@@ -596,7 +638,7 @@ jobs:
         # The planner IS the step's command, so its exit status is the step's. Inlined
         # as `cargo … $(planner)` a planner error was swallowed and cargo ran with no
         # target arguments, i.e. its default targets — green, wrong suite (#2168).
-        run: python3 tools/ci-test-shard.py run core ${{ matrix.shard }} ${{ strategy.job-total }} --lib-parts 2 --output lcov.info -- --workspace --no-default-features --features ferx-core/ci --profile ci-cov
+        run: python3 tools/ci-test-shard.py run core ${{ matrix.shard }} ${{ strategy.job-total }} --lib-parts 2 --output lcov.info -- --workspace --no-default-features --features ferx-core/ci,ferx-cli/search --profile ci-cov
 
       - uses: actions/upload-artifact@v7
         with:

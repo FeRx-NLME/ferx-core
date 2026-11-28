@@ -782,7 +782,7 @@ pub(crate) const ODE_9: &str = r"
   method = focei
 ";
 
-/// Used by src/api/tests/vpc_kmmc_tests.rs, src/api/tests/vpc_rtte_tests.rs, src/api/tests/vpc_tte_tests.rs, src/stats/npde_tte_tests.rs.
+/// Used by src/api/tests/vpc_cif_tests.rs, src/api/tests/vpc_kmmc_tests.rs, src/api/tests/vpc_rtte_tests.rs, src/api/tests/vpc_tte_tests.rs, src/stats/npde_tte_tests.rs.
 #[cfg(feature = "survival")]
 pub(crate) const MODEL_2: &str = r"
 [parameters]
@@ -800,7 +800,7 @@ pub(crate) const MODEL_2: &str = r"
   scale  = TVLAMBDA_B
 ";
 
-/// Used by src/api/tests/vpc_rtte_tests.rs, src/api/tests/vpc_tte_tests.rs, src/stats/npde_tte_tests.rs.
+/// Used by src/api/tests/vpc_cif_tests.rs, src/api/tests/vpc_rtte_tests.rs, src/api/tests/vpc_tte_tests.rs, src/stats/npde_tte_tests.rs.
 #[cfg(feature = "survival")]
 pub(crate) const ONE_CPT_IV_22: &str = r"
 [parameters]

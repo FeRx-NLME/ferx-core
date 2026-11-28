@@ -51,6 +51,7 @@ fn subject_results_use_the_fitted_mixture_class() {
             &kappas,
             true,
             mixest,
+            None,
             false,
         )
         .0
@@ -101,6 +102,7 @@ fn derived_columns_use_the_fitted_mixture_class() {
         &kappas,
         true,
         Some(&[1]),
+        None,
         false,
     );
     compute_extra_output_columns(
@@ -153,6 +155,7 @@ fn output_mixnum_column(
         &kappas,
         true,
         mixest,
+        None,
         false,
     );
     compute_extra_output_columns(model, population, &params.theta, &kappas, &mut subjects, mixest);

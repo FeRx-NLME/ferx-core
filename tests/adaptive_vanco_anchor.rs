@@ -220,9 +220,9 @@ fn vanco_titration_matches_mrgsolve() {
 
     // Point metric: troughs in [10, 15] on 7 of 14 decisions (decisions 7..=13).
     assert!(
-        (m.pct_time_in_window.expect("trough window declared") - 7.0 / 14.0).abs() < 1e-9,
-        "pct_time_in_window {:?}",
-        m.pct_time_in_window
+        (m.pct_readings_in_window.expect("trough window declared") - 7.0 / 14.0).abs() < 1e-9,
+        "pct_readings_in_window {:?}",
+        m.pct_readings_in_window
     );
 
     // Exposure metric (the S2.5b headline): AUC24 in [400, 600] on 8 of the 13

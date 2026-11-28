@@ -51,7 +51,7 @@ const REQUIRED_CHECKS: [&str; 10] = [
 /// and `Patterns lint` (#2634), a fast gate for the same reason: two queued PRs can
 /// combine into an unguarded NaN-swallowing fold that neither contained alone (one
 /// deletes a test's `is_finite` assert, the other adds a fold the assert guarded).
-const QUEUE_GATES: [&str; 8] = [
+const QUEUE_GATES: [&str; 9] = [
     "Check",
     "Clippy",
     "Docs lint",
@@ -60,6 +60,9 @@ const QUEUE_GATES: [&str; 8] = [
     "Rustdoc",
     "Changelog",
     "Patterns lint",
+    // #3183: compiles nothing, needs no other job, and a queued PR that changes
+    // `Cargo.lock` can stale the third-party notices another one regenerated.
+    "Licenses",
 ];
 
 /// The job that posts `codecov/patch` in the queue.

@@ -3,7 +3,7 @@
 # dump.py — they are NOT part of the corpus (Pharmpy rejects `#`; that case
 # is written with a literal `\n` escape below).
 #
-# Sections mirror crates/ferx-tools/src/search/mfl_pharmpy_anchor.rs, which
+# Sections mirror crates/ferx-search/src/search/mfl_pharmpy_anchor.rs, which
 # names every line where ferx deliberately differs.
 
 # --- the issue example and each feature category -----------------------------

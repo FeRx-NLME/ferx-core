@@ -555,10 +555,9 @@ The standard approach for PK parameters that must be positive:
   KA = TVKA * exp(ETA_KA)
 ```
 
-### Switching a random effect off: `omega ~ 0`
+### Switching a random effect off: `omega ~ 0 FIX`
 
-Declaring a variance of zero keeps the `ETA` in the model but removes its
-variability:
+Declaring a variance of zero, fixed, switches the random effect off:
 
 ```
 [parameters]
@@ -566,16 +565,41 @@ variability:
   omega ETA_V  ~ 0.09
 ```
 
-In a **simulation** (`simulate`, VPC, `simulate_adaptive`, the NPDE reference
-distribution) a zero `omega` or `kappa` draws exactly `ETA_CL = 0` for every
-subject, as NONMEM's `$SIMULATION` does with `$OMEGA 0 FIX`. The other random
-effects draw from exactly their declared variances (here 0.09). This also holds
-when you simulate from a fit, where the fitted Ω stores the `FIX`-ed zero as
-`1e-8`: the model's declaration identifies it. A variance you supply yourself
-for that `ETA` (anything above `2e-8`) is honoured, not replaced by the
-declared zero. Before #1605 the zero
-was drawn with a standard deviation of `1e-4`, and `1e-8` was added to every
-other variance.
+As in NONMEM, where `$OMEGA 0 FIX` holds an η at 0, ferx **removes such a placeholder η from the
+model** (#3150): `ETA_CL` reads as `0` in `[individual_parameters]`, `[odes]`, `[scaling]` and
+`[derived]`, and the model is the one written without it, so the fit and its objective are those
+of that model, bit for bit, and cost what it costs. (A term `+ ETA_CL`, `- ETA_CL` or `ETA_CL +`
+is deleted from its sum; in any other spelling, such as `ETA_CL * k`, the η reads as `0`, the same
+value, but mu-referencing is read from the text and can differ.) Before, the placeholder stayed a full
+dimension of every subject's inner problem at a variance of `1e-8`, which made a fit with six of
+them 2.5 times slower and moved the OFV by a few units in the sixth decimal. A `block_omega` whose
+entries are all `0` and `FIX` goes the same way. The model carries one
+`W_ZERO_FIX_ETA_DROPPED` note naming what was removed.
+
+What follows from the removal:
+
+- **No row for it** in Ω, in the EBEs, in the shrinkage tables or in an `sdtab` η column. Write the
+  η as a placeholder only when you want it out of the model.
+- **An input sized for the declared shape is refused.** A supplied Ω of the declared size
+  (`E_PARAM_SHAPE`), or per-subject η that name the removed η (`E_SUPPLIED_ETAS`), is refused, and
+  the refusal quotes the note that names it. Give Ω and η for the remaining random effects.
+- **Seeded stochastic methods** (`saem`, `imp`, `impmap`, `bayes`, `vi`) and simulation draw a
+  different stream, since it follows the η count.
+
+A placeholder **stays** when anything but those four blocks reads it: `iiv_on_ruv = NAME`, a
+`[mixture]` per-class override, an endpoint block (`[binary_model]`, `[event_model]`, …),
+`frem_predictions`, or a second line of `[parameters]` that mentions it; a zero-`FIX` `kappa` is
+not an `omega` and stays too. None is removed when that would leave the model with no η, since
+`saem`, `imp`, `impmap` and `bayes` refuse a model without one. A placeholder that stays behaves
+as below.
+
+In a **simulation** (`simulate`, VPC, `simulate_adaptive`, the NPDE reference distribution) a zero
+`omega` or `kappa` that stays draws exactly `ETA_CL = 0` for every subject, as NONMEM's
+`$SIMULATION` does with `$OMEGA 0 FIX`. The other random effects draw from exactly their declared
+variances (here 0.09). This also holds when you simulate from a fit, where the fitted Ω stores the
+`FIX`-ed zero as `1e-8`: the model's declaration identifies it. A variance you supply yourself for
+that `ETA` (anything above `2e-8`) is honoured, not replaced by the declared zero. Before #1605 the
+zero was drawn with a standard deviation of `1e-4`, and `1e-8` was added to every other variance.
 
 A simulation-only run also reads a zero without `FIX` (`omega ETA_CL ~ 0.0`)
 as switched off. NONMEM rejects a bare `$OMEGA 0` (NM-TRAN error 76), and ferx
@@ -583,8 +607,9 @@ rejects it in a **fit**, because a free zero variance sits on the estimation
 rail (`E_OMEGA_INIT_AT_RAIL`, see the [parameters page](parameters.qmd)). Write
 `FIX` whenever the model will also be fitted.
 
-During a fit, a `FIX`-ed zero is held at `1e-8` internally so that Ω stays
-invertible. This is what the objective function sees, and it is unchanged.
+During a fit, a placeholder that stays is held at `1e-8` internally so that Ω stays invertible.
+That floor is on its own diagonal only: the other random effects keep exactly the variances you
+declared (before #3150 every diagonal of Ω carried the `1e-8`).
 
 ### Allometric scaling with covariates
 
@@ -932,7 +957,7 @@ For example, in `CL = TVCL * (WT/70)^0.75 * exp(ETA_CL)`:
 A covariate factor like the one above can also be declared as data in
 [`[covariate_model]`](covariate-model.qmd) — `CL ~ WT power(center = 70)` —
 which desugars into exactly this expression, with the theta declaration, the
-PsN `scm` default bounds and a missing-value guard filled in. That form is worth
+default bounds and a missing-value guard filled in. That form is worth
 reaching for when a covariate search or an agent will be rewriting the model.
 
 ### Forgetting an omega declaration

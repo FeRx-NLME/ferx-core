@@ -521,6 +521,7 @@ fn require_skips_changes_that_are_not_user_facing() {
         ("core-src", "src/stats/npde.rs"),
         ("cli-src", "crates/ferx-cli/src/main.rs"),
         ("tools-src", "crates/ferx-tools/src/lib.rs"),
+        ("search-src", "crates/ferx-search/src/lib.rs"),
         // `git diff --name-only` quotes non-ASCII under the default `core.quotePath`,
         // and always quotes a `"`: neither may hide the `src/` prefix.
         ("unicode", "src/modèles.rs"),

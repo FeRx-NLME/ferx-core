@@ -79,7 +79,7 @@ contributor:
 ### If the `Public API baseline` job goes red
 
 The repo is a cargo workspace — the `ferx-core` library at the root, with
-`ferx-tools` (multi-fit tooling) and `ferx-cli` (the `ferx` binary) on top — and
+`ferx-tools` (multi-fit tooling), `ferx-search` (model-space search) and `ferx-cli` (the `ferx` binary) on top — and
 `api/ferx-core-public-api.txt` is a committed snapshot of everything `ferx-core`
 exposes. CI diffs it, so *any* new `pub` item fails that job until the baseline
 is updated in the same PR. That is deliberate: it makes each widening one

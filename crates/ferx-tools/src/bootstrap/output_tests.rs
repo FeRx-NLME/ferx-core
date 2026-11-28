@@ -65,7 +65,7 @@ fn read(path: &std::path::Path) -> Vec<Vec<String>> {
 }
 
 #[test]
-fn write_all_produces_every_psn_artefact() {
+fn write_all_produces_the_documented_artefacts() {
     let dir = tempfile::tempdir().expect("temp dir");
     let options = BootstrapOptions { dofv: true, ..BootstrapOptions::default() };
     write_all(dir.path(), &result(), &options).expect("write");
@@ -93,7 +93,7 @@ fn delta_ofv_is_only_written_when_asked_for() {
 
 #[test]
 fn raw_results_puts_the_original_dataset_first() {
-    // PsN: "The first row is for the original dataset." Downstream tools (PsN's
+    // PsN's layout: the original dataset comes first. Downstream tools (PsN's
     // own `covmat -offset=1`) rely on it.
     let dir = tempfile::tempdir().expect("temp dir");
     let path = dir.path().join("raw.csv");
@@ -138,9 +138,8 @@ fn raw_results_gains_se_columns_only_with_keep_covariance() {
 
 #[test]
 fn the_replicate_files_agree_row_for_row() {
-    // PsN: "The row order is consistent between the files raw_results,
-    // included_individuals, included_keys and sample_keys so that row j ...
-    // concerns the same bootstrapped dataset."
+    // The replicates appear in the same order in `included_individuals`,
+    // `included_keys` and `sample_keys` (after the latter's header).
     let dir = tempfile::tempdir().expect("temp dir");
     let r = result();
 

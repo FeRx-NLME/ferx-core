@@ -22,7 +22,13 @@ ferx ruvsearch <search.ferxsearch> [--directory DIR] [--threads N] [--resume]
 ferx allometry <model.ferx> --data <data.csv> [--covariate WT] [--reference 70] [--estimate]
 ferx --help                    # or -h; also: ferx check --help, ferx summary --help,
                                # ferx bootstrap --help, ferx covsearch --help
+ferx --licenses                # licenses and third-party notices of this binary
 ```
+
+`ferx --licenses` prints the MIT license, the LGPL-3.0 and GPL-3.0 texts that
+cover the linked `ferx-search` crate, the third-party notices (NLopt among
+them), and how to rebuild the binary with a modified `ferx-search`; see
+[License](license.qmd).
 
 ## Commands
 
@@ -50,7 +56,7 @@ ferx bootstrap model.ferx --data data.csv --samples 200 --seed 12345 --threads 8
 
 Resamples subjects with replacement, refits the model to each replicate dataset,
 and reports bias, standard errors and confidence intervals from the spread of the
-estimates — the non-parametric case bootstrap, at `PsN::bootstrap` feature parity.
+estimates — the non-parametric case bootstrap, modelled on `PsN::bootstrap` (see [Bootstrap](tools/bootstrap.qmd) for where it differs).
 Writes PsN-named CSV artefacts to `{model}-bootstrap/`. Progress is drawn as a bar on
 stderr while the replicates fit, when stderr is a terminal; `--no-progress` turns it off.
 
@@ -340,6 +346,69 @@ ferx summary run1.fitrx run2.fitrx run3.fitrx
 | ... | ... | ... | ... |
 ```
 
+#### Machine-Readable Summary (`--json`)
+
+```bash
+ferx summary --json run1.fitrx run2.fitrx
+```
+
+`--json` emits the same content as **one JSON document on stdout**, for a script
+or agent comparing saved runs without scraping the tables (it mirrors
+`ferx check --json`). The document carries a `schema_version` (bumped only on a
+breaking change, the policy of `{model}-fit.json`), the `fit_schema_version` of
+the fit JSON its fields follow, and a `runs` array with one object per bundle in
+command-line order:
+
+- `label` (the file stem) and `path`.
+- **Run status** — `model_name`, `method`, `method_chain`, `converged`,
+  `status` (the usability verdict, with reasons), `final_gradient`,
+  `final_gradient_source`, `n_iterations`, `n_subjects`, `n_obs`, `n_parameters`.
+- **Objective** — `ofv`, `ofv_data`, `ofv_prior`, `aic`, `bic`, `prior_summary`,
+  `saem_objective`, `importance_sampling`.
+- **Estimates** — `estimates`, the name-keyed layout of the fit YAML / JSON
+  (`estimates.theta.CL.estimate`, with `se` and `rse_pct`; Ω `variance`,
+  `cv_pct` and off-diagonal `correlation`; `omega_iov` for κ; σ), with
+  `fixed: true` on a FIX parameter; and `error_model`. Like the text table,
+  `estimates.theta` leaves out the coefficients of a compact θ block (20 or more
+  levels) and `[covariate_nn]` weights, so every θ is also given by position in
+  `theta`, `theta_names`, `theta_fixed` and `se_theta`, with `held_at_bound`
+  naming coordinates held on a bound (no SE) and `profiled_blocks` the blocks
+  declared `profile`.
+- **θ blocks** — `theta_blocks`, keyed by block name, the `--- THETA BLOCKS ---`
+  rows: `n_free_coefficients`, `n_fixed_coefficients`, `profiled`, `min`,
+  `median`, `max` (over every coefficient, FIX included), and `theta_start` /
+  `theta_end`, the half-open index range of the block's coefficients in `theta`.
+  `{}` for a fit without one.
+- **Diagnostics** — `covariance_status`, `covariance_method`,
+  `cov_condition_number`, and `shrinkage_eta`, `shrinkage_kappa`,
+  `shrinkage_kappa_by_occ`, `shrinkage_eps` as **fractions** (not percent),
+  indexed like `eta_names` / `kappa_names`.
+- **Run info** — `wall_time_secs`, `ferx_version`, and `warnings_structured`
+  (`severity`, `category`, `message`, …).
+
+Every one of these is copied from the fit JSON's own serializer under the same
+key, so a value reads the same here and in `{model}-fit.json`. Non-finite
+values are `null`. With two or more bundles the document also has
+`reference_run: 0` and each run a `delta_ofv` against the first run (the
+comparison table's ΔOFV row; `null` when the first bundle failed to load).
+
+```json
+{
+  "schema_version": 1,
+  "fit_schema_version": 1,
+  "reference_run": 0,
+  "runs": [
+    { "label": "run1", "path": "run1.fitrx", "ofv": -280.3595, "delta_ofv": 0.0,
+      "converged": true, "estimates": { "theta": { "TVCL": { "estimate": 0.133, ... } } }, ... },
+    { "label": "run2", "path": "run2.fitrx", "error": "failed to load run2.fitrx: ..." }
+  ]
+}
+```
+
+The exit codes are those of the text summary. A bundle that fails to load does
+not stop the others: it gets an `error` entry in place of the fit fields, the
+document is still printed, and the exit code is `1`.
+
 ## Output Files
 
 Two files are always generated, named after the model file:
@@ -469,8 +538,9 @@ That last split decides which error you get when the argument resolves to
 nothing:
 
 ```bash
-$ ferx covsearch run1.ferxsearch      # on a build without covsearch
-Error: tool `covsearch` not recognized.
+$ ferx covsearh run1.ferxsearch       # a tool this build does not have
+Error: tool `covsearh` not recognized.
+Did you mean `covsearch`?
 Available tools: check, summary, bootstrap, gam, ...
 To fit a model, give its file path: ferx run1.ferx --data data.csv
 
@@ -480,6 +550,15 @@ Error: the model `run1.ferx` was not found at this location. Please check folder
 
 A tool name within two edits of a real one also gets a `Did you mean ...?`
 line. Both cases exit `1`.
+
+A binary built without model search (see [Building](#building)) still knows
+the eight search tool names, and says what is missing instead (exit `1`):
+
+```bash
+$ ferx covsearch run1.ferxsearch
+Error: `covsearch` is a model-search tool, and this ferx was built without the `search` feature.
+Rebuild ferx-cli with its default features (or `--features search`) to use it.
+```
 
 A path the filesystem cannot answer for — an unreadable parent directory, a
 symlink loop — is not reported as missing: it goes to the fit path, which
@@ -510,4 +589,10 @@ cargo build --release -p ferx-cli
 
 # Run directly via cargo
 cargo run --release -p ferx-cli -- model.ferx --data data.csv
+
+# Without the model-search tools (covsearch, allometry, modelsearch, ruvsearch,
+# iivsearch, iovsearch, amd, globalsearch) and their ferx-search dependency
+cargo build --release -p ferx-cli --no-default-features
 ```
+
+Model search is the `search` feature of `ferx-cli`, on by default.

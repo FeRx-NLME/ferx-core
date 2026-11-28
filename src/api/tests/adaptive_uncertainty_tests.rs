@@ -176,8 +176,8 @@ fn fit_of(model: &CompiledModel) -> FitResult {
 #[test]
 fn replicate_tag_names_the_draw_only_under_uncertainty() {
     use crate::sim::adaptive::ReplicateTag;
-    let off = ReplicateTag { draw: None, sim: 3 };
-    let on = ReplicateTag { draw: Some(2), sim: 3 };
+    let off = ReplicateTag { draw: None, sim: 3, rep: None };
+    let on = ReplicateTag { draw: Some(2), sim: 3, rep: None };
     assert_eq!(off.sim_label(), "sim 3");
     assert_eq!(on.sim_label(), "draw 2, sim 3");
     assert_eq!(off.replicate_label(), "replicate 3");
@@ -224,7 +224,7 @@ fn absorbed_step_warning_names_the_draw_of_the_first_replicate() {
     let population = pop(1);
     let plan = |draw, sim| AbsorbedPlan {
         subject: 0,
-        replicate: Some(ReplicateTag { draw: Some(draw), sim }),
+        replicate: Some(ReplicateTag { draw: Some(draw), sim, rep: None }),
         found: FromStart(500.0),
     };
     let w =
@@ -624,21 +624,21 @@ fn value_difference_covers_iov_and_rho_and_ignores_flags() {
     let mut flags = t.clone();
     flags.theta_fixed[0] = !flags.theta_fixed[0];
     flags.theta_upper[0] = 99.0;
-    assert_eq!(first_value_difference(&flags, &t), None);
+    assert_eq!(first_value_difference(&flags, &t, ("run", "fit")), None);
     let mut iov = t.clone();
     let m = iov.omega_iov.as_ref().unwrap().matrix.clone() * 3.0;
     iov.omega_iov = Some(OmegaMatrix::from_matrix(m, vec!["KAPPA_CL".into()], true));
-    let d = first_value_difference(&iov, &t).expect("Ω_IOV differs");
+    let d = first_value_difference(&iov, &t, ("run", "fit")).expect("Ω_IOV differs");
     assert!(d.starts_with("Ω_IOV[1, 1] is"), "{d}");
     let mut rho = t.clone();
     rho.residual_correlations =
         vec![crate::types::ResidualCorrelation { sigma_i: 0, sigma_j: 0, rho: 0.5 }];
-    let d = first_value_difference(&rho, &t).expect("ρ differs");
+    let d = first_value_difference(&rho, &t, ("run", "fit")).expect("ρ differs");
     assert_eq!(d, "residual ρ has 1 value(s), the fit's 0");
     // Same length: named by the σ pair it correlates (review r1 row 6).
     let mut fit_rho = rho.clone();
     fit_rho.residual_correlations[0].rho = 0.3;
-    let d = first_value_difference(&rho, &fit_rho).expect("ρ value differs");
+    let d = first_value_difference(&rho, &fit_rho, ("run", "fit")).expect("ρ value differs");
     assert_eq!(d, "residual ρ (PROP, PROP) is 0.5, the fit's is 0.3");
 }
 
