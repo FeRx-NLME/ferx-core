@@ -14750,7 +14750,7 @@ fn a_verified_start_reports_the_probe_and_skips_the_stall_retry() {
             ..at(&off, 4, probe_left)
         };
         let ((result, _), skip) =
-            settle_start_probe((first(), None), false, Some((probe, None, verdict)), |r| r.ofv);
+            settle_start_probe((first(), None), false, Some((probe, verdict)), |r| r.ofv);
         assert_eq!(skip, skip_retry, "{label}: retry skipped");
         assert_eq!(
             pack_params(&result.params) != init_packed,
@@ -14792,7 +14792,7 @@ fn a_verified_start_reports_the_probe_and_skips_the_stall_retry() {
     // above the start by the clean OFV but below it once penalized is the point reported.
     let probe = OuterResult { ofv: start_ofv + 1e-3, converged: true, ..at(&off, 4, true) };
     let ((result, _), _) =
-        settle_start_probe((first(), None), false, Some((probe, None, Some(true))), |r| {
+        settle_start_probe((first(), None), false, Some((probe, Some(true))), |r| {
             r.ofv - if pack_params(&r.params) == init_packed { 0.0 } else { 1.0 }
         });
     assert_eq!(
@@ -15014,7 +15014,6 @@ fn a_restart_probe_reports_a_verified_or_lower_probe_and_leaves_any_other_restar
     let restarted = || restarted_at(true);
     let restart_ofv = restarted().ofv;
     let restart_cause = Some(RestartCause::MidDescent);
-    let probe_cause = Some(RestartCause::BasinShift);
     let budget_tag = "Outer optimization hit the evaluation budget (maxiter = 9) before \
                       converging; increase maxiter for a tighter fit.";
     for (verdict, probe_delta, reports_probe, restart_left, probe_converged, probe_left, budget) in [
@@ -15054,7 +15053,7 @@ fn a_restart_probe_reports_a_verified_or_lower_probe_and_leaves_any_other_restar
         };
         let (result, cause, from_probe, verified) = settle_restart_probe(
             (restarted_at(restart_left), restart_cause),
-            Some((probe, probe_cause, verdict)),
+            Some((probe, verdict)),
             |r| r.ofv,
         );
         assert_eq!(
@@ -15076,7 +15075,8 @@ fn a_restart_probe_reports_a_verified_or_lower_probe_and_leaves_any_other_restar
                 if probe_run { probe_converged } else { false },
                 probe_run,
                 !probe_run,
-                if probe_run { probe_cause } else { restart_cause }
+                // A probe's result has had its restarts: no cause is carried on.
+                if probe_run { None } else { restart_cause }
             ),
             "{label}: whose verdict, warnings and restart cause: {:?}",
             result.warnings
@@ -15171,6 +15171,35 @@ fn a_stall_at_the_inits_stays_flagged_when_the_probe_finds_lower() {
         );
         assert!(!v.passed, "{status:?}: a stall fails the default strictness: {v:?}");
     }
+}
+
+/// #2905: a first attempt's probe already lower than its start is a stall whatever its restart
+/// chain would find, so it is not resumed. On the flip-flop fixture stopped at its inits, the
+/// probe's single leg ends at −3045.877713 in 34 evaluations (macOS arm64); resumed, it ends at
+/// the optimum, −3051.439, in 113, with the same stall reported.
+#[test]
+fn a_first_attempts_probe_already_lower_is_not_resumed() {
+    let dir = "tests/fixtures/flip_flop_pop";
+    let text = std::fs::read_to_string(format!("{dir}/flip_flop_pop.ferx")).expect("model");
+    let parsed = crate::parser::model_parser::parse_full_model(&text).expect("model parses");
+    let mut model = parsed.model;
+    model.name = "first_probe_lower_2905".into();
+    let path = format!("{dir}/flip_flop_pop.csv");
+    let pop = crate::read_nonmem_csv(std::path::Path::new(&path), None, None).expect("data");
+    forced_stop_at_start::set(&model.name, None, false);
+    let opts = FitOptions {
+        optimizer: crate::types::Optimizer::NloptLbfgs,
+        verbose: false,
+        run_covariance_step: false,
+        ..parsed.fit_options
+    };
+    let result = crate::api::fit(&model, &pop, &model.default_params, &opts).expect("fit");
+    let reached: f64 = result
+        .warnings
+        .iter()
+        .find_map(|w| w.split("reached OFV = ").nth(1)?.split(',').next()?.parse().ok())
+        .unwrap_or_else(|| panic!("no probe warning: {:?}", result.warnings));
+    assert!(reached > -3050.0 && result.n_iterations < 70, "{reached}, {}", result.n_iterations);
 }
 
 /// #2506, end to end through `fit()`: a refit at a converged fit's estimates comes

@@ -31,7 +31,7 @@
 //! macOS arm64 numbers are still to be measured on the #3153 seed.
 
 use ferx_core::parser::model_parser::parse_full_model;
-use ferx_core::types::{FitResult, WarningCode};
+use ferx_core::types::{FitResult, OmegaMatrix, WarningCode};
 use ferx_core::{fit, read_nonmem_csv};
 use std::path::Path;
 
@@ -167,6 +167,45 @@ fn a_verified_basin_shift_restart_is_converged_closed_form() {
 #[cfg_attr(not(feature = "slow-tests"), ignore = "slow: opt in with --features slow-tests")]
 fn a_verified_basin_shift_restart_is_converged_ode_twin() {
     assert_restart_reported_converged(ODE_TWIN, -3392.136568, 112);
+}
+
+/// #2905: a refit from the fit's own estimates is a warm start at the optimum. Its first
+/// attempt does not leave its start, and its #2506 probe lands in another EBE basin
+/// (−3047.527166, six subjects), as a restart's probe does. With a single leg that probe
+/// returned no verdict, so the refit carried `W_STALLED_AT_INIT`, and the ODE twin's was
+/// `converged: false`. Now the probe runs the restart chain, comes back to the optimum and
+/// verifies it (macOS arm64: 47 → 123 evaluations closed form, 63 → 137 ODE twin).
+fn assert_warm_refit_verified(model: &str) {
+    let text = std::fs::read_to_string(model).expect("model");
+    let parsed = parse_full_model(&text).expect("model parses");
+    let population = read_nonmem_csv(Path::new(DATA), None, None).expect("data loads");
+    let mut opts = parsed.fit_options.clone();
+    opts.verbose = false;
+    opts.run_covariance_step = false;
+    let cold = fit(&parsed.model, &population, &parsed.model.default_params, &opts).expect("cold");
+    assert!((cold.ofv - OPTIMUM).abs() < 1e-5, "{model}: precondition, cold {}", cold.ofv);
+    let mut warm = parsed.model.default_params.clone();
+    warm.theta = cold.theta.clone();
+    let (names, diagonal) = (warm.omega.eta_names.clone(), warm.omega.diagonal);
+    warm.omega = OmegaMatrix::from_matrix(cold.omega.clone(), names, diagonal);
+    warm.sigma.values = cold.sigma.clone();
+    let r = fit(&parsed.model, &population, &warm, &opts).expect("warm");
+    assert!(r.converged && r.stationary_start, "{model}: {:?}", r.warnings);
+    assert!((r.ofv - OPTIMUM).abs() < 1e-5, "{model}: {}", r.ofv);
+    // The probe's chain ran: without it the refits end at 47 / 63 evaluations.
+    assert!(r.n_iterations > 90, "{model}: {} evaluations", r.n_iterations);
+    assert!(
+        !r.warnings_structured.iter().any(|w| w.category == WarningCode::StalledAtInit),
+        "{model}: {:?}",
+        r.warnings
+    );
+}
+
+#[test]
+#[cfg_attr(not(feature = "slow-tests"), ignore = "slow: opt in with --features slow-tests")]
+fn a_warm_refit_whose_probe_shifts_basin_is_verified() {
+    assert_warm_refit_verified(CLOSED_FORM);
+    assert_warm_refit_verified(ODE_TWIN);
 }
 
 /// The probe and its restart chain run on what is left of the fit's `maxiter` budget, not on

@@ -3716,18 +3716,19 @@ fn start_probe_due(
 /// retry ([`resolve_stall_retry`]).
 ///
 /// - `Some(false)` — the first attempt, a stall, with [`start_probe_stall_warning`]; retried.
-/// - `Some(true)` — [`verified_start_result`]; no retry.
+/// - `Some(true)` — [`verified_start_result`], with no restart cause (the probe has had its
+///   restarts); no retry.
 /// - `None` — the first attempt, retried exactly when it did not leave its start.
 ///
 /// The probe's evaluations count in `n_iterations` either way.
-type ProbedAttempt = (OuterResult, Option<RestartCause>, Option<bool>);
+type ProbedAttempt = (OuterResult, Option<bool>);
 fn settle_start_probe(
     first: (OuterResult, Option<RestartCause>), first_left_init: bool,
     probed: Option<ProbedAttempt>, penalized: impl Fn(&OuterResult) -> f64,
 ) -> ((OuterResult, Option<RestartCause>), bool) {
     let (mut first, first_cause) = first;
     match probed {
-        Some((found, _, Some(false))) => {
+        Some((found, Some(false))) => {
             first.warnings.push(start_probe_stall_warning(
                 first.ofv,
                 first.n_iterations,
@@ -3737,13 +3738,13 @@ fn settle_start_probe(
             first.n_iterations += found.n_iterations;
             ((first, first_cause), first_left_init)
         }
-        Some((found, found_cause, Some(true))) => {
+        Some((found, Some(true))) => {
             let start_wins = penalized(&first) <= penalized(&found);
             // A start that wins is the user's own, never left.
             let left = found.left_init != Some(false) && !start_wins;
-            ((verified_start_result(found, left, first, start_wins), found_cause), true)
+            ((verified_start_result(found, left, first, start_wins), None), true)
         }
-        Some((spent, _, None)) => {
+        Some((spent, None)) => {
             first.n_iterations += spent.n_iterations;
             ((first, first_cause), first_left_init)
         }
@@ -3757,8 +3758,8 @@ fn settle_start_probe(
 ///
 /// - `Some(true)` — the probe's result, through [`verified_start_result`] as for the first
 ///   attempt ([`settle_start_probe`]): the restart's point is an optimum an independent run
-///   came back to, and the probe's own verdict, warnings and restart cause stand, at the
-///   restart's point when that is at or below the probe's. One difference: the published
+///   came back to, and the probe's own verdict and warnings stand, at the restart's point
+///   when that is at or below the probe's. One difference: the published
 ///   `left_init` is the reported point's own, measured from the user's start, and
 ///   `stationary_start` its negation, whichever point wins.
 /// - `Some(false)` — the probe's result as it is, verdict, warnings and displacement its own:
@@ -3771,7 +3772,8 @@ fn settle_start_probe(
 ///
 /// Every probe's evaluations count in `n_iterations`, whichever result is kept. No probe ran
 /// (`probed` is `None`) unless the restart did not leave its start and displacement was all
-/// its acceptance rule rejected it on. Returns the result, the restart cause, whether the
+/// its acceptance rule rejected it on. Returns the result, the restart cause (`None` for a
+/// probe's result: the probe has had its restarts), whether the
 /// reported point is the probe's, and whether the probe verified the point (`Some(true)`),
 /// which lets a mid-descent restart that ties its stalled leg be adopted.
 fn settle_restart_probe(
@@ -3780,26 +3782,21 @@ fn settle_restart_probe(
 ) -> (OuterResult, Option<RestartCause>, bool, bool) {
     let (mut restarted, cause) = restarted;
     match probed {
-        Some((found, found_cause, Some(true))) => {
+        Some((found, Some(true))) => {
             let start_wins = penalized(&restarted) <= penalized(&found);
             // The displacement published is the reported point's own, from the user's start
             // (both legs measure it against `escape_from`): a restart's start is the previous
             // leg's estimates, so a restart whose point wins is not, as on the first attempt,
             // a start the fit never left.
             let left = if start_wins { &restarted } else { &found }.left_init != Some(false);
-            (
-                verified_start_result(found, left, restarted, start_wins),
-                found_cause,
-                !start_wins,
-                true,
-            )
+            (verified_start_result(found, left, restarted, start_wins), None, !start_wins, true)
         }
-        Some((mut found, found_cause, Some(false))) => {
+        Some((mut found, Some(false))) => {
             found.start_eval = restarted.start_eval;
             found.n_iterations += restarted.n_iterations;
-            (found, found_cause, true, false)
+            (found, None, true, false)
         }
-        Some((spent, _, None)) => {
+        Some((spent, None)) => {
             restarted.n_iterations += spent.n_iterations;
             // A probe cut by the budget before its verdict spent the rest of this fit's: the
             // restart's own leg stopped short of it, so the spent budget and the advice the
@@ -3852,8 +3849,7 @@ fn verified_start_result(
     probe.n_iterations += unmoved.n_iterations;
     // The covariance quartet goes with `packed_estimate` (#816). The covariance step's warnings
     // cannot be told apart from the probe's others, so off NLopt they stay the probe's (a point
-    // within `START_PROBE_TOL`); on NLopt the step is deferred to the reported point. The
-    // probe's restart cause stays (adopted only when lower).
+    // within `START_PROBE_TOL`); on NLopt the step is deferred to the reported point.
     if start_wins {
         probe.params = unmoved.params;
         probe.ofv = unmoved.ofv;
@@ -4811,14 +4807,18 @@ pub(crate) fn optimize_nlopt(
         }
         (restarted, restarted_cause, verified)
     };
-    // The probe. With `chain`, its leg runs the fit's own restart chain
-    // ([`resolve_restart_chain`]) before its verdict is read (#2707): from a perturbation of
-    // a restart's point, on a multimodal inner problem, the probe's warm EBEs can be trapped
-    // as the fit's were, and a probe stopped at a basin shift has not finished — it would
-    // return no verdict on a start that is an optimum. The chain's last restart cause is not
-    // carried on: the probe has had its restarts. The first attempt's probe keeps #2506's
-    // single leg.
-    let probe_for = |chain: bool| {
+    // The probe. Its leg runs the fit's own restart chain ([`resolve_restart_chain`]) before
+    // its verdict is read (#2707, #2905): from a perturbation of the start, on a multimodal
+    // inner problem, the probe's warm EBEs can be trapped as the fit's were, and a probe
+    // stopped at a basin shift has not finished — it would return no verdict on a start that
+    // is an optimum. The chain's last restart cause is not carried on: the probe has had its
+    // restarts. `resume_lower` is the one difference between the restart legs' probe
+    // (`RestartLegOwner::Fit`) and the first attempt's: a restart's probe already lower than
+    // its start is the result reported, so it is resumed; a first attempt's is a stall
+    // whatever its chain finds (#2506 reports the unmoved run), so it is not — the chain
+    // would only sharpen the objective its warning names (+79 L-BFGS / +179 BOBYQA
+    // evaluations on a flip-flop stall, macOS arm64).
+    let probe_for = |resume_lower: bool| {
         let (restart_leg, probed, penalized) = (&restart_leg, &probed, &penalized);
         move |start: &ModelParameters, start_ofv: f64, spent_evals: usize| {
             // Its covariance step is deferred like every attempt's: `optimize_nlopt` runs it
@@ -4836,8 +4836,12 @@ pub(crate) fn optimize_nlopt(
                 identity_scales,
                 true,
             );
-            let (result, cause) = if chain {
-                let finished = resolve_restart_chain(
+            let verdict_of =
+                |r: &OuterResult| start_probe_verdict(start_ofv, penalized(r), r.converged);
+            let result = if !resume_lower && verdict_of(&result) == Some(false) {
+                result
+            } else {
+                resolve_restart_chain(
                     options.verbose,
                     crate::cancel::is_cancelled(&options.cancel),
                     (result, outcome.restart_cause()),
@@ -4849,12 +4853,9 @@ pub(crate) fn optimize_nlopt(
                         )
                     },
                     penalized,
-                );
-                (finished, None)
-            } else {
-                (result, outcome.restart_cause())
+                )
             };
-            let verdict = start_probe_verdict(start_ofv, penalized(&result), result.converged);
+            let verdict = verdict_of(&result);
             if options.verbose {
                 eprintln!(
                     "Start probe: the leg did not leave its start (OFV = {start_ofv:.6}); a \
@@ -4864,7 +4865,7 @@ pub(crate) fn optimize_nlopt(
                     result.converged,
                 );
             }
-            *probed.borrow_mut() = Some((result, cause, verdict));
+            *probed.borrow_mut() = Some((result, verdict));
         }
     };
     let (first_probe, restart_probe) = (probe_for(false), probe_for(true));

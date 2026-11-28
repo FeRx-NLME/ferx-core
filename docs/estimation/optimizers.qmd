@@ -242,7 +242,9 @@ the start is an optimum: it **restarts from a perturbation of the start** (every
 coordinate moved by 0.1 in the optimizer's scaled space, alternating in sign and turned
 around at a bound; a tight box may shorten a coordinate's move, and the restart runs
 as long as some coordinate moves at least 0.01) on what is left of the fit's `maxiter` budget, and compares where that
-restart ends with the objective at the start.
+restart ends with the objective at the start. A restart that stops in another EBE basin or
+mid-descent, not yet lower than the start, is first resumed, on the same budget, as a fit's
+leg is ([#2905](https://github.com/FeRx-NLME/ferx-core/issues/2905)).
 
 - **It converges back**, to within 0.01 OFV (about ten times the largest gap measured on
   warm refits, 1.1e-3 under Gauss–Newton): the start was an optimum, and **the restart's
