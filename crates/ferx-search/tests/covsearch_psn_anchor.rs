@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: LGPL-3.0-or-later
 //! The PsN `scm` anchor for covsearch (#1180): the same dataset, base model
 //! and test relations, run through PsN 5.7.1 + NONMEM 7.6 and through ferx,
 //! must walk the **same trajectory** — the same effect added at each forward

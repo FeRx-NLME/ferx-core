@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: LGPL-3.0-or-later
 //! Splitting one AMD search space into the subspace each tool will accept
 //! (#1184).
 //!

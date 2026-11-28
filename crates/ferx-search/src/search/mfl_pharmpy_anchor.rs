@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: LGPL-3.0-or-later
 //! The Pharmpy anchor for the MFL parser and the `@`-symbol resolver.
 //!
 //! `tests/data/mfl_pharmpy_anchor.json` is Pharmpy's own reading of every

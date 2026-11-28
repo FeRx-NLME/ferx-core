@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: LGPL-3.0-or-later
 //! Tier-1 tests for the structural search logic (#1181).
 //!
 //! Every test drives [`search`] with a *scripted* fitter — OFVs keyed by the

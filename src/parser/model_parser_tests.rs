@@ -36604,3 +36604,289 @@ fn a_structural_name_in_a_magnitude_or_weight_gets_its_own_message() {
     let err = expect_parse_err(&ipred_magnitude_str("DV ~ additive(EPS * NOPE)"));
     assert!(err.contains("undeclared covariate `NOPE`") && err.contains("[covariates]"), "{err}");
 }
+
+// ── #3150: an `omega NAME ~ 0 FIX` placeholder is held at 0 and dropped ──────────────────────
+
+/// A one-compartment model with two live ηs; `decl` adds placeholders to `[parameters]`, `cl`
+/// and `v` are the individual-parameter right-hand sides, `extra` is appended to `[error_model]`.
+fn zero_eta_src(decl: &str, cl: &str, v: &str, extra: &str) -> String {
+    format!(
+        "[parameters]\n  theta TVCL(4.0, 0.1, 100.0)\n  theta TVV(12.0, 1.0, 500.0)\n  \
+         omega ETA_CL ~ 0.15\n  omega ETA_V ~ 0.1\n{decl}  sigma PROP ~ 0.1 (sd)\n\
+         [individual_parameters]\n  CL = {cl}\n  V = {v}\n[structural_model]\n  \
+         pk one_cpt_iv(cl=CL, v=V)\n[error_model]\n  DV ~ proportional(PROP)\n{extra}"
+    )
+}
+
+fn dropped_note(m: &CompiledModel) -> Option<&str> {
+    crate::types::dropped_zero_eta_note(m)
+}
+
+/// The placeholders go whole, in every form they take in a sum and outside one, and what is
+/// left is the model written without them: the same ηs, and the same individual parameters
+/// bit for bit. Mutation: have the pass drop the declaration but not rewrite the expressions,
+/// and the model fails to parse (`ETA_Z1` undeclared); turn the names into `0` without deleting
+/// the terms, and the mu-reference of `ETA_CL` is lost.
+#[test]
+fn zero_fix_placeholders_are_dropped_and_leave_the_model_written_without_them() {
+    let decl = "  omega ETA_Z1 ~ 0.0 FIX\n  omega ETA_Z2 ~ 0 FIX\n  omega ETA_Z3 ~ 0.0 FIX\n";
+    // `+ Z`, `- Z`, `Z +` and `-Z +` as the first term, and `Z` where it is not a whole term
+    // (`0.5 * Z`).
+    let with = parse_model_string(&zero_eta_src(
+        decl,
+        "TVCL * exp(ETA_Z3 + ETA_CL + ETA_Z1 - ETA_Z2)",
+        "TVV * exp(-ETA_Z3 + ETA_V) * (1 + 0.5 * ETA_Z1)",
+        "",
+    ))
+    .expect("the model with placeholders parses");
+    let without = parse_model_string(&zero_eta_src(
+        "",
+        "TVCL * exp(ETA_CL)",
+        "TVV * exp(ETA_V) * (1 + 0.5 * 0)",
+        "",
+    ))
+    .expect("the reduced model parses");
+    assert_eq!(with.eta_names, ["ETA_CL", "ETA_V"]);
+    assert_eq!(with.n_eta, 2);
+    assert_eq!(with.default_params.omega.dim(), without.default_params.omega.dim());
+    let note = dropped_note(&with).expect("the dropped placeholders are named");
+    assert!(note.contains("ETA_Z1, ETA_Z2, ETA_Z3") && note.contains("are held at 0"), "{note}");
+    assert!(dropped_note(&without).is_none());
+    let at = |m: &CompiledModel| {
+        let pk = (m.pk_param_fn)(&m.default_params.theta, &[0.3, -0.2], &HashMap::new(), 0.0);
+        format!("{pk:?}")
+    };
+    assert_eq!(at(&with), at(&without), "the individual parameters, bit for bit");
+    // And the structure read from the text: `exp(ETA_CL + 0 - 0)` is no longer recognised as
+    // `TVCL * exp(ETA_CL)`, so a pass that only turned the names into `0` loses the mu-reference
+    // that SAEM and the η re-centring read.
+    let mu = |m: &CompiledModel| {
+        let mut v: Vec<String> = m.mu_refs.iter().map(|(k, r)| format!("{k}: {r:?}")).collect();
+        v.sort();
+        (v, format!("{:?}", m.eta_param_info))
+    };
+    assert_eq!(mu(&with), mu(&without), "mu-references and η parameter info");
+}
+
+/// Everything that keeps a placeholder, one item at a time: an `iiv_on_ruv` that names it, a
+/// `[mixture]` per-class override, a zero block with one name read elsewhere (a block goes
+/// whole or not at all), and a model whose every η is a placeholder (SAEM / IMP / IMPMAP /
+/// Bayes refuse an η-free model, so none goes). Each is asserted both ways: the placeholder is
+/// still declared and the note is absent. Mutation: drop the `declared_once` condition and the
+/// mixture case drops its η; drop the `dropped.len() >= declared` guard and the all-zero model
+/// loses every η.
+#[test]
+fn a_placeholder_that_anything_else_reads_keeps_its_declaration() {
+    let z1 = "  omega ETA_Z1 ~ 0.0 FIX\n";
+    let sum = "TVCL * exp(ETA_CL + ETA_Z1)";
+    let kept = |name: &str, src: String, still: &[&str]| {
+        let m = parse_model_string(&src).unwrap_or_else(|e| panic!("{name}: {e}"));
+        for n in still {
+            assert!(
+                m.eta_names.iter().any(|e| e == n),
+                "{name}: {n} was dropped: {:?}",
+                m.eta_names
+            );
+        }
+        assert!(dropped_note(&m).is_none(), "{name}: {:?}", dropped_note(&m));
+    };
+    kept("iiv_on_ruv", zero_eta_src(z1, sum, "TVV", "  iiv_on_ruv = ETA_Z1\n"), &["ETA_Z1"]);
+    // A named endpoint block that reads it.
+    #[cfg(feature = "survival")]
+    kept(
+        "named endpoint block",
+        zero_eta_src(
+            z1,
+            sum,
+            "TVV",
+            "[event_model cause_a]\n  cmt = 2\n  family = exponential\n  scale = 0.05 * exp(ETA_Z1)\n",
+        ),
+        &["ETA_Z1"],
+    );
+    // A zero block: one name read by `iiv_on_ruv` keeps the whole block.
+    let block = "  block_omega (ETA_Z1, ETA_Z2) = [0, 0, 0] FIX\n";
+    kept(
+        "block with a name read elsewhere",
+        zero_eta_src(
+            block,
+            "TVCL * exp(ETA_CL + ETA_Z1 + ETA_Z2)",
+            "TVV",
+            "  iiv_on_ruv = ETA_Z2\n",
+        ),
+        &["ETA_Z1", "ETA_Z2"],
+    );
+    // A block with a non-zero member is not a placeholder at all.
+    kept(
+        "block with non-zero members",
+        zero_eta_src(
+            "  block_omega (ETA_A, ETA_B) = [0.09, 0.02, 0.04]\n",
+            "TVCL * exp(ETA_CL + ETA_A)",
+            "TVV * exp(ETA_B)",
+            "",
+        ),
+        &["ETA_A", "ETA_B"],
+    );
+    // The `[mixture]` override of a placeholder.
+    kept(
+        "mixture override",
+        MIXTURE_2CLASS
+            .replace("  omega ETA_CL ~ 0.1\n", "  omega ETA_CL ~ 0.1\n  omega ETA_Z1 ~ 0.0 FIX\n")
+            .replace(
+                "  omega(2) ETA_CL ~ 0.4\n",
+                "  omega(2) ETA_CL ~ 0.4\n  omega(2) ETA_Z1 ~ 0.2\n",
+            )
+            .replace("TVCL1 * exp(ETA_CL)", "TVCL1 * exp(ETA_CL + ETA_Z1)"),
+        &["ETA_Z1"],
+    );
+    // No η would remain.
+    let all_zero = "[parameters]\n  theta TVCL(4.0, 0.1, 100.0)\n  theta TVV(12.0, 1.0, 500.0)\n  \
+        omega ETA_Z1 ~ 0.0 FIX\n  omega ETA_Z2 ~ 0.0 FIX\n  sigma PROP ~ 0.1 (sd)\n\
+        [individual_parameters]\n  CL = TVCL * exp(ETA_Z1)\n  V = TVV * exp(ETA_Z2)\n\
+        [structural_model]\n  pk one_cpt_iv(cl=CL, v=V)\n[error_model]\n  DV ~ proportional(PROP)\n";
+    kept("no η would remain", all_zero.to_string(), &["ETA_Z1", "ETA_Z2"]);
+}
+
+/// A zero `FIX` block goes whole, and a zero `FIX` κ is not an `omega`, so it stays.
+#[test]
+fn a_zero_fix_block_goes_whole_and_a_zero_fix_kappa_stays() {
+    let block = parse_model_string(&zero_eta_src(
+        "  block_omega (ETA_Z1, ETA_Z2) = [0, 0, 0] FIX\n",
+        "TVCL * exp(ETA_CL + ETA_Z1)",
+        "TVV * exp(ETA_Z2 + ETA_V)",
+        "",
+    ))
+    .expect("parses");
+    assert_eq!(block.eta_names, ["ETA_CL", "ETA_V"]);
+    assert!(dropped_note(&block).is_some_and(|n| n.contains("ETA_Z1, ETA_Z2")));
+
+    let kappa = parse_model_string(&zero_eta_src(
+        "  omega ETA_Z1 ~ 0.0 FIX\n  kappa KAPPA_CL ~ 0.0 FIX\n",
+        "TVCL * exp(ETA_CL + ETA_Z1 + KAPPA_CL)",
+        "TVV",
+        "",
+    ))
+    .expect("parses");
+    assert_eq!(kappa.eta_names, ["ETA_CL", "ETA_V"]);
+    assert_eq!(kappa.kappa_names, ["KAPPA_CL"], "a κ placeholder is left as declared");
+    assert!(dropped_note(&kappa).is_some_and(|n| n.contains("omega ETA_Z1 ~ 0 FIX is held")));
+}
+
+/// The kink flag that turns the inner stall escape on by default (#3210). A branch counts when
+/// its condition or operand reads a random effect or a state, in `[individual_parameters]` or a
+/// `y` readout; a branch on time, a covariate or θ alone, one in `[derived]`, and an `[odes]`
+/// switch do not. Each mutation reddens its own rows: the predicate stuck at `true` reddens every
+/// negative, stuck at `false` every positive; dropping the dependence test reddens the TIME, WT
+/// and θ rows only; skipping block `if` conditions reddens the block-`if` row only, and not
+/// recursing into an `if` body or an `else` body reddens its nested row only; a taint blind to
+/// κ slots reddens the κ row only.
+#[test]
+fn prediction_has_kink_flags_an_eta_or_state_branch_on_the_prediction_path() {
+    let model = |indiv: &str, odes: &str, scaling: &str| {
+        format!(
+            "[parameters]\n  theta TVBASE(10.0, 0.1, 100.0)\n  theta K(0.15, 0.001, 5.0)\n  \
+             theta TVTH(4.0, 0.01, 50.0)\n  omega ETA_BASE ~ 0.04\n  omega ETA_TH ~ 0.09\n  \
+             sigma ADD_ERR ~ 0.15 (sd)\n[individual_parameters]\n  BASE = TVBASE * exp(ETA_BASE)\n  \
+             TH = TVTH * exp(ETA_TH)\n  F1 = BASE\n{indiv}\n[structural_model]\n  \
+             ode(obs_cmt=eff, states=[eff])\n[odes]\n  d/dt(eff) = {odes}\n[scaling]\n  \
+             y = {scaling}\n[error_model]\n  DV ~ additive(ADD_ERR)\n"
+        )
+    };
+    let decay = "-KI * eff";
+    let mut rows: Vec<(String, String, bool)> = ["abs", "floor", "ceil", "round"]
+        .iter()
+        .map(|f| {
+            let indiv = format!("  KI = K * exp({f}(ETA_BASE))");
+            (format!("{f}(η) in an individual parameter"), model(&indiv, decay, "eff"), true)
+        })
+        .collect();
+    rows.extend(
+        [
+            (
+                "clipped readout (state and η)",
+                model("  KI = K", decay, "if (eff - TH < 0) 0 else eff - TH"),
+                true,
+            ),
+            ("max readout, η in TH", model("  KI = K", decay, "max(eff - TH, 0)"), true),
+            (
+                "a readout branch on the state alone",
+                model("  KI = K", decay, "if (eff > 5) eff else 2 * eff"),
+                true,
+            ),
+            (
+                "an η reached through TH only",
+                model("  KI = if (TH > 5) K else 2 * K", decay, "eff"),
+                true,
+            ),
+            (
+                "block if on η",
+                model(
+                    "  if (ETA_BASE > 0) {\n    KI = K\n  } else {\n    KI = 2 * K\n  }",
+                    decay,
+                    "eff",
+                ),
+                true,
+            ),
+            (
+            "nested block if on η",
+            model(
+                "  if (K > 1) {\n    if (ETA_BASE > 0) {\n      KI = K\n    } else {\n      KI = 2 * K\n    \
+                 }\n  } else {\n    KI = 3 * K\n  }",
+                decay,
+                "eff",
+            ),
+            true,
+        ),
+        (
+            "block if on η inside an else body",
+            model(
+                "  if (K > 1) {\n    KI = K\n  } else {\n    KI = 2 * K\n    if (ETA_BASE > 0) {\n      \
+                 KI = 3 * K\n    }\n  }",
+                decay,
+                "eff",
+            ),
+            true,
+        ),
+        (
+            "a branch on a κ alone",
+            model("  KI = if (KAPPA_TH > 0) K else 2 * K", decay, "eff")
+                .replace("  sigma ADD_ERR", "  kappa KAPPA_TH ~ 0.04\n  sigma ADD_ERR"),
+            true,
+        ),
+        ("if on TIME", model("  KI = K", decay, "if (TIME > 6) eff else 2 * eff"), false),
+            ("if on WT", model("  KI = if (WT > 70) K else 2 * K", decay, "eff"), false),
+            ("a branch on θ alone", model("  KI = if (K > 1) K else 2 * K", decay, "eff"), false),
+            (
+                "an [odes] switch on the observed state",
+                model("  KI = K", "if (eff > 5) -KI * eff else -2 * KI * eff", "eff"),
+                false,
+            ),
+            ("a smooth readout", model("  KI = K", decay, "eff - TH"), false),
+        ]
+        .map(|(what, src, want)| (what.to_string(), src, want)),
+    );
+    let mut wrong = Vec::new();
+    for (what, src, want) in &rows {
+        let got = parse_full_model(src).unwrap_or_else(|e| panic!("{what}: {e}")).model;
+        if got.prediction_has_kink != *want {
+            wrong.push(format!("{what}: {}", got.prediction_has_kink));
+        }
+    }
+    // `warfarin_ode_time` has a branch on an unobserved state and on TAD in `[odes]`, and
+    // `max(IPRED)` in `[derived]`; the six done-5 ODE examples have no branch (#3210 m1).
+    let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("examples");
+    for name in [
+        "warfarin_ode_time",
+        "mm_iv",
+        "mm_oral",
+        "emax_pkpd",
+        "one_cpt_iv_ode",
+        "pkpd_nonmem",
+        "transit_2cpt",
+    ] {
+        let parsed = parse_full_model_file(&dir.join(format!("{name}.ferx"))).expect(name);
+        if parsed.model.prediction_has_kink {
+            wrong.push(format!("{name}: true"));
+        }
+    }
+    assert!(wrong.is_empty(), "rows the flag got wrong: {wrong:#?}");
+}

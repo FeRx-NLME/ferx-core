@@ -272,7 +272,7 @@ jobs:
           timeout --signal=INT --kill-after=2m ${{ matrix.leg == 'core' && '60m' || '95m' }} \
             python3 tools/ci-test-shard.py run slow ${{ matrix.shard }} ${{ strategy.job-total }} --lib-parts 1 --manifest manifest -- \
               --workspace --exclude docs-lint --exclude patterns-lint --no-default-features \
-              --features ${{ matrix.leg == 'core' && 'ferx-core/ci,ferx-core/survival,ferx-core/slow-tests,ferx-tools/slow-tests,ferx-search/slow-tests' || 'ferx-core/ci,ferx-core/survival,ferx-core/nn,ferx-core/slow-tests,ferx-tools/slow-tests,ferx-search/slow-tests' }} \
+              --features ${{ matrix.leg == 'core' && 'ferx-core/ci,ferx-core/survival,ferx-core/slow-tests,ferx-tools/slow-tests,ferx-search/slow-tests,ferx-cli/search' || 'ferx-core/ci,ferx-core/survival,ferx-core/nn,ferx-core/slow-tests,ferx-tools/slow-tests,ferx-search/slow-tests,ferx-cli/search' }} \
               --profile ci-test --no-fail-fast ${{ inputs.nocapture && '-- --nocapture' || '' }} \
             || { code=$?; \
                  if [ "$code" -eq 124 ]; then \
@@ -347,7 +347,7 @@ jobs:
           timeout --signal=INT --kill-after=2m 70m \
             python3 tools/ci-test-shard.py run slow-nn 1 1 --lib-parts 1 --list-all --manifest manifest -- \
               --workspace --exclude docs-lint --exclude patterns-lint --no-default-features \
-              --features ferx-core/ci,ferx-core/survival,ferx-core/nn,ferx-core/slow-tests,ferx-tools/slow-tests,ferx-search/slow-tests \
+              --features ferx-core/ci,ferx-core/survival,ferx-core/nn,ferx-core/slow-tests,ferx-tools/slow-tests,ferx-search/slow-tests,ferx-cli/search \
               --profile ci-test --no-fail-fast ${{ inputs.nocapture && '-- --nocapture' || '' }} \
             || { code=$?; \
                  if [ "$code" -eq 124 ]; then \

@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: LGPL-3.0-or-later
 //! The seam between a search's step logic and the [`Runner`]: one step's
 //! candidates in, one [`RunReport`] out.
 //!

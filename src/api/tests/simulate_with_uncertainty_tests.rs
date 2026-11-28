@@ -586,6 +586,8 @@ pub(super) fn synthetic_fit(template: &ModelParameters) -> FitResult {
         method_chain: vec![EstimationMethod::FoceI],
         method_wall_times_secs: vec![0.0],
         covariance_wall_time_secs: 0.0,
+        ofv_settlement_wall_time_secs: 0.0,
+        subject_results_wall_time_secs: 0.0,
         converged: true,
         ofv: 0.0,
         aic: Some(0.0),

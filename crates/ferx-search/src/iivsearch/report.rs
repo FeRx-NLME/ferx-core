@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: LGPL-3.0-or-later
 //! `models.csv`, `models/<id>.ferx` and `final.ferx` — what a
 //! variability-structure search leaves behind (#1183).
 //!

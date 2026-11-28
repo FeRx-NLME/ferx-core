@@ -5170,6 +5170,7 @@ fn iov_solve_at_a_tight_tolerance_certifies_a_partial_at_its_mode() {
             false,
             false,
             InnerHessianSeed::None,
+            false,
         )
     };
     let flat = |r: &EbeResult| {
@@ -5720,6 +5721,7 @@ fn iov_solved_zero_start_is_seeded() {
             false,
             warm,
             InnerHessianSeed::GaussNewton,
+            false,
         );
         let used = LAST_INITIAL_HESSIAN.with(|h| h.borrow().is_some());
         assert_eq!(used, seeded, "warm {warm}, start of {}", start.len());

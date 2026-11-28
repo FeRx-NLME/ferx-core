@@ -1,25 +1,22 @@
 [package]
 name = "ferx-search"
-version = "0.4.0"
+version = "0.5.0"
 edition = "2021"
 description = "Model-space search on top of ferx-core: structural, variability, residual-error and covariate search"
-license = "MIT"
+license = "LGPL-3.0-or-later"
 authors = ["Ron Keizer", "Teun Post", "Hidde van de Beek"]
 repository = "https://github.com/FeRx-NLME/ferx-core"
 keywords = ["nlme", "pharmacometrics", "model-selection", "covariate-search", "amd"]
 categories = ["science", "mathematics", "simulation"]
-# Held back from crates.io until its license is settled (#3183). `ferx-cli`
-# depends on this crate, so it cannot be published either until then.
-publish = false
 
 [dependencies]
 # `default-features = false` is load-bearing, not tidiness: see the note in
 # `crates/ferx-tools/Cargo.toml`.
-ferx-core = { path = "../..", version = "0.4.0", default-features = false }
+ferx-core = { path = "../..", version = "0.5.0", default-features = false }
 # One item: `lanes::run_in_lanes`, the bounded fit queue. The arrow points this
 # way only: `ferx-tools` must never depend on `ferx-search` (#3185, pinned by
 # `tests/public_api_boundary.rs`).
-ferx-tools = { path = "../ferx-tools", version = "0.4.0" }
+ferx-tools = { path = "../ferx-tools", version = "0.5.0" }
 csv = "1.3"
 nalgebra = "0.35"
 rand = "0.10"

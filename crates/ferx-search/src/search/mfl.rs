@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: LGPL-3.0-or-later
 //! The Model Feature Language (MFL): the grammar a `.ferxsearch` file states
 //! its search space in (#1179).
 //!

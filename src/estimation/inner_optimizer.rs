@@ -1031,6 +1031,12 @@ pub(crate) struct InnerSolvePolicy {
     /// quadrature, whose objective is that constant; quadrature, IMP and the rest keep the
     /// solve. `false`, the `Default`, solves.
     pub(crate) skip_refused: bool,
+    /// Restart from a small kick of each informative coordinate of the returned EBE and keep a
+    /// lower mode ([`kink::kick_restarts`], #3159), where a second mode a barrier away is
+    /// otherwise reported as the subject's EBE. `[fit_options] inner_kick`, in every solve: kicked
+    /// in the final pass only, a fit's #833 recovery scores the warm, unkicked EBEs lower on OFV
+    /// and reports them (#3159 review). `false`, the `Default`.
+    pub(crate) kick: bool,
 }
 
 impl InnerSolvePolicy {
@@ -1052,6 +1058,7 @@ impl InnerSolvePolicy {
             keep_certified_start: false,
             unseeded_iov_warm: false,
             skip_refused: skips_refused_subjects(options),
+            kick: options.inner_kick,
         }
     }
 
@@ -2186,12 +2193,13 @@ pub(crate) fn find_ebe_for_stage_with_prev(
         restarts,
         schedule.as_ref(),
         // The historical seed, as `find_ebe_with_variance` uses; only the convention, the
-        // #2013 screen and the #2095 twin seed come from the stage.
+        // #2013 screen, the #2095 twin seed and the #3159 kicks come from the stage.
         InnerSolvePolicy {
             ebe_variance: EbeVariance::for_options(stage, model),
             screen: stage.inner_screen,
             twin_seed: stage.inner_twin_seed,
             skip_refused: skips_refused_subjects(stage),
+            kick: stage.inner_kick,
             ..InnerSolvePolicy::default()
         }
         .with_prev_etas(prev),
@@ -2485,6 +2493,9 @@ pub(crate) fn recording_handle() -> Option<RecordingHandle> {
     INNER_RECORDING.with(|r| r.borrow().clone())
 }
 
+#[path = "inner_kink.rs"]
+mod kink;
+
 /// Run `f` with this thread writing to `handle`, then restore what it wrote to before — on
 /// every exit path, a panic included, so a recorded fit that panics on a cached pool worker
 /// cannot leave its handle armed there (#2379).
@@ -2640,6 +2651,7 @@ fn find_ebe_impl_from(
             // A refused subject's zeros are `refused_iov_ebe`'s placeholder, not a solve.
             policy.init_is_warm && !refused,
             if policy.unseeded_iov_warm { InnerHessianSeed::None } else { policy.seed },
+            policy.kick,
         );
         #[cfg(test)]
         with_recording(|r| {
@@ -3341,6 +3353,9 @@ fn find_ebe_solve(
             stop_precond,
             &stall_at,
             short_line_search,
+            // Not on every model (#3159 land): on by default it fired 390 times in a smooth
+            // transit fit, and the EBEs it moved broke BOBYQA's convergence.
+            kink::kink_escape_allowed(model, use_analytic, policy.kick),
         )
     };
 
@@ -3491,6 +3506,8 @@ fn find_ebe_solve(
                 #[cfg(test)]
                 TWIN_SEEDS_RUN.with(|n| n.set(n.get() + 1));
                 let mut cand = start;
+                // No kink escape on this probe (#3159 review): it is a short, independent
+                // exploration of the flip-flop twin, not the primary solve.
                 let ok = inner_minimize_with_grad(
                     &obj,
                     &agrad,
@@ -3502,6 +3519,7 @@ fn find_ebe_solve(
                     None,
                     stop_precond,
                     &stall_at,
+                    false,
                     false,
                 );
                 if cand.iter().all(|v| v.is_finite()) {
@@ -3593,6 +3611,8 @@ fn find_ebe_solve(
             restarts,
             Some(&params.omega.matrix),
         ) {
+            // No kink escape on this probe (#3159 review): a restart seed already starts at a
+            // sizeable step, not on the search's own mode.
             let ok = inner_minimize_with_grad(
                 &obj,
                 &agrad,
@@ -3604,6 +3624,7 @@ fn find_ebe_solve(
                 None,
                 stop_precond,
                 &stall_at,
+                false,
                 false,
             );
             if cand.iter().all(|v| v.is_finite()) {
@@ -3620,6 +3641,54 @@ fn find_ebe_solve(
             }
         }
         MULTISTART_PROFILE.record(twin_moved, screen_moved, axis_moved);
+    }
+
+    // Kick restarts around the incumbent (#3159): a second mode a barrier away. Each probe is
+    // capped and cheap; the walk's end point is re-descended to the search's own tolerance
+    // before it is compared and adopted (`kink::kick_restarts`'s `finish`, #3159 review).
+    if policy.kick {
+        let sds: Vec<f64> =
+            omega_prior_diag(&params.omega, n_eta).iter().map(|p| p.var.max(0.0).sqrt()).collect();
+        let probe = |cand: &mut Vec<f64>| {
+            inner_minimize_with_grad(
+                &obj,
+                &agrad,
+                cand,
+                n_eta,
+                max_iter.min(kink::KICK_MAX_ITER),
+                tol,
+                precond.as_deref(),
+                None,
+                stop_precond,
+                &stall_at,
+                false,
+                false,
+            );
+        };
+        let finish = |cand: &mut Vec<f64>| {
+            inner_minimize_with_grad(
+                &obj,
+                &agrad,
+                cand,
+                n_eta,
+                max_iter,
+                tol,
+                precond.as_deref(),
+                None,
+                stop_precond,
+                &stall_at,
+                false,
+                use_analytic,
+            )
+        };
+        if let Some((cand, cand_nll, ok)) =
+            kink::kick_restarts(&eta, nll, &sds, &obj, probe, finish)
+        {
+            nll = cand_nll;
+            eta = cand;
+            ebe_exit = ok;
+            used_fallback = false;
+        }
     }
 
     // ── Runaway-EBE guard (#958) ───────────────────────────────────────────
@@ -3943,6 +4012,7 @@ fn find_ebe_iov(
         init_is_mode,
         false,
         InnerHessianSeed::GaussNewton,
+        false,
     )
 }
 
@@ -3952,7 +4022,7 @@ fn find_ebe_iov(
 fn find_ebe_iov_seeded(
     model: &CompiledModel, subject: &Subject, params: &ModelParameters, max_iter: usize, tol: f64,
     eta_init: Option<&[f64]>, mu_k: Option<&[f64]>, restarts: usize, ebe_variance: EbeVariance,
-    init_is_mode: bool, init_is_warm: bool, seed: InnerHessianSeed,
+    init_is_mode: bool, init_is_warm: bool, seed: InnerHessianSeed, kick: bool,
 ) -> EbeResult {
     let n_eta = model.n_eta;
     let n_kappa = model.n_kappa;
@@ -4437,6 +4507,7 @@ fn find_ebe_iov_seeded(
         None,
         &stall_at,
         false,
+        kink::kink_escape_allowed(model, analytic_iov_inner, kick),
     );
     // On BFGS failure, recover exactly as the non-IOV `find_ebe` does (cold seed = prior
     // mode `bsv_psi = μ`, κ = 0): keep the lower-objective of {BFGS partial, NM restart}
@@ -4564,8 +4635,11 @@ fn find_ebe_iov_seeded(
                     }
                 });
             }
+            // No kink escape on this probe (#3159 review): a restart seed already starts at a
+            // sizeable step, not on the search's own mode.
             let ok = inner_minimize_with_grad(
                 &obj, &agrad, &mut cand, n_flat, max_iter, tol, None, None, None, &stall_at, false,
+                false,
             );
             if cand.iter().all(|v| v.is_finite()) {
                 let cand_nll = obj(&cand);
@@ -4586,6 +4660,54 @@ fn find_ebe_iov_seeded(
             }
         }
         MULTISTART_PROFILE.record(false, false, axis_moved);
+    }
+
+    // Kick restarts around the incumbent (#3159), on the flat `[ψ, κ_1, …, κ_K]`. Each probe is
+    // capped and cheap; the walk's end point is re-descended to the search's own tolerance
+    // before it is compared and adopted (`kink::kick_restarts`'s `finish`, #3159 review).
+    if kick {
+        let nll = obj(&x);
+        let sds: Vec<f64> = iov_prior_diag(n_eta, n_kappa, k_occasions, nested, params)
+            .iter()
+            .map(|p| p.var.max(0.0).sqrt())
+            .collect();
+        let probe = |cand: &mut Vec<f64>| {
+            inner_minimize_with_grad(
+                &obj,
+                &agrad,
+                cand,
+                n_flat,
+                max_iter.min(kink::KICK_MAX_ITER),
+                tol,
+                None,
+                None,
+                None,
+                &stall_at,
+                false,
+                false,
+            );
+        };
+        let finish = |cand: &mut Vec<f64>| {
+            inner_minimize_with_grad(
+                &obj,
+                &agrad,
+                cand,
+                n_flat,
+                max_iter,
+                tol,
+                None,
+                None,
+                None,
+                &stall_at,
+                false,
+                analytic_iov_inner,
+            )
+        };
+        if let Some((cand, _, ok)) = kink::kick_restarts(&x, nll, &sds, &obj, probe, finish) {
+            x = cand;
+            ebe_exit = ok;
+            used_fallback = false;
+        }
     }
 
     let runaway_limit = RUNAWAY_EBE_MAHA_PER_ETA * n_flat as f64;
@@ -6618,6 +6740,7 @@ fn inner_minimize_with_grad(
     obj: &dyn Fn(&[f64]) -> f64, grad: &dyn Fn(&[f64]) -> Vec<f64>, x: &mut [f64], n: usize,
     max_iter: usize, tol: f64, precond: Option<&[f64]>, hessian_seed: Option<&DMatrix<f64>>,
     stop_precond: Option<&[f64]>, stall_at: &dyn Fn(&[f64]) -> bool, short_line_search: bool,
+    allow_kink_escape: bool,
 ) -> InnerExit {
     inner_minimize_with_prime(
         obj,
@@ -6632,6 +6755,7 @@ fn inner_minimize_with_grad(
         stop_precond,
         stall_at,
         short_line_search,
+        allow_kink_escape,
     )
 }
 
@@ -6649,7 +6773,7 @@ fn inner_minimize_with_prime(
     obj: &dyn Fn(&[f64]) -> f64, prime: Option<&PrimeFn<'_>>, grad: &dyn Fn(&[f64]) -> Vec<f64>,
     x: &mut [f64], n: usize, max_iter: usize, tol: f64, precond: Option<&[f64]>,
     hessian_seed: Option<&DMatrix<f64>>, stop_precond: Option<&[f64]>,
-    stall_at: &dyn Fn(&[f64]) -> bool, short_line_search: bool,
+    stall_at: &dyn Fn(&[f64]) -> bool, short_line_search: bool, allow_kink_escape: bool,
 ) -> InnerExit {
     if matches!(inner_optimizer_mode(), crate::types::InnerOptimizer::NelderMead) {
         // NM's simplex-spread exit is its stopping rule, not a certificate (#1527): measured
@@ -6680,6 +6804,7 @@ fn inner_minimize_with_prime(
             stop_precond,
             stall_at,
             short_line_search,
+            allow_kink_escape,
         )
     } else {
         dense_bfgs_run(
@@ -6695,6 +6820,7 @@ fn inner_minimize_with_prime(
             stop_precond,
             stall_at,
             short_line_search,
+            allow_kink_escape,
         )
     };
     #[cfg(test)]
@@ -6712,6 +6838,8 @@ fn lbfgs_core(
     max_iter: usize, tol: f64, precond: Option<&[f64]>, stop_precond: Option<&[f64]>,
     stall_at: &dyn Fn(&[f64]) -> bool, short_line_search: bool,
 ) -> bool {
+    // The fallback certifier's polish is a generic recovery primitive used far outside the
+    // primary search (covariance, SIR, profile): no kink escape here (#3159 review).
     lbfgs_run(
         obj,
         None,
@@ -6724,6 +6852,7 @@ fn lbfgs_core(
         stop_precond,
         stall_at,
         short_line_search,
+        false,
     )
     .converged()
 }
@@ -6734,6 +6863,7 @@ fn lbfgs_run(
     obj: &dyn Fn(&[f64]) -> f64, prime: Option<&PrimeFn<'_>>, grad: &dyn Fn(&[f64]) -> Vec<f64>,
     x: &mut [f64], n: usize, max_iter: usize, tol: f64, precond: Option<&[f64]>,
     stop_precond: Option<&[f64]>, stall_at: &dyn Fn(&[f64]) -> bool, short_line_search: bool,
+    allow_kink_escape: bool,
 ) -> InnerExit {
     let mut s_hist: Vec<Vec<f64>> = Vec::new();
     let mut y_hist: Vec<Vec<f64>> = Vec::new();
@@ -6748,6 +6878,8 @@ fn lbfgs_run(
     let mut stall = 0u32;
     // Accepted non-moves in a row ([`exact_search_stuck`], #2497).
     let mut non_moves = NonMoveStreak::default();
+    // Kink escapes this solve has attempted ([`kink::stall_escape`], #3159).
+    let mut escapes = 0usize;
     let mut best_gnorm = f64::INFINITY;
     // The regime is a property of the *iterate*, not of the start point (#1521 review): a
     // transit/IG subject can begin inside the closed form's domain and cross the flip-flop
@@ -6847,6 +6979,27 @@ fn lbfgs_run(
             x[i] += s[i];
         }
         if stalled {
+            // A stall at a kink is not a minimum unless the gradients around it say so (#3159).
+            // Only with a gradient this solve already trusts to be exact: `stall_escape` reads
+            // the same `grad` closure, and on an FD-gradient ODE objective its samples carry
+            // the same solver noise `enable_stall` exists to tolerate — a model with no kink,
+            // forced to `gradient = fd`, moved OFV -442.3578 to -438.8685 on a measured
+            // example before this gate (#3159 review). `allow_kink_escape` is the caller's
+            // `analytic_inner_grad_supported` / `analytic_iov_inner_supported` verdict, and `inner_kick`.
+            if allow_kink_escape && escapes < kink::MAX_STALL_ESCAPES {
+                escapes += 1;
+                if let Some(e) = kink::stall_escape(obj, grad, x, f_cur, &g) {
+                    x.copy_from_slice(&e.x);
+                    f_cur = e.f;
+                    g = e.g;
+                    s_hist.clear();
+                    y_hist.clear();
+                    rho_hist.clear();
+                    stall = 0;
+                    best_gnorm = f64::INFINITY;
+                    continue;
+                }
+            }
             return InnerExit::Converged;
         }
         enable_stall = enable_stall || stall_at(x);
@@ -6997,6 +7150,8 @@ fn dense_bfgs_core(
     max_iter: usize, tol: f64, precond: Option<&[f64]>, hessian_seed: Option<&DMatrix<f64>>,
     stop_precond: Option<&[f64]>, stall_at: &dyn Fn(&[f64]) -> bool, short_line_search: bool,
 ) -> bool {
+    // The fallback certifier's polish is a generic recovery primitive used far outside the
+    // primary search (covariance, SIR, profile): no kink escape here (#3159 review).
     dense_bfgs_run(
         obj,
         None,
@@ -7010,6 +7165,7 @@ fn dense_bfgs_core(
         stop_precond,
         stall_at,
         short_line_search,
+        false,
     )
     .converged()
 }
@@ -7020,7 +7176,7 @@ fn dense_bfgs_run(
     obj: &dyn Fn(&[f64]) -> f64, prime: Option<&PrimeFn<'_>>, grad: &dyn Fn(&[f64]) -> Vec<f64>,
     x: &mut [f64], n: usize, max_iter: usize, tol: f64, precond: Option<&[f64]>,
     hessian_seed: Option<&DMatrix<f64>>, stop_precond: Option<&[f64]>,
-    stall_at: &dyn Fn(&[f64]) -> bool, short_line_search: bool,
+    stall_at: &dyn Fn(&[f64]) -> bool, short_line_search: bool, allow_kink_escape: bool,
 ) -> InnerExit {
     let seed_inv = seed_h_inv(n, hessian_seed);
     let mut h_inv = init_h_inv(n, precond, seed_inv.as_ref());
@@ -7052,6 +7208,8 @@ fn dense_bfgs_run(
     let mut stall = 0u32;
     // Accepted non-moves in a row ([`exact_search_stuck`], #2497).
     let mut non_moves = NonMoveStreak::default();
+    // Kink escapes this solve has attempted ([`kink::stall_escape`], #3159).
+    let mut escapes = 0usize;
     let mut best_gnorm = f64::INFINITY;
     // The regime is a property of the *iterate*, not of the start point (#1521 review): a
     // transit/IG subject can begin inside the closed form's domain and cross the flip-flop
@@ -7166,6 +7324,26 @@ fn dense_bfgs_run(
         let f_old = f_cur;
         f_cur = f_new;
         if stalled {
+            // A stall at a kink is not a minimum unless the gradients around it say so (#3159).
+            // Only with a gradient this solve already trusts to be exact: `stall_escape` reads
+            // the same `grad` closure, and on an FD-gradient ODE objective its samples carry
+            // the same solver noise `enable_stall` exists to tolerate — a model with no kink,
+            // forced to `gradient = fd`, moved OFV -442.3578 to -438.8685 on a measured
+            // example before this gate (#3159 review). `allow_kink_escape` is the caller's
+            // `analytic_inner_grad_supported` / `analytic_iov_inner_supported` verdict, and `inner_kick`.
+            if allow_kink_escape && escapes < kink::MAX_STALL_ESCAPES {
+                escapes += 1;
+                if let Some(e) = kink::stall_escape(obj, grad, x, f_cur, &g) {
+                    x.copy_from_slice(&e.x);
+                    f_cur = e.f;
+                    g = e.g;
+                    h_inv = init_h_inv(n, precond, seed_inv.as_ref());
+                    h_unshaped = true;
+                    stall = 0;
+                    best_gnorm = f64::INFINITY;
+                    continue;
+                }
+            }
             return InnerExit::Converged;
         }
         enable_stall = enable_stall || stall_at(x);
@@ -7427,6 +7605,8 @@ fn screen_descents(
     screen_starts(obj, omega, n_eta, n, subject_id)
         .into_iter()
         .map(|mut cand| {
+            // No kink escape on this probe (#3159 review): one of many Sobol-screen points,
+            // not the search's own mode.
             let ok = inner_minimize_with_grad(
                 obj,
                 agrad,
@@ -7438,6 +7618,7 @@ fn screen_descents(
                 None,
                 stop_precond,
                 stall_at,
+                false,
                 false,
             );
             cand.iter().all(|v| v.is_finite()).then(|| {
@@ -8845,6 +9026,10 @@ fn run_inner_loop_warm_map_impl<T: Send + Default>(
 
     (eta_hats, h_matrices, stats, kappas, extras)
 }
+
+#[cfg(test)]
+#[path = "inner_kink_tests.rs"]
+mod kink_tests;
 
 #[cfg(test)]
 #[path = "inner_optimizer_tests.rs"]

@@ -1131,60 +1131,65 @@ pub fn optimize_population_warm(
 //  NLopt-based outer optimizer (matches Julia's NLopt path exactly)
 // ═══════════════════════════════════════════════════════════════════════════
 
-/// Identity-Hessian first-step overshoot guard for the scaled gradient.
+/// Identity-Hessian first-step overshoot guard: the scalar `c ≥ 1` such that no component
+/// of `g / c` exceeds `clamp(half_width, 0.1, 1.0)` in scaled space (the clamp keeps it
+/// effective on fixed / very narrow and on very wide bounds).
 ///
 /// SLSQP and L-BFGS start with `H = I`, so the first step is `−∇f` projected onto the box;
-/// with |∇f|∞ ≈ 10²–10³ (analytic FOCE gradients) it pins every component to a corner and
-/// the fit stays at init (#55 SLSQP, #960 L-BFGS). This rescales `g` in place by one
-/// scalar so no component of the step exceeds `clamp(half_width, 0.1, 1.0)` in scaled
-/// space (the clamp keeps it effective on fixed / very narrow and on very wide bounds).
-/// Uniform, so the direction is unchanged. Returns whether the cap fired.
+/// with |∇f|∞ ≈ 10²–10⁸ it pins every component to a corner and the fit stays at init
+/// (#55 SLSQP, #960 L-BFGS). So the first gradient evaluation of a leg sets `c`, and NLopt
+/// minimises `f / c` with gradient `∇f / c` for the rest of that leg
+/// ([`optimize_nlopt_attempt_probed`]). Dividing the objective too is what keeps the two
+/// consistent (#3153). When only the gradient was divided, the first line search's slope
+/// test was `c` times off and backtracked to ~1% of its step. The first secant pair
+/// `y = g₂ − g₁/c` could also fail `sᵀy > 0`: Luksan's PLIS then restarted on the raw
+/// gradient and took the uncapped step to a bound. A turnover model's `KIN` stayed on its
+/// guard there, 1887 OFV above the optimum. MMA and BOBYQA are never capped.
 ///
-/// Applied on every SLSQP eval but only the first L-BFGS eval ([`should_cap_gradient`]):
-/// capping later corrupts L-BFGS's `(s, y)` curvature (#960). MMA and BOBYQA are never capped.
-pub(crate) fn cap_scaled_gradient(g: &mut [f64], lower_s: &[f64], upper_s: &[f64]) -> bool {
+/// `c` is set once per leg's first gradient and reset to 1 after the first leg
+/// ([`optimize_nlopt_attempt_probed`]), so only the first leg of an attempt is ever capped.
+/// Before #3153, SLSQP was capped (gradient only) on every evaluation of every leg; now a
+/// verification, polish or basin-shift restart leg runs it uncapped, at `H = I`, on the raw
+/// gradient. L-BFGS legs were already uncapped past the first (#960), so they are unchanged.
+/// Whether to re-arm `c` for every leg, on both algorithms, is a design question (#3198)
+/// outside this fix's scope: it changes the step every later leg takes, not only the first.
+pub(crate) fn cap_factor(g: &[f64], lower_s: &[f64], upper_s: &[f64]) -> f64 {
     debug_assert_eq!(g.len(), lower_s.len());
     debug_assert_eq!(g.len(), upper_s.len());
-    let mut worst_ratio = 0.0_f64;
-    for i in 0..g.len() {
-        let budget = ((upper_s[i] - lower_s[i]).abs() * 0.5).clamp(0.1, 1.0);
-        let ratio = g[i].abs() / budget;
-        if ratio > worst_ratio {
-            worst_ratio = ratio;
-        }
-    }
-    if worst_ratio > 1.0 {
-        for gi in g.iter_mut() {
-            *gi /= worst_ratio;
-        }
-        true
-    } else {
-        false
-    }
+    (0..g.len())
+        .map(|i| g[i].abs() / ((upper_s[i] - lower_s[i]).abs() * 0.5).clamp(0.1, 1.0))
+        .fold(1.0, f64::max)
 }
 
-/// Whether the overshoot cap ([`cap_scaled_gradient`]) fires on this gradient eval.
-/// `n_grad_evals` counts this eval too, so the first is `1`.
-///
-/// - **SLSQP** — every eval (its QP stores no curvature from gradients, #55).
-/// - **L-BFGS** — the first eval, and later ones only on the stall-retry pass while
-///   still at the initial estimates (`hold_cap_at_init`; see [`optimize_nlopt`]).
-///   Holding it from the start corrupts the `(s, y)` curvature: ~11 OFV on
-///   `scaling_convergence`, ~4 on the 2-cpt transit fit (#960).
-/// - **MMA / BOBYQA** — never.
-pub(crate) fn should_cap_gradient(
-    algo: nlopt::Algorithm, n_grad_evals: usize, hold_cap_at_init: bool,
-) -> bool {
-    match algo {
-        nlopt::Algorithm::Slsqp => true,
-        nlopt::Algorithm::Lbfgs => n_grad_evals == 1 || hold_cap_at_init,
-        _ => false,
-    }
+/// Divide `g` in place by [`cap_factor`]; returns whether it fired. Only the #751 stall
+/// retry does this, on every evaluation while still at the initial estimates
+/// (`hold_cap_at_init`; see [`optimize_nlopt`]).
+pub(crate) fn cap_scaled_gradient(g: &mut [f64], lower_s: &[f64], upper_s: &[f64]) -> bool {
+    let c = cap_factor(g, lower_s, upper_s);
+    g.iter_mut().for_each(|gi| *gi /= c);
+    c > 1.0
+}
+
+// #3153 review r1 row 8: what NLopt's first leg actually receives, each time `c` fires —
+// `(raw_ofv, scaled_ofv, raw_grad_norm, scaled_grad_norm)`. A build that divides only the
+// gradient (the pre-#3153 shape) pushes a point where `scaled_ofv == raw_ofv` but
+// `scaled_grad_norm < raw_grad_norm`; [`take_first_leg_scale_probe`]'s one caller asserts
+// the two ratios agree instead.
+#[cfg(test)]
+thread_local! {
+    static FIRST_LEG_SCALE_PROBE: std::cell::RefCell<Vec<(f64, f64, f64, f64)>> =
+        std::cell::RefCell::new(Vec::new());
+}
+
+/// Drains [`FIRST_LEG_SCALE_PROBE`].
+#[cfg(test)]
+pub(crate) fn take_first_leg_scale_probe() -> Vec<(f64, f64, f64, f64)> {
+    FIRST_LEG_SCALE_PROBE.with(|v| v.borrow_mut().split_off(0))
 }
 
 /// Scaled-space displacement from the initial estimates below which a point still counts
 /// as "at init" (~1% on O(1) scaled coordinates). Gates: the [`optimize_nlopt`] stall
-/// retry, [`should_cap_gradient`]'s held cap, and [`failure_is_converged_plateau`]'s
+/// retry, its held cap ([`cap_scaled_gradient`]), and [`failure_is_converged_plateau`]'s
 /// refusal to call a bare `Failure` converged at init (#751: a stalled fit moved 1.4e-4).
 /// Well above the FOCE noise floor (~1e-4) and below a real first step (O(0.1)).
 pub(crate) const INIT_ESCAPE_STEP_S: f64 = 1e-2;
@@ -1192,7 +1197,7 @@ pub(crate) const INIT_ESCAPE_STEP_S: f64 = 1e-2;
 /// L∞ distance between two scaled vectors, or `NaN` for mismatched lengths or any
 /// non-finite coordinate. Callers compare against [`INIT_ESCAPE_STEP_S`], and `NaN`
 /// fails both comparisons — the conservative reading for
-/// [`failure_is_converged_plateau`] and [`should_cap_gradient`] alike (an `f64::max`
+/// [`failure_is_converged_plateau`] and the held cap alike (an `f64::max`
 /// fold would drop `NaN` and report "at init"). Lengths never differ (`debug_assert`).
 pub(crate) fn max_scaled_deviation(a: &[f64], b: &[f64]) -> f64 {
     debug_assert_eq!(a.len(), b.len());
@@ -4662,7 +4667,7 @@ pub(crate) enum RestartCause {
 /// ways a run can stop somewhere that is not a minimum.
 ///
 /// The first attempt is the default configuration: the identity-Hessian
-/// overshoot cap fires on L-BFGS's opening gradient eval only, because holding
+/// overshoot cap ([`cap_factor`]) is set on L-BFGS's opening gradient eval only, because holding
 /// it on corrupts the `(s, y)` curvature pairs of a fit that is descending
 /// normally (#960 — measured at ~11 OFV units on `scaling_convergence`).
 ///
@@ -5019,7 +5024,7 @@ const MAX_BASIN_RESTARTS: usize = 3;
 /// first iteration always is — returns a bare `Failure` that discards every
 /// point it accepted (#1411, `plis.c` instrumented). The eval-12 abort is the
 /// *extrapolation* cap inside the first line search: the identity-Hessian
-/// overshoot cap ([`should_cap_gradient`]) shrank the opening gradient 1.7e5×,
+/// overshoot cap (which then divided the gradient alone, [`cap_factor`]) shrank the opening gradient 1.7e5×,
 /// so every trial point showed a huge real decrease next to a tiny predicted
 /// slope and the search extrapolated eleven times — before any `(s, y)` pair
 /// exists. A fresh run from the best point works there because it re-arms that
@@ -5926,7 +5931,7 @@ fn optimize_nlopt_once(
 /// [`AttemptOutcome`] — whether the fit left its initial estimates, and whether
 /// it stopped mid-descent — which is what [`optimize_nlopt`] runs a second
 /// attempt on. `hold_cap_at_init` is the retry mode — see
-/// [`should_cap_gradient`].
+/// [`cap_scaled_gradient`].
 ///
 /// `restart` is `Some` for the #1277 restart leg only, and carries the two
 /// things that leg inherits from the stalled one ([`RestartLeg`]):
@@ -6029,7 +6034,7 @@ fn optimize_nlopt_attempt_probed(
     //
     // IOV + SLSQP auto-enables per-coordinate scaling (#101): IOV models pack disparate
     // magnitudes (block-diagonal omega plus the kappa block), and SLSQP's uniform gradient cap
-    // (`cap_scaled_gradient`, every SLSQP eval) would otherwise rescale the whole gradient by
+    // ([`cap_factor`]) would otherwise rescale the whole gradient by
     // the worst (theta) component and starve the omega / omega_iov step. The #99 regression that
     // made scaling default-off was on non-IOV models and other algorithms (notably MMA), so the
     // auto-enable is scoped to the combination that needs it. Since #155/#490 the default
@@ -6237,6 +6242,11 @@ fn optimize_nlopt_attempt_probed(
         ..options.clone()
     };
     let in_leg = std::cell::Cell::new(false);
+    // The first leg's objective scale (`cap_factor`); later legs see the OFV itself.
+    let obj_scale = std::cell::Cell::new(1.0_f64);
+    // Until the leg's first real (unguarded) gradient. Not `n_grad_evals == 1`: the mixture
+    // gradient does not count there, and SLSQP on a mixture must still be capped.
+    let first_gradient = std::cell::Cell::new(true);
     let leg_best = std::cell::RefCell::new(BestPoint::new());
     let leg_first: std::cell::Cell<Option<f64>> = std::cell::Cell::new(None);
     // Set when the #2093 basin probe ends a leg. Such a stop belongs to the basin-shift
@@ -6274,7 +6284,7 @@ fn optimize_nlopt_attempt_probed(
             }
             state.n_evals += 1;
             n_evals_cl.fetch_add(1, Ordering::Relaxed);
-            return state.best_ofv;
+            return state.best_ofv / obj_scale.get();
         }
         // Unscale from optimizer space to real (log/Cholesky) space.
         let x: Vec<f64> = (0..n).map(|i| xs[i] * scale[i]).collect();
@@ -6624,7 +6634,8 @@ fn optimize_nlopt_attempt_probed(
             want_dx: warm_predictor,
             ..Default::default()
         };
-        if let Some(g) = grad {
+        let mut grad = grad;
+        if let Some(g) = grad.as_deref_mut() {
             // A rejected or non-finite point has no useful population gradient: steepest
             // ascent toward bounds center nudges the optimizer back. Fall through (no early
             // return) so the eval is still traced and prev_x / stagnation stay correct,
@@ -6715,15 +6726,22 @@ fn optimize_nlopt_attempt_probed(
                 // Clone the scaled gradient for the trace only when a trace is
                 // open — this runs on every gradient eval (the hot path), so an
                 // unconditional `to_vec` would waste an allocation per eval on
-                // the default trace-off path (#640 review). Snapshot before the
-                // SLSQP cap below so it matches `grad_norm_for_trace`.
+                // the default trace-off path (#640 review). The trace holds the
+                // unscaled gradient, matching `grad_norm_for_trace`: the `1/c` of
+                // [`cap_factor`] is applied just before the closure returns.
                 if crate::estimation::trace::is_active() {
                     grad_vec_for_trace = Some(g.to_vec());
                 }
                 let hold_cap =
                     hold_cap_at_init && max_scaled_deviation(xs, &x0_start_s) < INIT_ESCAPE_STEP_S;
-                if should_cap_gradient(algo, state.n_grad_evals, hold_cap) {
+                let capped = matches!(algo, nlopt::Algorithm::Lbfgs | nlopt::Algorithm::Slsqp);
+                let first = first_gradient.replace(false);
+                if capped && hold_cap {
+                    // The #751 stall retry: the gradient alone, on every evaluation while the
+                    // fit is still at its start, as before #3153 (the objective is not scaled).
                     cap_scaled_gradient(g, &lower_s, &upper_s);
+                } else if capped && first {
+                    obj_scale.set(cap_factor(g, &lower_s, &upper_s));
                 }
                 // Gate on the global best (same tracker as the `best_seen` update
                 // below) so `last_gradient` always reflects the best point seen.
@@ -7152,7 +7170,25 @@ fn optimize_nlopt_attempt_probed(
 
         state.prev_x = xs.to_vec();
 
-        ofv
+        // NLopt sees `f / c` and `∇f / c` ([`cap_factor`]); everything above keeps the OFV.
+        let c = obj_scale.get();
+        let reported_ofv = ofv / c;
+        if let Some(g) = grad {
+            g.iter_mut().for_each(|gi| *gi /= c);
+            #[cfg(test)]
+            if !in_verify_leg && c > 1.0 {
+                let after = g.iter().map(|v| v * v).sum::<f64>().sqrt();
+                FIRST_LEG_SCALE_PROBE.with(|v| {
+                    v.borrow_mut().push((
+                        ofv,
+                        reported_ofv,
+                        grad_norm_for_trace.unwrap_or(f64::NAN),
+                        after,
+                    ));
+                });
+            }
+        }
+        reported_ofv
     };
 
     // Create NLopt optimizer with state (operates in scaled xs space)
@@ -7246,6 +7282,11 @@ fn optimize_nlopt_attempt_probed(
         resolve_outer_ftol(model.has_non_gaussian(), model.is_ode_based(), options.outer_ftol)
             .min(POLISH_FTOL_REL);
     let first_leg = opt.optimize(&mut x0);
+    let c = obj_scale.replace(1.0);
+    // Back from `f / c` to `f`, for consistency with every later leg's OFV units: nothing
+    // downstream reads this value numerically (only the status, e.g. `verified_stop_needs_left_init`),
+    // so no test can tell this rescale apart from leaving it unscaled.
+    let first_leg = first_leg.map(|(st, f)| (st, f * c)).map_err(|(st, f)| (st, f * c));
     #[cfg(test)]
     FIRST_LEG_EVALS.with(|c| c.set(Some(n_evals_outer.load(Ordering::Relaxed))));
     let mut opt_slot = Some(opt);

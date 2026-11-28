@@ -62,6 +62,15 @@ A warm start is often close to the mode of the previous outer evaluation, a few 
 - **A short step still teaches curvature.** BFGS updates its metric from each accepted step's pair $(s, y)$ when $s^\top y > 10^{-12}$, *or* when $s^\top y > 10^{-8}\lVert s\rVert\lVert y\rVert$. Near the mode $s^\top y \approx \lambda\lVert s\rVert^2$ is tiny for every step, so the absolute test alone stopped updating the metric, and the search zigzagged to `inner_maxiter`. On `examples/warfarin` the inner objective evaluations fell from 143,927 to 18,424 with both rules, and the BFGS failures from 63 to 2. With every IOV warm start at the previous mode (η̂, κ̂), as #2271 makes it, `nested_levels_3` had 24 such failures and went from 100,960 to 16,879 evaluations. An ODE objective keeps the absolute test only: there a short step's $y$ is the solver's noise, which the relative test would admit as curvature.
 - **On an exact objective, the gradient verifies a step the objective cannot resolve.** When a step's predicted gain is below $10^{-11}(1+|f|)$, the same verification as at an ODE's noise floor runs first: the full step is taken when it keeps the objective within that resolution and at least halves the gradient norm. Otherwise the line search runs as before. This only accepts steps. The solve still counts as converged only at $\lVert\nabla_\eta\rVert < \texttt{inner\_tol}$.
 
+#### A kink in the individual objective {#inner-loop-kinks}
+
+A prediction clipped at a threshold (`y = if (x - TH < 0) 0 else x - TH`) puts a kink in a subject's individual objective wherever a record crosses it, and the inner search can go wrong there in two ways (#3159).
+
+- **A stall on a kink's valley floor.** BFGS arrives on the kink, where the gradient is large and points across the valley, and every step along the valley gains less than the objective-stall stop treats as flat. The stop certifies that point at $\lVert\nabla\rVert \approx 10$, up to 0.175 above the minimum of the individual objective, with nothing flagged. A large gradient is not what is wrong: the *minimum* of such an objective is itself a kink minimum, also certified at a large gradient. So, when the stall stop of an ODE model's search fires at $\lVert\nabla\rVert \ge 1$ (the noise floor of a smooth ODE objective is at most about $6 \times 10^{-3}$), the gradients at the point and at $\pm 10^{-5}$ along each axis are taken, and their convex hull is asked whether it contains zero (gradient sampling, Burke–Lewis–Overton). If it does, the point is a minimum and is certified as before. If not, the hull's minimum-norm element is a descent direction along the valley; the search steps along it and restarts. It runs by default only on a model with a kink on its prediction path: an `if`, `min`, `max`, `clamp`, `abs`, `floor`, `ceil` or `round` that reads a random effect or a state, in `[individual_parameters]` or a `y` readout (#3210). `inner_kick = true` runs it on every model. A smooth ODE objective can stall there too: in a one-η flip-flop transit fit the escape moved 55 of 390 solves by up to 0.75, back and forth between outer evaluations, so BOBYQA could not settle. An `[odes]` switch or an η on a dose time is a kink it does not detect; a closed-form model has no stall stop.
+- **A second mode a barrier away.** A record that crosses the threshold between two points makes a second local minimum close to the first (0.011 away in the fixture) that no descent from the incumbent reaches. With `[fit_options] inner_kick = true`, every inner solve kicks each informative coordinate (at most 16, widest prior first) by $\pm 0.25$ prior standard deviations and keeps a descent of at most 12 iterations from each when it ends lower by more than $10^{-9}$. A subject with one mode ends where it started. The search's solves kick too: kicked in the final pass only, a fit's final EBE check (#833) compared the kicked EBE with the search's unkicked one by OFV, where the unkicked one scores lower (the log-determinant jumps at the kink), and reported it. **Off by default**: the kicks run whether or not the model has a kink, and cost 2-20× on four fast ODE examples without one (`mm_iv`, `one_cpt_iv_ode`, `emax_pkpd`, `mm_oral`) — turn it on for a model with a clipped or thresholded prediction.
+
+On the fixture of #3159 (40 subjects, one subject objective each), 4 subjects ended 0.175, 0.165, 0.055 and 0.032 above the minimum; with both, none does. Fitted (6 subjects of it, `tests/fixtures/clipped_decay`, Linux), the default and `inner_kick = true` both reach OFV −4844.3147, the point a restart from a perturbation also reaches. Only `inner_kick = true` reports it converged: under the default a cold re-solve of subject 17 scores 8.5 higher (`W_EBE_START_DEPENDENT`), because the kicks that reach its mode from a cold start are off. The OFV of a fit that has an EBE on a kink also depends on which side of the kink it lands: the FOCE log-determinant jumps there, so the individual objective, not the OFV, is the quantity that is minimised.
+
 #### Where the residual variance is taken {#inner-loop-residual-variance}
 
 Under **FOCEI** (and Laplace/AGQ) $V_{ij} = V(f_{ij}(\eta_i))$, the variance at the
@@ -1222,9 +1231,9 @@ and a gap ends the leg for the restart. Before, a trapped leg ran until NLopt it
 On a 10-subject subset of the Michaelis–Menten benchmark below (`tests/ebe_basin_shift.rs`)
 the probe stops the trapped first leg at its 33rd evaluation, where a cold solve scores
 68.08, and the restart converges at 63.29. A leg the probe clears runs on unchanged, at the
-cost of one cold inner pass per probe. On `examples/warfarin_dcm.ferx` (Linux) the probe
-catches a trapped first leg at its 64th evaluation instead of the 96th, and the restart
-converges at −1173.56 either way (#2204).
+cost of one cold inner pass per probe. On `examples/warfarin_dcm.ferx` as it was before it declared `init`
+(Linux), the probe caught a trapped first leg at its 64th evaluation instead of the 96th, and
+the restart converged at −1173.56 either way (#2204).
 
 A probe ends the leg only when the gap comes from at least **1 % of the subjects** (#2600).
 On a large population a handful of subjects almost always sits in a lower cold mode: a
@@ -1276,9 +1285,9 @@ notice in `FitResult.warnings` says which run the reported estimates come from.
 
 On a simulated population of 80 subjects, 24 of them flip-flop
 (`tests/fixtures/flip_flop_pop/`, fitted in closed form and as an ODE), both fits end at the
-optimum, OFV −3051.439163, and are now reported converged. The closed form stops through the
-verified-stop rule and the ODE twin through the plateau rule. The check costs about 110 more
-objective evaluations (87 → 197 and 85 → 202), about twice each fit's run time (Linux).
+optimum, OFV −3392.235417, and are now reported converged. The closed form stops through the
+verified-stop rule and the ODE twin through the plateau rule. The check costs about 85–95 more
+objective evaluations (73 → 156 and 112 → 208), about twice each fit's run time (Linux).
 
 ## Configuration Example
 

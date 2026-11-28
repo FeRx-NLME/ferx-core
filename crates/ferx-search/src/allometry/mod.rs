@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: LGPL-3.0-or-later
 //! Allometric scaling — Pharmpy's `allometry` tool (#1180).
 //!
 //! Multiply every clearance-like parameter by `(WT / 70)^0.75` and every

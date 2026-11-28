@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: LGPL-3.0-or-later
 //! Tier-1 tests for the ruvsearch logic (#1182).
 //!
 //! Every test drives [`search`] with a *scripted* fitter — a table of OFVs

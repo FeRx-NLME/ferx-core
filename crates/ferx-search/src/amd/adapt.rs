@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: LGPL-3.0-or-later
 //! The production [`StepRunner`]: the real tools, and their rows adapted to
 //! the pipeline's own table (#1184).
 //!

@@ -352,13 +352,13 @@ fn fit_with_missing_files_errors() {
 #[test]
 fn an_unknown_tool_name_is_named_as_a_tool_not_as_a_missing_file() {
     let out = ferx()
-        .args(["covsearchx", "covsearch.ferxsearch"])
+        .args(["bootstrapx", "run1.ferx"])
         .output()
         .expect("run ferx with an unknown tool name");
     assert_eq!(out.status.code(), Some(1), "unknown tool → exit 1");
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(
-        stderr.contains("tool `covsearchx` not recognized"),
+        stderr.contains("tool `bootstrapx` not recognized"),
         "expected the unknown-tool error: {stderr}"
     );
     // The regression this exists to catch: the old model-file reading. The phrase
@@ -369,7 +369,7 @@ fn an_unknown_tool_name_is_named_as_a_tool_not_as_a_missing_file() {
         "a tool name must not be reported as a model file: {stderr}"
     );
     assert!(
-        stderr.contains("Did you mean `covsearch`?"),
+        stderr.contains("Did you mean `bootstrap`?"),
         "expected a suggestion for a one-edit typo: {stderr}"
     );
     assert!(stderr.contains("Available tools:"), "expected the tool list: {stderr}");
@@ -514,7 +514,10 @@ fn every_listed_tool_still_dispatches() {
         .split(", ")
         .map(str::to_string)
         .collect::<Vec<_>>();
-    assert!(listed.len() >= 12, "expected every tool listed: {listed:?}");
+    // 5 tools, plus the 8 model-search tools when built with `search` (#3187).
+    let expected = if cfg!(feature = "search") { 13 } else { 5 };
+    assert_eq!(listed.len(), expected, "expected every tool listed: {listed:?}");
+    assert_eq!(listed.contains(&"covsearch".to_string()), cfg!(feature = "search"), "{listed:?}");
     for tool in listed {
         let out = ferx()
             .args([&tool, "--help"])
@@ -526,6 +529,29 @@ fn every_listed_tool_still_dispatches() {
             "`{tool}` is advertised but not dispatched: {stderr}"
         );
     }
+}
+
+/// #3187: a build without the `search` feature still knows the search tools'
+/// names, and says what is missing rather than calling them unknown or reading
+/// them as model files.
+#[cfg(not(feature = "search"))]
+#[test]
+fn a_search_tool_in_a_build_without_search_names_the_missing_feature() {
+    for tool in ["covsearch", "amd"] {
+        let out = ferx().args([tool, "x.ferxsearch"]).output().expect("run ferx");
+        assert_eq!(out.status.code(), Some(1));
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(
+            stderr.contains(&format!("`{tool}` is a model-search tool"))
+                && stderr.contains("built without the `search` feature"),
+            "{stderr}"
+        );
+        assert!(!stderr.contains("not recognized"), "{stderr}");
+    }
+    let out = ferx().arg("--help").output().expect("run ferx --help");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(stdout.contains("built without the `search` feature"), "{stdout}");
+    assert!(!stdout.contains("ferx covsearch"), "{stdout}");
 }
 
 // ── ferx bootstrap (#1140) ───────────────────────────────────────────────────
@@ -598,6 +624,7 @@ fn the_bootstrap_subcommand_does_not_shadow_a_plain_fit() {
 
 // ── ferx covsearch / ferx allometry (#1180) ─────────────────────────────────
 
+#[cfg(feature = "search")]
 #[test]
 fn covsearch_help_lists_the_search_options() {
     let out = ferx().args(["covsearch", "--help"]).output().expect("run ferx covsearch --help");
@@ -615,6 +642,7 @@ fn covsearch_help_lists_the_search_options() {
     }
 }
 
+#[cfg(feature = "search")]
 #[test]
 fn covsearch_without_a_file_is_a_usage_error_and_unknown_flags_are_refused() {
     let out = ferx().args(["covsearch"]).output().expect("run");
@@ -629,6 +657,7 @@ fn covsearch_without_a_file_is_a_usage_error_and_unknown_flags_are_refused() {
     assert!(String::from_utf8_lossy(&out.stderr).contains("unknown flag: --samples"));
 }
 
+#[cfg(feature = "search")]
 #[test]
 fn covsearch_refuses_a_file_meant_for_another_tool_before_reading_data() {
     // The shipped example ranks on BIC (a modelsearch file); covsearch
@@ -645,6 +674,7 @@ fn covsearch_refuses_a_file_meant_for_another_tool_before_reading_data() {
     assert!(!stderr.contains("Data:"), "{stderr}");
 }
 
+#[cfg(feature = "search")]
 const ONE_CPT_WT: &str = "[parameters]
   theta TVCL(0.2, 0.001, 10.0)
   theta TVV(10.0, 0.1, 500.0)
@@ -678,6 +708,7 @@ const ONE_CPT_WT: &str = "[parameters]
 /// A whole search from the command line, on evaluations (`maxiter = 0`) so
 /// it is seconds: the base model, one forward step over two candidates that
 /// cannot be significant, and the files a user reads afterwards.
+#[cfg(feature = "search")]
 #[test]
 fn covsearch_runs_a_search_and_writes_its_files() {
     let dir = tempfile::tempdir().expect("tempdir");
@@ -715,6 +746,7 @@ fn covsearch_runs_a_search_and_writes_its_files() {
     assert_eq!(steps.lines().count(), 3, "{steps}");
 }
 
+#[cfg(feature = "search")]
 #[test]
 fn allometry_help_and_usage() {
     let out = ferx().args(["allometry", "--help"]).output().expect("run ferx allometry --help");
@@ -728,6 +760,7 @@ fn allometry_help_and_usage() {
     assert!(String::from_utf8_lossy(&out.stderr).contains("Usage: ferx allometry"));
 }
 
+#[cfg(feature = "search")]
 #[test]
 fn allometry_scales_a_model_from_the_command_line() {
     let dir = tempfile::tempdir().expect("tempdir");
@@ -798,6 +831,7 @@ fn allometry_scales_a_model_from_the_command_line() {
 
 /// The `.ferxsearch` form of `ferx allometry`, with estimated exponents and
 /// a signed exponent on the command line (review of #1238).
+#[cfg(feature = "search")]
 #[test]
 fn allometry_from_a_search_file_estimates_exponents() {
     let dir = tempfile::tempdir().expect("tempdir");
@@ -846,6 +880,7 @@ fn allometry_from_a_search_file_estimates_exponents() {
 /// ΔOFV is significant, so the evaluations still walk two forward steps —
 /// covering the "added" progress line and the SELECTED rows — and a second,
 /// `--resume --quiet` invocation on the same directory refits nothing.
+#[cfg(feature = "search")]
 #[test]
 fn covsearch_accepts_effects_and_resumes_quietly() {
     let dir = tempfile::tempdir().expect("tempdir");
@@ -901,6 +936,7 @@ fn covsearch_accepts_effects_and_resumes_quietly() {
 
 // ── ferx modelsearch (#1181) ────────────────────────────────────────────────
 
+#[cfg(feature = "search")]
 #[test]
 fn modelsearch_help_usage_and_a_file_meant_for_another_tool() {
     let out = ferx().args(["modelsearch", "--help"]).output().expect("run ferx modelsearch --help");
@@ -935,6 +971,7 @@ fn modelsearch_help_usage_and_a_file_meant_for_another_tool() {
 /// A whole structural search from the command line, on evaluations
 /// (`maxiter = 0`) so it is seconds: the base, one layer of three candidates,
 /// and the files a user reads afterwards.
+#[cfg(feature = "search")]
 #[test]
 fn modelsearch_runs_a_search_and_writes_its_files() {
     let dir = tempfile::tempdir().expect("tempdir");
@@ -975,6 +1012,7 @@ fn modelsearch_runs_a_search_and_writes_its_files() {
 
 // ── ferx globalsearch (#1185) ───────────────────────────────────────────────
 
+#[cfg(feature = "search")]
 #[test]
 fn globalsearch_help_usage_and_a_file_meant_for_another_tool() {
     let out =
@@ -1011,6 +1049,7 @@ fn globalsearch_help_usage_and_a_file_meant_for_another_tool() {
 /// A whole global search from the command line, on evaluations
 /// (`maxiter = 0`) so it is seconds: the input, an eight-point grid over a
 /// structural and a covariate axis, and the files a user reads afterwards.
+#[cfg(feature = "search")]
 #[test]
 fn globalsearch_runs_an_exhaustive_search_and_writes_its_files() {
     let dir = tempfile::tempdir().expect("tempdir");
@@ -1447,4 +1486,17 @@ fn summary_json_with_help_prints_usage() {
     assert_eq!(out.status.code(), Some(0));
     let stdout = String::from_utf8(out.stdout).unwrap();
     assert!(stdout.contains("Usage: ferx summary") && stdout.contains("--json"), "{stdout}");
+}
+
+/// #3183: `ferx --licenses` is how the binary carries the LGPL texts and the
+/// third-party notices it links, so it must exit 0 and print them, not be read
+/// as a model path or an unknown flag.
+#[test]
+fn licenses_flag_prints_the_notices() {
+    let out = ferx().arg("--licenses").output().expect("run ferx --licenses");
+    assert!(out.status.success(), "--licenses should exit 0: {out:?}");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    for needle in ["ferx-search", "LESSER GENERAL PUBLIC LICENSE", "Third-party notices", "nlopt"] {
+        assert!(stdout.contains(needle), "`ferx --licenses` lacks {needle:?}");
+    }
 }

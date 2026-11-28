@@ -38,6 +38,10 @@
   # MLP shape: 2 → 8 → 8 → 5. Total weights:
   #   2*8 + 8 + 8*8 + 8 + 8*5 + 5 = 141.
   layers     = [8, 8]
+  # Starting value of each output, on its parameter's own scale (CL, V1, Q, V2, KA). Without
+  # it every output starts at softplus(0) = 0.693 and the optimum a fit reaches depends on
+  # the path to it (W_NN_BARE_OUTPUT_START; docs/model-file/covariate-nn.qmd).
+  init       = [4, 40, 8, 80, 1]
   # Hidden activation: tanh keeps hidden units in a smooth bounded regime.
   # Output activation: softplus guarantees positive PK parameters without
   # exponential blow-up. See docs/model-file/covariate-nn.qmd for the

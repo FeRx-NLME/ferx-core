@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: LGPL-3.0-or-later
 //! Tier-3: the CWRES pre-screen and the full refit select the same feature on
 //! the fixture set (#1182, the issue's third validation bullet) — up to the
 //! `power`/`combined` pair Pharmpy treats as one candidate.

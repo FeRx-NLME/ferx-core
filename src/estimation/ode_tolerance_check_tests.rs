@@ -179,6 +179,54 @@ fn fit_warns_when_the_ofv_moves_at_a_tighter_tolerance_and_not_when_settled() {
     assert!(not_settled(&tight).is_none(), "a settled objective warned: {:?}", tight.warnings);
 }
 
+/// #3157: `ode_ofv_check = false` skips the check and the fit says so, under the token an
+/// unrunnable check uses; the same evaluation with the check on warns and times it. Both sides
+/// of the gate in one test, so a gate that is always open or always shut fails. The check's
+/// time is zero where it did not run (switched off, or nothing integrates), and the subject
+/// results are timed either way.
+#[test]
+fn switching_the_check_off_skips_it_and_says_so_and_the_phases_are_timed() {
+    let prep = mm_iv();
+    let at = |on: bool, prep: &crate::api::PreparedRun| {
+        let opts = FitOptions {
+            verbose: false,
+            outer_maxiter: 0,
+            run_covariance_step: false,
+            ode_reltol: 1e-3,
+            ode_abstol: 1e-3,
+            ode_method: crate::ode::OdeMethod::Rk45,
+            ode_ofv_check: on,
+            ..prep.parsed.fit_options.clone()
+        };
+        crate::fit(&prep.parsed.model, &prep.population, &prep.init_params, &opts).expect("fit")
+    };
+    let on = at(true, &prep);
+    assert!(not_settled(&on).is_some(), "the loose pair must warn: {:?}", on.warnings);
+    assert!(on.ofv_settlement_wall_time_secs > 0.0 && on.subject_results_wall_time_secs > 0.0);
+    assert!(!on.warnings.iter().any(|w| w.contains("ode_ofv_check")), "{:?}", on.warnings);
+
+    let off = at(false, &prep);
+    assert!(not_settled(&off).is_none(), "{:?}", off.warnings);
+    let note = off
+        .warnings
+        .iter()
+        .find(|w| {
+            w.starts_with("W_ODE_OFV_SETTLEMENT_UNCHECKED:") && w.contains("ode_ofv_check = false")
+        })
+        .unwrap_or_else(|| panic!("no skip note in {:?}", off.warnings));
+    assert_eq!(crate::types::classify_warning(note).category, WarningCode::OdeSolver);
+    assert_eq!(off.ofv_settlement_wall_time_secs, 0.0);
+    assert!(off.subject_results_wall_time_secs > 0.0);
+    assert_eq!(off.ofv, on.ofv, "the check never changes the objective");
+
+    // Nothing integrates: no check to switch off, so no note, and no check time either way.
+    let warfarin = crate::api::prepare_run("examples/warfarin.ferx", Some("data/warfarin.csv"))
+        .expect("prepare warfarin");
+    let closed = at(false, &warfarin);
+    assert!(!closed.warnings.iter().any(|w| w.contains("ode_ofv_check")), "{:?}", closed.warnings);
+    assert_eq!(closed.ofv_settlement_wall_time_secs, 0.0);
+}
+
 /// A Monte-Carlo estimator owning the published OFV is out of scope: it reports an objective
 /// `pop_nll_opts` does not compute, so comparing against it would blame the estimator's own
 /// noise on the ODE tolerance. A differential pair: the same model and tolerance warn under

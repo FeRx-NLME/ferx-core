@@ -4086,7 +4086,9 @@ pub fn parse_full_model_with(
     let mut extracted = extract_blocks(content)?;
     // A deprecated block (`[initial_values]`) is a warning, not an error (#2913):
     // taken out here so it seeds `parse_warnings` when the model is built.
-    let deprecated_block_warnings = std::mem::take(&mut extracted.warnings);
+    let mut deprecated_block_warnings = std::mem::take(&mut extracted.warnings);
+    // `omega NAME ~ 0 FIX` placeholders are held at 0 and taken out of the model (#3150).
+    deprecated_block_warnings.extend(apply_zero_fix_etas(&mut extracted, level_bindings));
     // `ode_template NAME(...)` desugaring (#322 Phase 0b): if [structural_model]
     // uses `ode_template`, rewrite it (and the [odes]/[scaling] blocks) into the
     // hand-written `ode(...)` form *before* anything else looks at the blocks, so
@@ -5104,27 +5106,26 @@ pub fn parse_full_model_with(
     // `__ferx_ro_*` variables (#486/#1636), which would hide the block.
     // #1065: per θ block, the one plain column every read indexes it by.
     let mut read_index: Vec<(String, Option<String>)> = Vec::new();
+    let readout = match blocks.get("scaling") {
+        Some(lines) => readout_y_exprs(lines, &theta_names, &eta_names, &indiv_var_names)
+            .map_err(|e| retarget_scaling_diag(is_algebraic, e))?,
+        None => Vec::new(),
+    };
+    // #1649/#1650: the per-η couplings also follow the random effects into the
+    // states, which the share above does not.
+    let state_lines: Vec<&String> =
+        ["odes", "initial_conditions"].iter().filter_map(|b| blocks.get(*b)).flatten().collect();
+    let states = StateInputs::new(
+        &state_lines,
+        is_algebraic,
+        ode_spec.as_ref().map(|s| s.state_names.as_slice()),
+        pk_model,
+        &pk_param_map,
+        &indiv_var_names,
+    );
+    // #3210: turns the inner stall escape on by default.
+    let prediction_has_kink = prediction_has_kink(&indiv_stmts, &readout, &states);
     if !level_block_decls.is_empty() || vector_theta_decls.iter().any(|d| d.profiled) {
-        let readout = match blocks.get("scaling") {
-            Some(lines) => readout_y_exprs(lines, &theta_names, &eta_names, &indiv_var_names)
-                .map_err(|e| retarget_scaling_diag(is_algebraic, e))?,
-            None => Vec::new(),
-        };
-        // #1649/#1650: the per-η couplings also follow the random effects into the
-        // states, which the share above does not.
-        let state_lines: Vec<&String> = ["odes", "initial_conditions"]
-            .iter()
-            .filter_map(|b| blocks.get(*b))
-            .flatten()
-            .collect();
-        let states = StateInputs::new(
-            &state_lines,
-            is_algebraic,
-            ode_spec.as_ref().map(|s| s.state_names.as_slice()),
-            pk_model,
-            &pk_param_map,
-            &indiv_var_names,
-        );
         let mut readout_with_states = states.readout(&readout, blocks.contains_key("scaling"));
         // #2562: a `[binary_model]` predictor is a prediction too. It reads no state,
         // so it joins both readout lists as written.
@@ -5855,6 +5856,7 @@ pub fn parse_full_model_with(
         gradient_method: GradientMethod::default(),
         parse_warnings: deprecated_block_warnings, // more pushed below
         has_conditional_eta_params: false,
+        prediction_has_kink,
         eta_param_info,
         kappa_param_types,
         theta_transform,
@@ -11112,6 +11114,9 @@ fn parse_adaptive_dosing_block(
         auc_target,
         rules,
     };
+    if spec.rules.is_empty() {
+        return Err(crate::sim::adaptive::NO_RULES.to_string());
+    }
     spec.validate()?;
     if let (Some(step), Some(ladder)) = (at_step, &spec.intervals) {
         check_intervals_on_every_grid(ladder, step)?;
@@ -12022,6 +12027,7 @@ pub fn apply_fit_option(opts: &mut FitOptions, key: &str, value: &str) -> Result
         "inner_maxiter" => opts.inner_maxiter = parse_usize("inner_maxiter")?,
         "inner_tol" => opts.inner_tol = parse_f64("inner_tol")?,
         "inner_restarts" => opts.inner_restarts = parse_usize("inner_restarts")?,
+        "inner_kick" => opts.inner_kick = parse_bool("inner_kick")?,
         "inner_screen" => opts.inner_screen = parse_usize("inner_screen")?,
         "inner_twin_seed" => opts.inner_twin_seed = parse_bool("inner_twin_seed")?,
         // Validated like its covariance-step sibling `fd_hessian_step`, not like
@@ -12053,6 +12059,7 @@ pub fn apply_fit_option(opts: &mut FitOptions, key: &str, value: &str) -> Result
             };
         }
         "ode_auto_switch" => opts.ode_auto_switch = parse_bool("ode_auto_switch")?,
+        "ode_ofv_check" => opts.ode_ofv_check = parse_bool("ode_ofv_check")?,
         "ode_method" => {
             opts.ode_method = crate::ode::OdeMethod::parse(value).ok_or_else(|| {
                 format!(
@@ -18449,6 +18456,137 @@ pub(crate) fn mixing_logp_grad(
     out
 }
 
+#[cfg(test)]
+thread_local! {
+    static KEEP_ZERO_FIX_ETAS: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Test-only: while alive on this thread, [`apply_zero_fix_etas`] drops nothing, so a test of
+/// the machinery that carries a `0 FIX` η through Ω (simulation's exact zero, the packed
+/// layout) still has one to carry. Such an η survives in a model when it is read by
+/// `iiv_on_ruv` or an endpoint block, and in every Ω built from a bare matrix.
+#[cfg(test)]
+pub(crate) struct KeepZeroFixEtas(bool);
+
+#[cfg(test)]
+impl KeepZeroFixEtas {
+    pub(crate) fn on() -> Self {
+        Self(KEEP_ZERO_FIX_ETAS.with(|k| k.replace(true)))
+    }
+    fn is_on() -> bool {
+        KEEP_ZERO_FIX_ETAS.with(std::cell::Cell::get)
+    }
+}
+
+#[cfg(test)]
+impl Drop for KeepZeroFixEtas {
+    fn drop(&mut self) {
+        KEEP_ZERO_FIX_ETAS.with(|k| k.set(self.0));
+    }
+}
+
+/// Blocks whose lines are expressions an η may appear in as a plain value. A placeholder η that
+/// is mentioned anywhere else (`iiv_on_ruv = NAME` in `[error_model]`, a `[mixture]` override, an
+/// endpoint block, `frem_predictions`) keeps its declaration: those read the η by name or by
+/// position, which dropping it would move.
+const ZERO_ETA_EXPRESSION_BLOCKS: [&str; 4] =
+    ["individual_parameters", "odes", "scaling", "derived"];
+
+/// Design A2 of #3150: an `omega NAME ~ 0 FIX` η (or every name of an all-zero `FIX`
+/// `block_omega`) is held at 0, as NONMEM holds `$OMEGA 0 FIX`, so it is taken out of the model
+/// instead of being carried through every subject's inner problem at variance `1e-8`.
+///
+/// A text pass on the extracted blocks, run before anything reads them: the declaration is
+/// removed, a term `+ NAME`, `- NAME`, `NAME +` or `-NAME +` is deleted from the sum it is in,
+/// and a `NAME` left anywhere else reads as `0` (`NAME * k`, `exp(NAME)`: the same value, though
+/// a pattern the fit reads from the text, such as mu-referencing, can then differ). For the
+/// deleted spellings the model that results is the one written without the placeholder.
+///
+/// A placeholder goes only if its declaration is its single mention in `[parameters]` and its
+/// other mentions all sit in [`ZERO_ETA_EXPRESSION_BLOCKS`]; a block goes whole or not at all.
+/// A `kappa NAME ~ 0 FIX` is not an `omega` and stays. Nothing goes when it would leave no η
+/// (SAEM, IMP, IMPMAP and Bayes refuse a model with none). Returns the one
+/// `W_ZERO_FIX_ETA_DROPPED` note, or nothing.
+fn apply_zero_fix_etas(
+    extracted: &mut ExtractedBlocks, level_bindings: &LevelBindings,
+) -> Vec<String> {
+    #[cfg(test)]
+    if KeepZeroFixEtas::is_on() {
+        return Vec::new();
+    }
+    let Some(lines) = extracted.unnamed.get("parameters") else { return Vec::new() };
+    // The common model has no fixed omega: no second parse, no regex.
+    let fixed_omega = |l: &String| {
+        let l = l.to_ascii_lowercase();
+        l.contains("omega") && l.contains("fix")
+    };
+    if !lines.iter().any(fixed_omega) {
+        return Vec::new();
+    }
+    let Ok((_, omegas, blocks, ..)) = parse_parameters(lines, level_bindings) else {
+        return Vec::new();
+    };
+    // A mention in any case keeps the placeholder. η names bind case-sensitively, so a differently
+    // cased mention reads as a covariate; matching it anyway only ever keeps more, never drops.
+    let word = |n: &str| Regex::new(&format!(r"(?i)\b{}\b", regex::escape(n))).unwrap();
+    let decl = Regex::new(r"(?i)^\s*(omega|block_omega)\b").unwrap();
+    let goes = |name: &String| {
+        let w = word(name);
+        let mut own = lines.iter().filter(|l| w.is_match(l));
+        let declared_once = own.next().is_some_and(|l| decl.is_match(l)) && own.next().is_none();
+        let elsewhere = |(ty, ls): (&String, &Vec<String>)| {
+            ZERO_ETA_EXPRESSION_BLOCKS.contains(&ty.as_str()) || !ls.iter().any(|l| w.is_match(l))
+        };
+        declared_once
+            && extracted.unnamed.iter().filter(|(ty, _)| *ty != "parameters").all(elsewhere)
+            && !extracted.named.values().flat_map(|m| m.values().flatten()).any(|l| w.is_match(l))
+    };
+    // Groups that go together: each zero diagonal alone, each all-zero `FIX` block whole.
+    let groups =
+        omegas.iter().filter(|o| o.fixed && o.variance == 0.0).map(|o| vec![o.name.clone()]).chain(
+            blocks
+                .iter()
+                .filter(|b| b.fixed && b.lower_triangle.iter().all(|&v| v == 0.0))
+                .map(|b| b.names.clone()),
+        );
+    let dropped: Vec<String> = groups.filter(|g| g.iter().all(goes)).flatten().collect();
+    let declared = omegas.len() + blocks.iter().map(|b| b.names.len()).sum::<usize>();
+    if dropped.is_empty() || dropped.len() >= declared {
+        return Vec::new();
+    }
+    let alt = dropped.iter().map(|n| regex::escape(n)).collect::<Vec<_>>().join("|");
+    let any_name = Regex::new(&format!(r"\b({alt})\b")).unwrap();
+    if let Some(ls) = extracted.unnamed.get_mut("parameters") {
+        ls.retain(|l| !(decl.is_match(l) && any_name.is_match(l)));
+    }
+    // A whole additive term goes: `x + NAME` and `x - NAME` before a closing `)`, `,`, `+`, `-`
+    // or the line's end (never `x + NAME * y`), and `NAME +` as the first term of a sum. What
+    // is left of the name (`NAME * y`, `exp(-NAME)`) reads as 0.
+    let trailing = Regex::new(&format!(r"([\w)])\s*[+-]\s*\b({alt})\b(\s*[)+,-]|\s*$)")).unwrap();
+    let leading = Regex::new(&format!(r"(^|[(,=])\s*-?\s*\b({alt})\b\s*\+\s*")).unwrap();
+    for ty in ZERO_ETA_EXPRESSION_BLOCKS {
+        for l in extracted.unnamed.get_mut(ty).into_iter().flatten() {
+            let mut text = l.clone();
+            loop {
+                let next = trailing.replace_all(&text, "$1$3").into_owned();
+                let next = leading.replace_all(&next, "$1").into_owned();
+                if next == text {
+                    break;
+                }
+                text = next;
+            }
+            *l = any_name.replace_all(&text, "0").into_owned();
+        }
+    }
+    vec![format!(
+        "{ZERO_FIX_ETA_TOKEN}: omega {} ~ 0 FIX {} held at 0 and removed from the model, as \
+         NONMEM holds `$OMEGA 0 FIX`: no row in Ω, the EBEs or the shrinkage tables, and a \
+         supplied Ω or per-subject η sized for the declared shape is refused (#3150).",
+        dropped.join(", "),
+        if dropped.len() == 1 { "is" } else { "are" },
+    )]
+}
+
 fn parse_parameters(
     lines: &[String], level_bindings: &LevelBindings,
 ) -> Result<
@@ -24279,42 +24417,24 @@ fn map_condition_operands<'a>(
 ///
 /// The readout is read from its source text, where a block lifted into `__ferx_ro_g{n}` by the #1636
 /// desugaring is still the gather it is; the statements that desugaring appends to `stmts` only
-/// re-state a readout read, so they add no share. The propagation is a fixpoint over assignment
-/// order, so a forward reference cannot be missed by a single pass. `only_eta` restricts the η
-/// taint to one slot of the extended η vector (#1649): each [`EtaCoupling::share`] is this question
-/// asked of one random effect.
+/// re-state a readout read, so they add no share. Both propagations are fixpoints over assignment
+/// order ([`eta_tainted_names`] for the η one). `only_eta` restricts the η taint to one slot of the
+/// extended η vector (#1649): each [`EtaCoupling::share`] is this question asked of one random
+/// effect.
 fn block_shares_scale_with_eta(
     stmts: &[Statement], readout: &[Expression], endpoint_labels: &[&'static str], block: &str,
     only_eta: Option<usize>,
 ) -> Option<ScaleShare> {
-    /// Every `(lhs, rhs)` assignment in source order, `if`-branches included.
-    fn assignments<'a>(stmts: &'a [Statement], out: &mut Vec<(Option<&'a str>, &'a Expression)>) {
-        for s in stmts {
-            match s {
-                Statement::Assign(n, e) => out.push((Some(n.as_str()), e)),
-                Statement::If { branches, else_body } => {
-                    for (_, body) in branches {
-                        assignments(body, out);
-                    }
-                    if let Some(eb) = else_body {
-                        assignments(eb, out);
-                    }
-                }
-                _ => {}
-            }
-        }
-    }
-
     let mut assigns = Vec::new();
     assignments(stmts, &mut assigns);
     let n_y = readout.len() - endpoint_labels.len();
     // `None` is the readout: it is read, never assigned to.
     assigns.extend(readout.iter().map(|e| (None, e)));
     let first_readout = assigns.len() - readout.len();
+    let eta_tainted = eta_tainted_names(&assigns, only_eta);
     let mut block_tainted: Vec<&str> = Vec::new();
-    let mut eta_tainted: Vec<&str> = Vec::new();
     loop {
-        let before = (block_tainted.len(), eta_tainted.len());
+        let before = block_tainted.len();
         for (at, (lhs, rhs)) in assigns.iter().enumerate() {
             let mut reads_block = false;
             let mut reads_eta = false;
@@ -24346,15 +24466,122 @@ fn block_shares_scale_with_eta(
                 if reads_block && !block_tainted.contains(&lhs) {
                     block_tainted.push(lhs);
                 }
-                if (reads_eta || eta_via.is_some()) && !eta_tainted.contains(&lhs) {
-                    eta_tainted.push(lhs);
-                }
             }
         }
-        if (block_tainted.len(), eta_tainted.len()) == before {
+        if block_tainted.len() == before {
             return None;
         }
     }
+}
+
+/// Every `(lhs, rhs)` assignment of `stmts` in source order, `if`-branches included.
+fn assignments<'a>(stmts: &'a [Statement], out: &mut Vec<(Option<&'a str>, &'a Expression)>) {
+    for s in stmts {
+        match s {
+            Statement::Assign(n, e) => out.push((Some(n.as_str()), e)),
+            Statement::If { branches, else_body } => {
+                for (_, body) in branches {
+                    assignments(body, out);
+                }
+                if let Some(eb) = else_body {
+                    assignments(eb, out);
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
+/// Whether `expr` reads a random effect: an `Eta` node (only slot `only_eta`, when given) or a
+/// name in `tainted`.
+fn expr_reads_eta(expr: &Expression, tainted: &[&str], only_eta: Option<usize>) -> bool {
+    let mut reads = false;
+    visit_expr_nodes(expr, &mut |n| match n {
+        Expression::Eta(i) => reads |= only_eta.is_none_or(|k| k == *i),
+        Expression::Variable(v) => reads |= tainted.contains(&v.as_str()),
+        _ => {}
+    });
+    reads
+}
+
+/// The assigned names whose value depends on a random effect through any chain of assignments
+/// (`assigns` as [`assignments`] lists them; a `None` left-hand side is read, never assigned). A
+/// fixpoint over assignment order, so a forward reference or a reassignment cannot be missed by a
+/// single pass. `only_eta` restricts the taint to one slot of the extended η vector (#1649).
+fn eta_tainted_names<'a>(
+    assigns: &[(Option<&'a str>, &'a Expression)], only_eta: Option<usize>,
+) -> Vec<&'a str> {
+    let mut tainted: Vec<&str> = Vec::new();
+    loop {
+        let before = tainted.len();
+        for (lhs, rhs) in assigns {
+            if let Some(lhs) = *lhs {
+                if !tainted.contains(&lhs) && expr_reads_eta(rhs, &tainted, only_eta) {
+                    tainted.push(lhs);
+                }
+            }
+        }
+        if tainted.len() == before {
+            return tainted;
+        }
+    }
+}
+
+/// Whether the prediction has a kink an inner search can stall at (#3210): an `if`, `min`, `max` or
+/// `clamp` (each a `Conditional` once desugared), `abs`, `floor`, `ceil` or `round` whose
+/// condition or operand depends on a random effect or a state, in an `[individual_parameters]`
+/// statement (block `if` conditions included) or a `y` readout (`readout`, as [`readout_y_exprs`]
+/// gives it). A branch on time or a covariate alone is smooth in η and does not count. Not read:
+/// `[odes]` right-hand sides, `[derived]`, and event times, so an η-moved switch or dose end that
+/// crosses an observation is a kink this misses (the gain measured on #3210 was 7.8e-7).
+fn prediction_has_kink(stmts: &[Statement], readout: &[Expression], states: &StateInputs) -> bool {
+    let mut assigns = Vec::new();
+    assignments(stmts, &mut assigns);
+    let eta = eta_tainted_names(&assigns, None);
+    let tainted = |e: &Expression| {
+        let mut state = false;
+        visit_expr_nodes(e, &mut |n| {
+            if let Expression::Variable(v) | Expression::Covariate(v) = n {
+                state |= states.is_state(v);
+            }
+        });
+        state || expr_reads_eta(e, &eta, None)
+    };
+    let cond_tainted = |c: &Condition| {
+        let mut t = false;
+        visit_condition_nodes(c, &mut |n| t |= tainted(n));
+        t
+    };
+    let kinked = |e: &Expression| {
+        let mut k = false;
+        visit_expr_nodes(e, &mut |n| {
+            k |= match n {
+                Expression::Conditional(c, _, _) => cond_tainted(c),
+                Expression::UnaryFn(f, a) => {
+                    matches!(f.as_str(), "abs" | "floor" | "ceil" | "round") && tainted(a)
+                }
+                _ => false,
+            }
+        });
+        k
+    };
+    fn conditions<'a>(stmts: &'a [Statement], out: &mut Vec<&'a Condition>) {
+        for s in stmts {
+            if let Statement::If { branches, else_body } = s {
+                for (c, body) in branches {
+                    out.push(c);
+                    conditions(body, out);
+                }
+                if let Some(eb) = else_body {
+                    conditions(eb, out);
+                }
+            }
+        }
+    }
+    let mut conds = Vec::new();
+    conditions(stmts, &mut conds);
+    conds.into_iter().any(cond_tainted)
+        || assigns.iter().map(|(_, e)| *e).chain(readout).any(kinked)
 }
 
 /// The name a readout leaf takes for "some state" when `y` is a state by

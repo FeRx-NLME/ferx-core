@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: LGPL-3.0-or-later
 //! `steps.csv` and `final.ferx` — what a search leaves behind (#1180).
 //!
 //! The step table has one row per candidate of every step, so a reader can

@@ -1,24 +1,40 @@
-mod allometry_cmd;
-mod amd_cmd;
 mod bootstrap_cmd;
 mod bootstrap_progress;
-mod covsearch_cmd;
 mod export_dcm_cmd;
 mod gam_cmd;
-mod globalsearch_cmd;
-mod iivsearch_cmd;
-mod iovsearch_cmd;
-mod modelsearch_cmd;
-mod ruvsearch_cmd;
+mod licenses;
 mod summary_json;
+
+// The model-search subcommands, behind the default-on `search` feature (#3187).
+#[cfg(feature = "search")]
+mod allometry_cmd;
+#[cfg(feature = "search")]
+mod amd_cmd;
+#[cfg(feature = "search")]
+mod covsearch_cmd;
+#[cfg(feature = "search")]
+mod globalsearch_cmd;
+#[cfg(feature = "search")]
+mod iivsearch_cmd;
+#[cfg(feature = "search")]
+mod iovsearch_cmd;
+#[cfg(feature = "search")]
+mod modelsearch_cmd;
+#[cfg(feature = "search")]
+mod ruvsearch_cmd;
 
 use ferx_core::NcaInit;
 use std::env;
 use std::time::Instant;
 
 /// Top-level usage/help text, shared by the no-args error path (stderr, exit 1)
-/// and `ferx -h`/`--help` (stdout, exit 0) so the two can't drift apart.
-const MAIN_USAGE: &str = "\
+/// and `ferx -h`/`--help` (stdout, exit 0) so the two can't drift apart. The
+/// search lines sit between the two halves and depend on the `search` feature.
+fn main_usage() -> String {
+    format!("{USAGE_HEAD}{SEARCH_USAGE}{USAGE_TAIL}")
+}
+
+const USAGE_HEAD: &str = "\
 Usage: ferx <model.ferx> --data <data.csv> [--threads N|auto] [--output <run.fitrx>] [--include-data] [--inits-from-nca[=nca|nca_sweep|nca_ebe]] [--output-format yaml|json|both] [--clean]
        ferx <model.ferx> --simulate          [--threads N|auto] [--output <run.fitrx>]
        ferx check <model.ferx> [--data <data.csv>] [--json]
@@ -27,6 +43,10 @@ Usage: ferx <model.ferx> --data <data.csv> [--threads N|auto] [--output <run.fit
                       [--stratify-on COL] [--threads N]   (see `ferx bootstrap --help`)
        ferx gam      <model.ferx>  --data <data.csv> [--csv gam.csv] [--threads N]
                                                          (see `ferx gam --help`)
+";
+
+#[cfg(feature = "search")]
+const SEARCH_USAGE: &str = "\
        ferx covsearch <search.ferxsearch> [--directory DIR] [--threads N] [--resume]
                                                          (see `ferx covsearch --help`)
        ferx allometry <model.ferx> --data <data.csv> [--covariate WT] [--reference 70]
@@ -43,6 +63,14 @@ Usage: ferx <model.ferx> --data <data.csv> [--threads N|auto] [--output <run.fit
                                                          (see `ferx amd --help`)
        ferx globalsearch <search.ferxsearch> [--directory DIR] [--threads N] [--resume]
                                                          (see `ferx globalsearch --help`)
+";
+
+#[cfg(not(feature = "search"))]
+const SEARCH_USAGE: &str = "\
+       (model search tools omitted: this ferx was built without the `search` feature)
+";
+
+const USAGE_TAIL: &str = "\
        ferx export-dcm <run.fitrx> [-o <out.ferx>] [--fixed-theta]
                                                          (see `ferx export-dcm --help`)
 
@@ -78,6 +106,7 @@ Data must be in NONMEM format (ID, TIME, DV, EVID, AMT, CMT, ...)
                Disable checkpointing entirely with [fit_options] checkpoint = false.
 
 -h, --help     print this help and exit
+--licenses     print the licenses and third-party notices of this binary
 ";
 
 /// True for either spelling of the help flag.
@@ -109,13 +138,16 @@ fn normalize_args(args: &[String]) -> Vec<String> {
         .collect()
 }
 
-/// Every `ferx <word> ...` subcommand, paired with the function that runs it
-/// and returns the process exit code.
+/// A subcommand's entry point: the full argument vector in, the process exit code out.
+type Runner = fn(&[String]) -> i32;
+
+/// Every `ferx <word> ...` subcommand that is not a model search, paired with the
+/// function that runs it and returns the process exit code.
 ///
-/// This table is the *only* list of tool names: `main` dispatches from it and
-/// the unknown-tool error below enumerates it, so a tool cannot be added to
-/// one and missed by the other (#1396).
-const SUBCOMMANDS: &[(&str, fn(&[String]) -> i32)] = &[
+/// This table and [`SEARCH_SUBCOMMANDS`] are the *only* lists of tool names: `main`
+/// dispatches from them and the unknown-tool error enumerates them, so a tool cannot
+/// be added to one and missed by the other (#1396).
+const SUBCOMMANDS: &[(&str, Runner)] = &[
     // Parse + validate a model (optionally against data) and report structured
     // diagnostics; no fit.
     ("check", run_check),
@@ -124,32 +156,75 @@ const SUBCOMMANDS: &[(&str, fn(&[String]) -> i32)] = &[
     // #1140, the first `ferx-tools` subcommand: many fits over resampled data.
     ("bootstrap", bootstrap_cmd::run),
     ("gam", gam_cmd::run),
-    // `covsearch` / `allometry` (#1180): the first model-space search tools,
-    // driven by a `.ferxsearch` file (or, for allometry, a model file + flags).
-    ("covsearch", covsearch_cmd::run),
-    ("allometry", allometry_cmd::run),
-    // #1181: structural PK search over the `pk` templates.
-    ("modelsearch", modelsearch_cmd::run),
-    // #1182: residual-error model search.
-    ("ruvsearch", ruvsearch_cmd::run),
-    // #1183: variability-structure search.
-    ("iivsearch", iivsearch_cmd::run),
-    ("iovsearch", iovsearch_cmd::run),
-    // #1184: the whole pipeline, one tool after another.
-    ("amd", amd_cmd::run),
-    // #1185: GA / exhaustive over one grid, penalized fitness.
-    ("globalsearch", globalsearch_cmd::run),
     // #1331: a fitted `[covariate_nn]` model written out as plain equations.
     ("export-dcm", export_dcm_cmd::run),
 ];
 
+/// The runner of a model-search subcommand: its module's `run` with the `search`
+/// feature, `built_without_search` without it (#3187).
+#[cfg(feature = "search")]
+macro_rules! search_tool {
+    ($module:ident) => {
+        $module::run
+    };
+}
+#[cfg(not(feature = "search"))]
+macro_rules! search_tool {
+    ($module:ident) => {
+        built_without_search
+    };
+}
+
+/// The model-search subcommands (`ferx-search`). Their names are in every build, so
+/// a build without the `search` feature reports that it was built without search
+/// rather than calling them unknown tools (#3187).
+const SEARCH_SUBCOMMANDS: &[(&str, Runner)] = &[
+    // `covsearch` / `allometry` (#1180): the first model-space search tools,
+    // driven by a `.ferxsearch` file (or, for allometry, a model file + flags).
+    ("covsearch", search_tool!(covsearch_cmd)),
+    ("allometry", search_tool!(allometry_cmd)),
+    // #1181: structural PK search over the `pk` templates.
+    ("modelsearch", search_tool!(modelsearch_cmd)),
+    // #1182: residual-error model search.
+    ("ruvsearch", search_tool!(ruvsearch_cmd)),
+    // #1183: variability-structure search.
+    ("iivsearch", search_tool!(iivsearch_cmd)),
+    ("iovsearch", search_tool!(iovsearch_cmd)),
+    // #1184: the whole pipeline, one tool after another.
+    ("amd", search_tool!(amd_cmd)),
+    // #1185: GA / exhaustive over one grid, penalized fitness.
+    ("globalsearch", search_tool!(globalsearch_cmd)),
+];
+
 /// The runner for `word`, when it names a subcommand.
-fn subcommand(word: &str) -> Option<fn(&[String]) -> i32> {
-    SUBCOMMANDS.iter().find(|(name, _)| *name == word).map(|(_, run)| *run)
+fn subcommand(word: &str) -> Option<Runner> {
+    SUBCOMMANDS
+        .iter()
+        .chain(SEARCH_SUBCOMMANDS)
+        .find(|(name, _)| *name == word)
+        .map(|(_, run)| *run)
+}
+
+/// The tools this build can run, in the order the unknown-tool error lists them:
+/// the search tools only when they were compiled in.
+fn available_tools() -> Vec<&'static str> {
+    let search: &[_] = if cfg!(feature = "search") { SEARCH_SUBCOMMANDS } else { &[] };
+    SUBCOMMANDS.iter().chain(search).map(|(name, _)| *name).collect()
+}
+
+/// What `ferx <search tool> ...` reports in a build without the `search` feature.
+#[cfg(not(feature = "search"))]
+fn built_without_search(args: &[String]) -> i32 {
+    eprintln!(
+        "Error: `{}` is a model-search tool, and this ferx was built without the `search` \
+         feature.\nRebuild ferx-cli with its default features (or `--features search`) to use it.",
+        args[1]
+    );
+    1
 }
 
 /// What the first argument means once it is known not to name a [`SUBCOMMANDS`]
-/// entry (#1396).
+/// or [`SEARCH_SUBCOMMANDS`] entry (#1396).
 #[derive(Debug, PartialEq, Eq)]
 enum FirstArg<'a> {
     /// A bare word — no dot, no path separator. The user meant a tool, and this
@@ -176,7 +251,7 @@ enum FirstArg<'a> {
 /// is a bare word by construction, so anything carrying a `.` or a path
 /// separator is a path the user got wrong rather than a tool we do not have.
 /// "Whatever the name" is bounded by the two decisions `main` takes first: a
-/// [`SUBCOMMANDS`] name runs its tool, and a leading `-` is a flag, so a file
+/// subcommand name runs its tool, and a leading `-` is a flag, so a file
 /// called `check` is reachable only by a path (`./check`).
 ///
 /// A probe that *fails* (`Err`) is not an absent file: an unreadable parent
@@ -203,7 +278,7 @@ fn classify_first_arg(arg: &str, exists: std::io::Result<bool>) -> FirstArg<'_> 
 /// The second line of the unknown-tool error: a `did you mean` when one tool
 /// name is within two edits of `word`, and the full list either way.
 fn unknown_tool_hint(word: &str) -> String {
-    let names: Vec<&str> = SUBCOMMANDS.iter().map(|(name, _)| *name).collect();
+    let names = available_tools();
     let mut hint = String::new();
     if let Some(near) = names
         .iter()
@@ -249,7 +324,11 @@ fn main() {
     let args = normalize_args(&raw_args);
 
     if is_help_flag(args.get(1)) {
-        print!("{MAIN_USAGE}");
+        print!("{}", main_usage());
+        std::process::exit(0);
+    }
+    if args.get(1).map(String::as_str) == Some("--licenses") {
+        print!("{}", licenses::text());
         std::process::exit(0);
     }
 
@@ -261,7 +340,7 @@ fn main() {
     }
 
     if args.len() < 2 {
-        eprint!("{MAIN_USAGE}");
+        eprint!("{}", main_usage());
         std::process::exit(1);
     }
 
@@ -284,7 +363,7 @@ fn main() {
         }
         FirstArg::Flag(flag) => {
             eprintln!("Error: expected a model file or a tool name, got the flag `{flag}`.");
-            eprint!("{MAIN_USAGE}");
+            eprint!("{}", main_usage());
             std::process::exit(1);
         }
         FirstArg::ModelFile(_) => {}
@@ -844,7 +923,8 @@ mod tests {
         bundle_label, check_summary_line, classify_first_arg, edit_distance, is_help_flag,
         normalize_args, parse_check_args, parse_inits_from_nca_flag, parse_output_flag,
         parse_output_format, parse_threads_flag, print_check_human, run_check, run_summary,
-        subcommand, unknown_tool_hint, CheckArgsError, EstimatesFormat, FirstArg, SUBCOMMANDS,
+        subcommand, unknown_tool_hint, CheckArgsError, EstimatesFormat, FirstArg,
+        SEARCH_SUBCOMMANDS, SUBCOMMANDS,
     };
     use ferx_core::NcaInit;
 
@@ -940,7 +1020,7 @@ mod tests {
         // The table is the single list of tool names: dispatch reads it and the
         // unknown-tool error enumerates it. A name in the list that does not
         // resolve would be advertised and then rejected.
-        for (name, _) in SUBCOMMANDS {
+        for (name, _) in SUBCOMMANDS.iter().chain(SEARCH_SUBCOMMANDS) {
             assert!(subcommand(name).is_some(), "`{name}` is listed but does not dispatch");
         }
         // A listed name is a bare word, so `main` must consult `subcommand`
@@ -953,9 +1033,9 @@ mod tests {
 
     #[test]
     fn the_hint_names_a_near_miss_and_always_lists_the_tools() {
-        let typo = unknown_tool_hint("covsearh");
+        let typo = unknown_tool_hint("bootstrp");
         assert!(
-            typo.contains("Did you mean `covsearch`?"),
+            typo.contains("Did you mean `bootstrap`?"),
             "one-edit typo should suggest the tool: {typo}"
         );
         // Far from every name: no suggestion, but still the full list.
@@ -963,6 +1043,25 @@ mod tests {
         assert!(!far.contains("Did you mean"), "unrelated word should not suggest anything: {far}");
         for (name, _) in SUBCOMMANDS {
             assert!(far.contains(name), "hint should list `{name}`: {far}");
+        }
+        // The search tools are listed exactly when they were compiled in (#3187).
+        for (name, _) in SEARCH_SUBCOMMANDS {
+            assert_eq!(
+                far.contains(&format!(" {name},")) || far.contains(&format!(" {name}.")),
+                cfg!(feature = "search"),
+                "`{name}` listed iff built with `search`: {far}"
+            );
+        }
+    }
+
+    /// #3187: without `search` a search tool still dispatches — to the
+    /// built-without-search error, exit 1 — instead of being an unknown tool.
+    #[cfg(not(feature = "search"))]
+    #[test]
+    fn a_search_tool_without_the_search_feature_reports_the_build() {
+        for (name, _) in SEARCH_SUBCOMMANDS {
+            let run = subcommand(name).expect("search names dispatch in every build");
+            assert_eq!(run(&args(&[name, "--help"])), 1, "`{name}`");
         }
     }
 

@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: LGPL-3.0-or-later
 //! Seeding a search child from its parent's fit.
 //!
 //! [`ModelEdit::SeedInits`] reproduces the fit it is handed — that is what
