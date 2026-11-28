@@ -6707,6 +6707,16 @@ pub(crate) fn check_packed_start_in_box(
         if declared_hits.contains(&(hit.index, hit.side)) {
             continue;
         }
+        // A θ past a bound the packer can represent is the one-ULP round trip the declared walk
+        // accepts (#2896), and the clamp moves it by that ULP: no cap is involved.
+        if hit.kind == PackedCoordKind::Theta
+            && match hit.side {
+                BoxSide::Above => init_params.theta_upper[hit.index] <= THETA_PACK_CEIL,
+                BoxSide::Below => init_params.theta_lower[hit.index] > LOG_PACK_FLOOR,
+            }
+        {
+            continue;
+        }
         let names = names.get_or_insert_with(|| coordinate_names(init_params));
         let name = names.get(hit.index).cloned().unwrap_or_else(|| format!("#{}", hit.index));
         let side = hit.side.direction();
@@ -6729,7 +6739,8 @@ pub(crate) fn check_packed_start_in_box(
             // `lower = max(θ_lower, 1e-10).ln()` fires only when
             // `θ_lower > 1e-10` and `θ < θ_lower`, which is a *declared*
             // violation and so was claimed by `theta_outside_declared_range`
-            // above; on the identity branch `packed` and `lower` are the
+            // above (or, within a ULP of a bound, skipped above, #2896); on the
+            // identity branch `packed` and `lower` are the
             // declared numbers themselves, likewise claimed. `Above`: the same
             // argument leaves only `θ_upper > THETA_PACK_CEIL`, where the cap
             // ferx substitutes is what the start exceeds. A declared range

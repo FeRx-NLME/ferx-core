@@ -2031,3 +2031,69 @@ fn the_eval_only_warning_classifies_as_a_start_side_finding() {
         assert_eq!(c.severity, WarningSeverity::Warning, "{msg}");
     }
 }
+
+/// #2896: a fit's own estimate at a declared bound is not a start outside it. A log-packed θ
+/// at a bound packs onto `ln(bound)` and unpacks as `exp(ln(bound))`, which is not the
+/// identity: 10 comes back as 10.000000000000002 and 500 as 499.99999999999983. Passed back
+/// as a start, each read as outside its own declared range, so a search refused it
+/// (`E_THETA_INIT_OUTSIDE_BOUNDS`) and an eval-only run warned on it. The estimates here
+/// come from a real `fit()` at `maxiter = 0` started on the bounds, which reports exactly
+/// that round trip; one ULP past it is still outside.
+#[test]
+fn a_fit_estimate_on_a_log_packed_bound_is_not_a_start_outside_it_2896() {
+    let model = model_with_parameters(
+        "  theta TVCL(10.0, 0.001, 10.0)\n  theta TVV(500.0, 500.0, 1e4)\n  \
+         omega ETA_CL ~ 0.09\n  sigma PROP_ERR ~ 0.04\n",
+    );
+    let csv = "ID,TIME,DV,EVID,AMT,MDV\n1,0,0,1,100,1\n1,1,0.2,0,0,0\n1,4,0.15,0,0,0\n";
+    let mut f = tempfile::NamedTempFile::new().unwrap();
+    std::io::Write::write_all(&mut f, csv.as_bytes()).unwrap();
+    let pop = crate::io::datareader::read_nonmem_csv(f.path(), None, None).unwrap();
+    let fitted = crate::api::fit(&model, &pop, &model.default_params, &eval_only()).unwrap();
+    let mut p = model.default_params.clone();
+    p.theta = fitted.theta.clone();
+    // Premise: the fit reports each bound's round trip, whatever this platform's libm makes
+    // of it (one ULP outside 10 and 500 on macOS arm64).
+    let rt = |b: f64| b.ln().exp();
+    assert_eq!(p.theta, [rt(10.0), rt(500.0)]);
+    for opts in [eval_only(), FitOptions::default()] {
+        let d = check_packed_start_in_box(&p, &opts);
+        assert!(d.is_empty(), "a fit's own estimates are a valid start: {d:#?}");
+    }
+    // End to end: neither the eval-only warning nor the search's refusal.
+    let again = crate::api::fit(&model, &pop, &p, &eval_only()).unwrap();
+    assert!(!again.warnings.iter().any(|w| w.contains("OUTSIDE_BOUNDS")), "{:?}", again.warnings);
+    let search = FitOptions { outer_maxiter: 1, ..FitOptions::default() };
+    crate::api::fit(&model, &pop, &p, &search).expect("a search from a fit's own estimates");
+    // One ULP past the bound or its round trip, whichever is further, is still outside.
+    let mut q = p.clone();
+    q.theta = vec![10f64.max(rt(10.0)).next_up(), 500f64.min(rt(500.0)).next_down()];
+    let out: Vec<_> =
+        crate::estimation::parameterization::theta_outside_declared_range(&q).collect();
+    assert_eq!(out.len(), 2, "both sides are still judged: {out:?}");
+    // An identity-packed θ (negative lower) unpacks exactly, so its bound gets no round trip.
+    let rest = "  theta TVV(10.0, 1.0, 100.0)\n  omega ETA_CL ~ 0.09\n  sigma PROP_ERR ~ 0.04\n";
+    let mut r = model_with_parameters(&format!("  theta TVCL(1.0, -1.0, 10.0)\n{rest}"));
+    r.default_params.theta[0] = 10f64.next_up();
+    let hits = crate::estimation::parameterization::theta_outside_declared_range(&r.default_params);
+    assert_eq!(hits.count(), 1, "identity θ one ULP past 10");
+    // Where the round trip moves `ln b` (#3053 review), only the packed walk sees the start,
+    // and no cap is involved: no diagnostic.
+    let b = 1.9956874516962497_f64;
+    let mut s = model_with_parameters(&format!("  theta TVCL(1.0, 0.001, {b:?})\n{rest}"));
+    s.default_params.theta[0] = rt(b);
+    if rt(b).ln() != b.ln() {
+        let d = check_packed_start_in_box(&s.default_params, &FitOptions::default());
+        assert!(d.is_empty(), "{d:#?}");
+    }
+    // The mirror on a lower bound (#3053 review r2). No such bound is shared by the two libms
+    // measured, so one each: macOS arm64, then glibc 2.41 (x86_64 and aarch64 agree).
+    for b in [1.997291064244341_f64, 1.9965916000000001] {
+        let mut s = model_with_parameters(&format!("  theta TVCL(5.0, {b:?}, 10.0)\n{rest}"));
+        s.default_params.theta[0] = rt(b);
+        if rt(b) < b && rt(b).ln() != b.ln() {
+            let d = check_packed_start_in_box(&s.default_params, &FitOptions::default());
+            assert!(d.is_empty(), "lower {b:?}: {d:#?}");
+        }
+    }
+}
