@@ -3716,7 +3716,8 @@ fn start_probe_due(
 /// retry ([`resolve_stall_retry`]).
 ///
 /// - `Some(false)` — the first attempt, a stall, with [`start_probe_stall_warning`]; retried.
-/// - `Some(true)` — [`verified_start_result`]; no retry.
+/// - `Some(true)` — [`verified_start_result`] (the probe's warnings but for a start-dependence
+///   warning, which follows the reported point, #2904); no retry.
 /// - `None` — the first attempt, retried exactly when it did not leave its start.
 ///
 /// The probe's evaluations count in `n_iterations` either way.
@@ -3757,8 +3758,9 @@ fn settle_start_probe(
 ///
 /// - `Some(true)` — the probe's result, through [`verified_start_result`] as for the first
 ///   attempt ([`settle_start_probe`]): the restart's point is an optimum an independent run
-///   came back to, and the probe's own verdict, warnings and restart cause stand, at the
-///   restart's point when that is at or below the probe's. One difference: the published
+///   came back to, and the probe's own verdict, warnings and restart cause stand (but for a
+///   start-dependence warning, which follows the reported point, #2904), at the restart's
+///   point when that is at or below the probe's. One difference: the published
 ///   `left_init` is the reported point's own, measured from the user's start, and
 ///   `stationary_start` its negation, whichever point wins.
 /// - `Some(false)` — the probe's result as it is, verdict, warnings and displacement its own:
@@ -3829,6 +3831,10 @@ fn eval_budget_warning(outer_maxiter: usize) -> String {
 
 /// The result reported for a start the probe verified (#2506): the probe's `converged`
 /// verdict and warnings, as the probe produced them, at the **lower** of the two points.
+/// The one exception is a start-dependence warning that names the EBEs of the point it was
+/// raised at (`W_EBE_START_DEPENDENT`, but not the basin-shift form, which states the verdict):
+/// it follows the reported point (#2904). The post-fit diagnostics (shrinkage, EBE, covariance)
+/// are computed after this, on the reported point, so they follow it on their own.
 /// `start_wins` says the unmoved run's penalized objective is at or below the probe's;
 /// the probe stops on its own `ftol`, which on an OFV near 1000 lets it end ~1e-3 above
 /// a start that was already the optimum (measured on `two_cpt_iv`, Linux), and a fit
@@ -3869,8 +3875,21 @@ fn verified_start_result(
         probe.cond_dist = unmoved.cond_dist;
         probe.packed_estimate = unmoved.packed_estimate;
         probe.mixture_posteriors = unmoved.mixture_posteriors;
+        // A start-dependence warning that describes the EBEs at its point follows the
+        // reported point (#2904). Measured on the ODE twin of `tests/fixtures/flip_flop_pop`:
+        // the restart's own names 8 subjects, the probe's 7.
+        probe.warnings.retain(|w| !describes_its_point(w));
+        probe.warnings.extend(unmoved.warnings.into_iter().filter(|w| describes_its_point(w)));
     }
     probe
+}
+
+/// Whether `warning` is a start-dependence warning (#833, #2013) about the EBEs at the point it
+/// was raised at. The basin-shift one (#1565, [`ebe_basin_shift_warning`]) is not: it states the
+/// fit "is not reported as converged", so it goes with the verdict, which is the probe's.
+fn describes_its_point(warning: &str) -> bool {
+    classify_warning(warning).category == WarningCode::EbeStartDependent
+        && !warning.contains("the fit is not reported as converged")
 }
 
 /// The `FitResult` warning a fit carries when it stalled on its initial estimates and the
