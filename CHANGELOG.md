@@ -32,9 +32,10 @@ section of the SDLC for the versioning policy).
   `globalsearch`) moved out of `ferx-tools` into the new `ferx-search` crate (#3185), which
   is licensed LGPL-3.0-or-later from this, its first release (#3183). The crate follows
   the behaviour of Pharmpy (LGPL-3.0-or-later); its `NOTICE` records the provenance audit.
-- **Everything else stays MIT.** `ferx-core`, `ferx-tools` (bootstrap, GAM screening,
-  `run_in_lanes`) and the `ferx-cli` source are MIT, and none of them depends on
-  `ferx-search`, so they can be used and embedded under MIT alone.
+- **Everything else stays MIT.** `ferx-core` and `ferx-tools` (bootstrap, GAM screening,
+  `run_in_lanes`) are MIT and never depend on `ferx-search`, so they can be used and
+  embedded under MIT alone. The `ferx-cli` source is MIT too, but its default-on `search`
+  feature pulls in `ferx-search`, so the default `ferx` binary has an LGPL component (below).
 - **Earlier releases stay MIT.** The search code shipped under MIT inside `ferx-tools` up to
   and including 0.4.0, and those releases keep that license. They are not yanked from
   crates.io: yanking would not withdraw the grant and would break pinned builds.
@@ -1926,7 +1927,7 @@ names the line.
   refused with the note quoted; and seeded `saem`, `imp`, `impmap`, `bayes`, `vi` and simulation
   runs draw a different stream, since it follows the η count.
 - **ferx-search is LGPL-3.0-or-later** (#3183): the model-search crate is
-  LGPL-3.0-or-later from its first release, 0.5.0; earlier
+  LGPL-3.0-or-later from its first release, the one after 0.4.0; earlier
   ferx-tools releases, including 0.4.0, remain MIT. ferx-core, ferx-tools and
   the ferx-cli source stay MIT. The `ferx` binary links ferx-search, and the new
   `ferx --licenses` prints every license and third-party notice it carries
