@@ -9155,7 +9155,8 @@ pub(crate) fn reconverged_fd_gradient(
     // Same bounded central-difference policy as the per-subject reconverged-FD gradients —
     // shared so the `eps`/clamp/missing-probe convention can't drift (#466 review round 4 #8).
     let floor = fd_step_floors(init_params, model);
-    central_diff_until_cancel(x, &fixed, &floor, bounds, &options.cancel, eval, tight)
+    let g = central_diff_until_cancel(x, &fixed, &floor, bounds, &options.cancel, eval, tight);
+    zero_non_finite(g)
 }
 
 /// [`central_diff_packed_gated`] for a stencil whose probes re-solve the inner loop and so
@@ -9167,7 +9168,8 @@ pub(crate) fn reconverged_fd_gradient(
 /// score (`SubjectScoreContext::finite_difference_score`, #3136), which polls its centre solve
 /// itself and declines a cancelled stencil; a coordinate a cancel cuts inside its gate growth
 /// keeps what the gate had, which every caller discards (`fit()` errs, the covariance step
-/// skips its reading).
+/// skips its reading). A non-finite difference is returned as is (#3097): the gradients
+/// read it as 0 through [`zero_non_finite`], as a missing pair; the AGQ score declines it.
 pub(crate) fn central_diff_until_cancel(
     x: &[f64], fixed: &[bool], floor: &[f64], bounds: &PackedBounds,
     cancel: &Option<crate::cancel::CancelFlag>, eval: impl Fn(&[f64]) -> f64,
@@ -9177,6 +9179,11 @@ pub(crate) fn central_diff_until_cancel(
     let eval = |xv: &[f64]| if live() { eval(xv) } else { f64::NAN };
     let tight = |xv: &[f64]| live().then(|| tight(xv)).flatten();
     central_diff_packed_gated(x, fixed, floor, bounds, eval, Some(&tight))
+}
+
+/// `g` with every non-finite component read as 0.
+pub(crate) fn zero_non_finite(g: Vec<f64>) -> Vec<f64> {
+    g.into_iter().map(|v| if v.is_finite() { v } else { 0.0 }).collect()
 }
 
 /// One probe of [`reconverged_fd_gradient`]: the OFV at packed `xv`, re-solving the inner
@@ -9480,7 +9487,8 @@ fn reporting_fd_gradient(
         crate::estimation::fd_resolution::inner_resolved(&stats).then_some(v)
     };
     let floor = fd_step_floors(init_params, model);
-    central_diff_until_cancel(x, &fixed, &floor, bounds, &options.cancel, eval, tight)
+    let g = central_diff_until_cancel(x, &fixed, &floor, bounds, &options.cancel, eval, tight);
+    zero_non_finite(g)
 }
 
 /// Bounded central-difference of a packed-space scalar `eval`, skipping fixed
@@ -9493,7 +9501,9 @@ fn reporting_fd_gradient(
 /// The sentinel is finite, so differenced as a value it gave a component of ~`1e20/2h`
 /// (#1537, #2378); the test lives here, once, so no caller can forget to mask. With one
 /// side missing the component is the one-sided difference against `eval(x)`, evaluated
-/// once and only when needed; with both missing, or the centre missing too, it is zero.
+/// once and only when needed; with both missing, or the centre missing too, it is zero. A
+/// difference that overflows between usable probes is returned as is, not zeroed, so a caller
+/// can tell it from a zero slope (#3097).
 ///
 /// Coordinate `k` is stepped by [`fd_step`]`(1e-4, xₖ, floor[k])`, `floor` from
 /// [`fd_step_floors`]: `1e-4·(1 + |xₖ|)` on every coordinate but a small identity-packed θ,
@@ -9553,9 +9563,7 @@ pub(crate) fn central_diff_packed_gated(
                     })
                 });
             if let Some(r) = resolved {
-                if r.value.is_finite() {
-                    grad[k] = r.value;
-                }
+                grad[k] = r.value;
                 continue;
             }
         }
@@ -9574,7 +9582,7 @@ pub(crate) fn central_diff_packed_gated(
         xw[k] = xm;
         let fm = eval(&xw);
         xw[k] = x[k];
-        let d = match (usable(fp), usable(fm)) {
+        grad[k] = match (usable(fp), usable(fm)) {
             (true, true) => (fp - fm) / denom,
             (false, false) => continue,
             (plus, _) => {
@@ -9589,9 +9597,6 @@ pub(crate) fn central_diff_packed_gated(
                 }
             }
         };
-        if d.is_finite() {
-            grad[k] = d;
-        }
     }
     grad
 }
@@ -9909,7 +9914,8 @@ fn subject_central_diff(
         resolved.then_some(v)
     };
     let floor = fd_step_floors(init_params, model);
-    central_diff_until_cancel(x, &fixed, &floor, bounds, &options.cancel, eval, tight)
+    let g = central_diff_until_cancel(x, &fixed, &floor, bounds, &options.cancel, eval, tight);
+    zero_non_finite(g)
 }
 
 /// The exact analytic per-subject packed **outer** gradient at the packed point `pt` the

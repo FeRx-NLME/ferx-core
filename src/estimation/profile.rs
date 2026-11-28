@@ -3411,17 +3411,18 @@ impl ProfileCtx<'_> {
         }
         let cov_ctx = self.at_cov_tol();
         let warm = ProfileWarm::from_solve(self.layout, solve);
-        // The subjects whose level gradient fell back to FD in the stencil's solves. The
-        // first of them is at the estimate itself, so it sees what the re-solve before the
-        // step saw; collecting that one too was a second gate on the same inputs.
+        // The subjects whose level gradient fell back to FD in any of the step's solves, the
+        // #2406 gate's discarded probes and its τ/100 twin's included (#3097): the warning
+        // reports the cost, as the fit's counts every trial point. The first of them is at
+        // the estimate itself, so it sees what the re-solve before the step saw; collecting
+        // that one too was a second gate on the same inputs.
         let fd_gradients = Mutex::new(std::collections::BTreeSet::new());
-        let f = |xv: &[f64]| match cov_ctx.solve(&unpack_params(xv, hold), &warm) {
-            Ok(s) => {
-                fd_gradients.lock().unwrap().extend(s.fd_gradient_subjects.iter().copied());
-                s.ofv
-            }
-            Err(_) => f64::NAN,
+        let solve_at = |c: &ProfileCtx, xv: &[f64]| {
+            let s = c.solve(&unpack_params(xv, hold), &warm).ok()?;
+            fd_gradients.lock().unwrap().extend(s.fd_gradient_subjects.iter().copied());
+            Some(s)
         };
+        let f = |xv: &[f64]| solve_at(&cov_ctx, xv).map_or(f64::NAN, |s| s.ofv);
         // The stencil's #2406 tight twin: the same solve at τ/100, kept only when every inner
         // solve in it converged without Nelder–Mead.
         let tight_ctx = ProfileCtx {
@@ -3429,7 +3430,7 @@ impl ProfileCtx<'_> {
             ..cov_ctx
         };
         let tight = |xv: &[f64]| {
-            let s = tight_ctx.solve(&unpack_params(xv, hold), &warm).ok()?;
+            let s = solve_at(&tight_ctx, xv)?;
             crate::estimation::fd_resolution::inner_resolved(&s.ebe).then_some(s.ofv)
         };
         let mut out = if cov_ctx.cov_is_analytic() {

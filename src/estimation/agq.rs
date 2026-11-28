@@ -1366,10 +1366,11 @@ impl<'a> SubjectScoreContext<'a> {
     /// gradient's [`central_diff_until_cancel`](crate::estimation::outer_optimizer::central_diff_until_cancel),
     /// so a `|θ₀|`-floored step passes the #2406 resolution gate (#2678). `None` when the
     /// objective at `x` is not usable. With `salvage`, a probe that fails takes the helper's
-    /// one-sided difference against the centre (both failing leaves that coordinate 0).
-    /// Without it, a probe that fails at a coordinate's first step declines the score, as
-    /// before #2678; one that fails only at a floor the gate grew to keeps what the smaller
-    /// floors resolved, the gate's own policy.
+    /// one-sided difference against the centre (both failing, or a non-finite difference,
+    /// leaves that coordinate 0). Without it, a probe that fails at a coordinate's first step,
+    /// or a non-finite difference (#3097), declines the score, as before #2678; a probe that
+    /// fails only at a floor the gate grew to keeps what the smaller floors resolved, the
+    /// gate's own policy.
     ///
     /// Cancel (#2776, #3136): the wrapper skips every probe once `options.cancel` is set, so
     /// the centre solve — which it does not see — is polled here, and a non-`salvage` score
@@ -1404,8 +1405,9 @@ impl<'a> SubjectScoreContext<'a> {
             },
             tight,
         );
-        (salvage || !(missing.get() || crate::cancel::is_cancelled(&self.options.cancel)))
-            .then_some(g)
+        let cancelled = || crate::cancel::is_cancelled(&self.options.cancel);
+        (salvage || !(missing.get() || g.iter().any(|v| !v.is_finite()) || cancelled()))
+            .then(|| crate::estimation::outer_optimizer::zero_non_finite(g))
     }
 }
 
