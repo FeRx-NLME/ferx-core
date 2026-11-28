@@ -968,6 +968,13 @@ Every metric gets a `Mean` and a `Median`. `AdaptiveSummaryOptions::thresholds` 
 patients with at least 80 % of their decision readings in the window; there is none by
 default. The mean of `Discontinued` is the fraction discontinued.
 
+Each metric, statistic and band status has a stable `label()`, the spelling ferx-r
+writes: the metric's `metrics` column (`CUM_DOSE`, `PCT_READINGS_IN_WINDOW`, …, and
+`SIGNAL` for a signal, whose analyte and decision are its fields), and lower-case tokens
+such as `fraction_at_least` and `not_drawn`. `AdaptiveSummaryMetric::from_label` reads a
+scalar metric back from its label, and `AdaptiveSummaryMetric::SCALARS` lists them. The
+variance decomposition's scope, layer and status have a `label()` too.
+
 #### How runs are pooled
 
 - A draw's statistic is over all its runs, `n_sim × n_reps × subjects`, each run weighted

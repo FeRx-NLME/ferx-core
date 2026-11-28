@@ -65,6 +65,17 @@ pub enum AdaptiveVarianceScope {
     Subject(String),
 }
 
+impl AdaptiveVarianceScope {
+    /// The stable output label: `"population"` or `"subject"` (the id is the variant's
+    /// field). Exhaustive here so downstream needs no wildcard (#2581).
+    pub fn label(&self) -> &'static str {
+        match self {
+            AdaptiveVarianceScope::Population => "population",
+            AdaptiveVarianceScope::Subject(_) => "subject",
+        }
+    }
+}
+
 /// A layer of the nested split.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 #[non_exhaustive]
@@ -82,6 +93,21 @@ pub enum AdaptiveVarianceLayer {
     /// population lines when no subject's η was supplied (the population `Bsv` averages
     /// the drawn subjects only).
     Total,
+}
+
+impl AdaptiveVarianceLayer {
+    /// The stable output label: `"parameter"`, `"bsv"`, `"within"`, `"between_subject"`
+    /// or `"total"`. `BetweenRow` reads `"between_subject"` because a population row is a
+    /// subject in every output. Exhaustive here so downstream needs no wildcard (#2581).
+    pub fn label(&self) -> &'static str {
+        match self {
+            AdaptiveVarianceLayer::Parameter => "parameter",
+            AdaptiveVarianceLayer::Bsv => "bsv",
+            AdaptiveVarianceLayer::Within => "within",
+            AdaptiveVarianceLayer::BetweenRow => "between_subject",
+            AdaptiveVarianceLayer::Total => "total",
+        }
+    }
 }
 
 /// What an [`AdaptiveVarianceComponent`] holds.
@@ -102,6 +128,18 @@ pub enum AdaptiveComponentStatus {
     Supplied,
     /// The run drew no parameter uncertainty, so there is no parameter layer.
     NotDrawn,
+}
+
+impl AdaptiveComponentStatus {
+    /// The stable output label: `"estimated"`, `"supplied"` or `"not_drawn"`. Exhaustive
+    /// here so downstream needs no wildcard (#2581).
+    pub fn label(&self) -> &'static str {
+        match self {
+            AdaptiveComponentStatus::Estimated { .. } => "estimated",
+            AdaptiveComponentStatus::Supplied => "supplied",
+            AdaptiveComponentStatus::NotDrawn => "not_drawn",
+        }
+    }
 }
 
 /// A `(metric, subject)` pair left out of the decomposition: see

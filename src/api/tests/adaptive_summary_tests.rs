@@ -291,9 +291,88 @@ fn bad_probabilities_and_thresholds_are_refused() {
     });
     assert_eq!(code, "E_ADAPTIVE_OPTIONS");
     assert!(
-        msg.contains("summarize_adaptive: the threshold for NDoses is inf; it must be finite"),
+        msg.contains("summarize_adaptive: the threshold for N_DOSES is inf; it must be finite"),
         "{msg}"
     );
+    let signal = M::Signal { analyte: "conc".into(), decision_idx: 3 };
+    let (_, msg) = refuse(AdaptiveSummaryOptions {
+        thresholds: vec![(signal, f64::NAN)],
+        ..Default::default()
+    });
+    assert!(
+        msg.contains(
+            "summarize_adaptive: the threshold for SIGNAL (analyte 'conc', decision 3) is NaN; \
+             it must be finite"
+        ),
+        "{msg}"
+    );
+}
+
+/// The labels are ferx-r's column names and tokens, one per variant, unique per enum
+/// (ferx-r#779 review finding 4). The `match`es without a wildcard stop compiling when a
+/// variant is added; for the metric, that `match` is the expected-label table and the
+/// variant list sits under it, and `SCALARS` is checked against that list, not built from
+/// it, so a metric added to the enum but not to `SCALARS` fails here (#3213 r1 row 2).
+///
+/// Mutations: any label changed or duplicated; a metric dropped from `SCALARS`;
+/// `from_label` not matching a scalar, or matching `"SIGNAL"`.
+#[test]
+fn every_metric_and_statistic_has_a_unique_stable_label() {
+    let expected = |m: &M| match m {
+        M::CumulativeDose => "CUM_DOSE",
+        M::NDoses => "N_DOSES",
+        M::NIncreases => "N_INCREASES",
+        M::NDecreases => "N_DECREASES",
+        M::NHolds => "N_HOLDS",
+        M::NNotDue => "N_NOT_DUE",
+        M::Discontinued => "DISCONTINUED",
+        M::SignalMin => "SIGNAL_MIN",
+        M::SignalMax => "SIGNAL_MAX",
+        M::SignalMean => "SIGNAL_MEAN",
+        M::PctReadingsInWindow => "PCT_READINGS_IN_WINDOW",
+        M::AucTargetAttainment => "AUC_TARGET_ATTAINMENT",
+        M::Signal { .. } => "SIGNAL",
+    };
+    // Every variant, one per arm above, scalars in output order.
+    let scalars = [
+        M::CumulativeDose,
+        M::NDoses,
+        M::NIncreases,
+        M::NDecreases,
+        M::NHolds,
+        M::NNotDue,
+        M::Discontinued,
+        M::SignalMin,
+        M::SignalMax,
+        M::SignalMean,
+        M::PctReadingsInWindow,
+        M::AucTargetAttainment,
+    ];
+    let signal = M::Signal { analyte: "conc".into(), decision_idx: 0 };
+    assert_eq!(M::SCALARS, scalars);
+    let mut labels = std::collections::BTreeSet::new();
+    for m in scalars.iter().chain(std::iter::once(&signal)) {
+        assert_eq!(m.label(), expected(m), "{m:?}");
+        assert!(labels.insert(m.label()), "{m:?}: label repeated");
+    }
+    for m in &scalars {
+        assert_eq!(M::from_label(m.label()), Some(m.clone()), "{m:?}");
+    }
+    assert_eq!(M::from_label("SIGNAL"), None);
+    assert_eq!(M::from_label("cum_dose"), None);
+
+    let _exhaustive = |s: &S| match s {
+        S::Mean | S::Median | S::FractionAtLeast(_) => (),
+    };
+    let stats = [S::Mean, S::Median, S::FractionAtLeast(0.8)].map(|s| s.label());
+    assert_eq!(stats, ["mean", "median", "fraction_at_least"]);
+
+    let _exhaustive = |b: &AdaptiveBandStatus| match b {
+        AdaptiveBandStatus::NotDrawn | AdaptiveBandStatus::Quantiles(_) => (),
+    };
+    let q = AdaptiveQuantiles { probs: [0.05, 0.5, 0.95], values: [None; 3] };
+    let bands = [AdaptiveBandStatus::NotDrawn, AdaptiveBandStatus::Quantiles(q)].map(|b| b.label());
+    assert_eq!(bands, ["not_drawn", "quantiles"]);
 }
 
 /// Review r1 row 2: the signal rows read `latent`, not the assay-noised `value` the

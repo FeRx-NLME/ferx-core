@@ -3,12 +3,16 @@ pub mod ferx_core::api
 #[non_exhaustive] pub enum ferx_core::api::AdaptiveBandStatus
 pub ferx_core::api::AdaptiveBandStatus::NotDrawn
 pub ferx_core::api::AdaptiveBandStatus::Quantiles(ferx_core::AdaptiveQuantiles)
+impl ferx_core::AdaptiveBandStatus
+pub fn ferx_core::AdaptiveBandStatus::label(&self) -> &'static str
 #[non_exhaustive] pub enum ferx_core::api::AdaptiveComponentStatus
 pub ferx_core::api::AdaptiveComponentStatus::Estimated
 pub ferx_core::api::AdaptiveComponentStatus::Estimated::mc_se: core::option::Option<f64>
 pub ferx_core::api::AdaptiveComponentStatus::Estimated::value: f64
 pub ferx_core::api::AdaptiveComponentStatus::NotDrawn
 pub ferx_core::api::AdaptiveComponentStatus::Supplied
+impl ferx_core::AdaptiveComponentStatus
+pub fn ferx_core::AdaptiveComponentStatus::label(&self) -> &'static str
 #[non_exhaustive] pub enum ferx_core::api::AdaptiveSummaryMetric
 pub ferx_core::api::AdaptiveSummaryMetric::AucTargetAttainment
 pub ferx_core::api::AdaptiveSummaryMetric::CumulativeDose
@@ -25,19 +29,29 @@ pub ferx_core::api::AdaptiveSummaryMetric::Signal::decision_idx: usize
 pub ferx_core::api::AdaptiveSummaryMetric::SignalMax
 pub ferx_core::api::AdaptiveSummaryMetric::SignalMean
 pub ferx_core::api::AdaptiveSummaryMetric::SignalMin
+impl ferx_core::AdaptiveSummaryMetric
+pub const ferx_core::AdaptiveSummaryMetric::SCALARS: &'static [ferx_core::AdaptiveSummaryMetric]
+pub fn ferx_core::AdaptiveSummaryMetric::from_label(label: &str) -> core::option::Option<Self>
+pub fn ferx_core::AdaptiveSummaryMetric::label(&self) -> &'static str
 #[non_exhaustive] pub enum ferx_core::api::AdaptiveSummaryStatistic
 pub ferx_core::api::AdaptiveSummaryStatistic::FractionAtLeast(f64)
 pub ferx_core::api::AdaptiveSummaryStatistic::Mean
 pub ferx_core::api::AdaptiveSummaryStatistic::Median
+impl ferx_core::AdaptiveSummaryStatistic
+pub fn ferx_core::AdaptiveSummaryStatistic::label(&self) -> &'static str
 #[non_exhaustive] pub enum ferx_core::api::AdaptiveVarianceLayer
 pub ferx_core::api::AdaptiveVarianceLayer::BetweenRow
 pub ferx_core::api::AdaptiveVarianceLayer::Bsv
 pub ferx_core::api::AdaptiveVarianceLayer::Parameter
 pub ferx_core::api::AdaptiveVarianceLayer::Total
 pub ferx_core::api::AdaptiveVarianceLayer::Within
+impl ferx_core::AdaptiveVarianceLayer
+pub fn ferx_core::AdaptiveVarianceLayer::label(&self) -> &'static str
 #[non_exhaustive] pub enum ferx_core::api::AdaptiveVarianceScope
 pub ferx_core::api::AdaptiveVarianceScope::Population
 pub ferx_core::api::AdaptiveVarianceScope::Subject(alloc::string::String)
+impl ferx_core::AdaptiveVarianceScope
+pub fn ferx_core::AdaptiveVarianceScope::label(&self) -> &'static str
 #[non_exhaustive] pub enum ferx_core::api::UnmatchedSubjects
 pub ferx_core::api::UnmatchedSubjects::Draw
 pub ferx_core::api::UnmatchedSubjects::Refuse
@@ -3280,6 +3294,7 @@ pub ferx_core::types::CompiledModel::pk_indices: alloc::vec::Vec<usize>
 pub ferx_core::types::CompiledModel::pk_model: ferx_core::PkModel
 pub ferx_core::types::CompiledModel::pk_param_fn: ferx_core::PkParamFn
 pub ferx_core::types::CompiledModel::plan_id: ferx_core::PlanId
+pub ferx_core::types::CompiledModel::prediction_has_kink: bool
 pub ferx_core::types::CompiledModel::prior_from_fit: core::option::Option<alloc::string::String>
 pub ferx_core::types::CompiledModel::priors: alloc::vec::Vec<ferx_core::ParameterPrior>
 pub ferx_core::types::CompiledModel::referenced_covariates: alloc::vec::Vec<alloc::string::String>
@@ -4226,12 +4241,16 @@ pub ferx_core::AdaptiveAction::Stop
 #[non_exhaustive] pub enum ferx_core::AdaptiveBandStatus
 pub ferx_core::AdaptiveBandStatus::NotDrawn
 pub ferx_core::AdaptiveBandStatus::Quantiles(ferx_core::AdaptiveQuantiles)
+impl ferx_core::AdaptiveBandStatus
+pub fn ferx_core::AdaptiveBandStatus::label(&self) -> &'static str
 #[non_exhaustive] pub enum ferx_core::AdaptiveComponentStatus
 pub ferx_core::AdaptiveComponentStatus::Estimated
 pub ferx_core::AdaptiveComponentStatus::Estimated::mc_se: core::option::Option<f64>
 pub ferx_core::AdaptiveComponentStatus::Estimated::value: f64
 pub ferx_core::AdaptiveComponentStatus::NotDrawn
 pub ferx_core::AdaptiveComponentStatus::Supplied
+impl ferx_core::AdaptiveComponentStatus
+pub fn ferx_core::AdaptiveComponentStatus::label(&self) -> &'static str
 pub enum ferx_core::AdaptiveRoute
 pub ferx_core::AdaptiveRoute::Bolus
 pub ferx_core::AdaptiveRoute::Bolus::cmt: usize
@@ -4254,19 +4273,29 @@ pub ferx_core::AdaptiveSummaryMetric::Signal::decision_idx: usize
 pub ferx_core::AdaptiveSummaryMetric::SignalMax
 pub ferx_core::AdaptiveSummaryMetric::SignalMean
 pub ferx_core::AdaptiveSummaryMetric::SignalMin
+impl ferx_core::AdaptiveSummaryMetric
+pub const ferx_core::AdaptiveSummaryMetric::SCALARS: &'static [ferx_core::AdaptiveSummaryMetric]
+pub fn ferx_core::AdaptiveSummaryMetric::from_label(label: &str) -> core::option::Option<Self>
+pub fn ferx_core::AdaptiveSummaryMetric::label(&self) -> &'static str
 #[non_exhaustive] pub enum ferx_core::AdaptiveSummaryStatistic
 pub ferx_core::AdaptiveSummaryStatistic::FractionAtLeast(f64)
 pub ferx_core::AdaptiveSummaryStatistic::Mean
 pub ferx_core::AdaptiveSummaryStatistic::Median
+impl ferx_core::AdaptiveSummaryStatistic
+pub fn ferx_core::AdaptiveSummaryStatistic::label(&self) -> &'static str
 #[non_exhaustive] pub enum ferx_core::AdaptiveVarianceLayer
 pub ferx_core::AdaptiveVarianceLayer::BetweenRow
 pub ferx_core::AdaptiveVarianceLayer::Bsv
 pub ferx_core::AdaptiveVarianceLayer::Parameter
 pub ferx_core::AdaptiveVarianceLayer::Total
 pub ferx_core::AdaptiveVarianceLayer::Within
+impl ferx_core::AdaptiveVarianceLayer
+pub fn ferx_core::AdaptiveVarianceLayer::label(&self) -> &'static str
 #[non_exhaustive] pub enum ferx_core::AdaptiveVarianceScope
 pub ferx_core::AdaptiveVarianceScope::Population
 pub ferx_core::AdaptiveVarianceScope::Subject(alloc::string::String)
+impl ferx_core::AdaptiveVarianceScope
+pub fn ferx_core::AdaptiveVarianceScope::label(&self) -> &'static str
 pub enum ferx_core::AggFunction
 pub ferx_core::AggFunction::Max
 pub ferx_core::AggFunction::Min
@@ -5082,6 +5111,7 @@ pub ferx_core::CompiledModel::pk_indices: alloc::vec::Vec<usize>
 pub ferx_core::CompiledModel::pk_model: ferx_core::PkModel
 pub ferx_core::CompiledModel::pk_param_fn: ferx_core::PkParamFn
 pub ferx_core::CompiledModel::plan_id: ferx_core::PlanId
+pub ferx_core::CompiledModel::prediction_has_kink: bool
 pub ferx_core::CompiledModel::prior_from_fit: core::option::Option<alloc::string::String>
 pub ferx_core::CompiledModel::priors: alloc::vec::Vec<ferx_core::ParameterPrior>
 pub ferx_core::CompiledModel::referenced_covariates: alloc::vec::Vec<alloc::string::String>
