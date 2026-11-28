@@ -70,7 +70,7 @@ jobs:
       # in the key so a dispatch's partial baseline never stands in for the full one.
       - name: Restore release baseline
         id: base-cache
-        uses: actions/cache@v4
+        uses: actions/cache@v6
         with:
           path: golden/base.json
           key: golden-base-v1-${{ runner.os }}-${{ runner.arch }}-${{ steps.release.outputs.tag }}-${{ hashFiles('tools/golden-fits/models.tsv', 'tools/golden-fits/golden.py') }}-only=${{ inputs.only }}
