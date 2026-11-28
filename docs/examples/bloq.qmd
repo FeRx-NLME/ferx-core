@@ -96,7 +96,7 @@ TVKA                 0.811661
   SIGMA(1) = 0.010761
 ```
 
-These match a NONMEM 7.5.1 LAPLACE M3 reference (`tests/nonmem/warfarin_bloq.{ctl,lst}`)
+These match a NONMEM 7.5.1 LAPLACE M3 reference (`tests/nonmem/warfarin_bloq.{ctl,nm.json}`)
 to ~4 significant figures on the structural and variance parameters (TVCL 0.132801,
 TVV 7.73139, TVKA 0.809824, PROP 0.010760, ω 0.028849 / 0.009544 / 0.335772). The
 NONMEM objective uses the F_FLAG likelihood convention for censored rows, which

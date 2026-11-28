@@ -153,6 +153,19 @@ const ALLOWED: &[(&str, &str, &str)] = &[
         "if template.residual_correlations.is_empty() {",
         "SE of the packed block_sigma ρ coordinates; None (not Some([])) without any",
     ),
+    // The SDE variance recording has θ‖σ leaves and no `block_sigma` ρ leaves (#3126, #3127):
+    // a declared ρ declines to FD. A serial correlation on an SDE model never reaches it: model
+    // validation refuses it (`E_RESIDUAL_CORRELATION_SCOPE`, `scope_refuses_m3_and_sde`).
+    (
+        "src/sens/ode_adjoint.rs",
+        "if model.is_sde() && !model.residual_correlations.is_empty() {",
+        "recorder_in_scope: block_sigma × SDE has no ρ leaves on the EKF variance recording",
+    ),
+    (
+        "src/sens/ode_adjoint.rs",
+        "if !model.residual_correlations.is_empty() {",
+        "record_sde_p: the same decline for the per-row callers that skip the model gate",
+    ),
     // The declaration's own validation.
     (
         "src/parser/model_parser.rs",

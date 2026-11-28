@@ -63,9 +63,10 @@ fn build_neural_network_infos(model: &CompiledModel) -> Vec<NeuralNetworkInfo> {
 ///
 /// Each subject is classified on the engine that serves it at the fitted `(θ, η̂)`
 /// ([`pk::effective_model_for_eval`], the same call `compute_predictions_with_states`
-/// makes), so a closed-form transit/IG subject rerouted to its ODE twin is reported as
-/// ODE, not as NaN. IOV subjects (non-empty κ) are skipped: their states are empty for
-/// a different reason, `W_DERIVED_CMT_IOV_UNSUPPORTED`.
+/// makes). A closed-form transit/IG subject rerouted to its ODE twin has no states in the
+/// closed form's layout and gets `W_DERIVED_CMT_TWIN_ANALYTICAL` instead (#1580). IOV
+/// subjects (non-empty κ) are skipped: their states are empty for a different reason,
+/// `W_DERIVED_CMT_IOV_UNSUPPORTED`.
 ///
 /// | engine | TV covariate or `TIME`-reading individual params | states | warning |
 /// |---|---|---|---|
@@ -73,6 +74,7 @@ fn build_neural_network_infos(model: &CompiledModel) -> Vec<NeuralNetworkInfo> {
 /// | analytical | either or both | empty → NaN | `_TV_ANALYTICAL` |
 /// | ODE | neither (a reset, or an `[odes]` RHS reading time, keeps one snapshot) | exact | — |
 /// | ODE | either or both | disposition frozen at the first observation | `_TV_ODE` |
+/// | ODE twin of a closed-form transit/IG | any | empty → NaN | `_TWIN_ANALYTICAL` |
 ///
 /// The analytical row's `TIME` column asks [`pk::model_uses_time_anywhere`], the
 /// predicate its state routing asks; the ODE row's asks
@@ -86,12 +88,17 @@ pub(crate) fn derived_cmt_time_varying_warnings(
     // (any subject with a TV covariate, any subject on a TIME-reading model), per engine.
     let mut analytical = (false, false);
     let mut ode = (false, false);
+    let mut twin = false;
     for (i, subject) in population.subjects.iter().enumerate() {
         if kappas.get(i).is_some_and(|k| !k.is_empty()) {
             continue;
         }
         let eta = eta_hats.get(i).map_or(&[][..], |e| e.as_slice());
         let m = pk::effective_model_for_eval(model, subject, theta, eta);
+        if model.ode_spec.is_none() && m.ode_spec.is_some() {
+            twin = true;
+            continue;
+        }
         let (slot, tv_cov, time) = if m.ode_spec.is_some() {
             if !pk::ode_cmt_states_approximate(m, subject) {
                 continue;
@@ -131,6 +138,16 @@ pub(crate) fn derived_cmt_time_varying_warnings(
             cause(ode)
         ));
     }
+    if twin {
+        out.push(
+            "W_DERIVED_CMT_TWIN_ANALYTICAL: closed-form transit/IG model with subjects its \
+             ODE equivalent serves (for example a steady-state or infusion dose, a \
+             TIME-reading parameter, or the flip-flop regime) — compartment states are \
+             not available for those subjects; [derived] expressions that reference \
+             compartments[i] evaluate to NaN for them."
+                .to_string(),
+        );
+    }
     out
 }
 
@@ -143,6 +160,10 @@ fn tte_npde_skipped_warning(why: &EngineError) -> String {
          cells of their rows are blank. Every other row is scored as usual. Reason: {why}"
     )
 }
+
+#[cfg(test)]
+#[path = "tests/phase_release_tests.rs"]
+mod phase_release_tests;
 
 #[cfg(test)]
 #[path = "tests/dw_autocorrelation_warning_tests.rs"]
@@ -261,8 +282,8 @@ pub fn fit_from_files(
 /// itself dispatches on — and not a second copy of the rule (#1540). `auto` is reported
 /// with what it resolved to (e.g. `auto (nlopt_lbfgs)`, #490). A mixture model replaces an
 /// explicit optimizer that cannot carry the mixture objective (built-in BFGS/L-BFGS,
-/// trust-region) with NLopt L-BFGS; that replacement is reported as `nlopt_lbfgs`,
-/// and the outer loop's downgrade warning says why. `has_mixture` is the same
+/// trust-region) with what `auto` resolves to (#3025); that replacement is reported under
+/// its own label (e.g. `nlopt_lbfgs`), and the outer loop's downgrade warning says why. `has_mixture` is the same
 /// `init_params.mixture.is_some()` the outer loop keys on.
 pub(crate) fn reported_optimizer_label(
     method: EstimationMethod, options: &FitOptions, model: &CompiledModel, has_mixture: bool,
@@ -278,7 +299,7 @@ pub(crate) fn reported_optimizer_label(
         EstimationMethod::Imp => "imp-bobyqa".to_string(),
         _ => {
             let (resolved, _) = crate::estimation::outer_optimizer::resolve_outer_optimizer(
-                options.optimizer,
+                stage_optimizer_request(method, options.optimizer),
                 model,
                 has_mixture,
                 crate::sens::provider::analytic_outer_gradient_available(model),
@@ -1083,19 +1104,18 @@ fn fit_unstamped(
     // The same checks the post-fit entry points run; `fit` returns their message.
     crate::api::check_theta_length(model, &init_params.theta)?;
     crate::api::check_param_shape(model, &crate::api::ParamBlock::all_of(init_params))?;
-    // Mixture models (#977). Phase 3 wires the K-fold log-sum-exp FOCE/FOCEI
-    // objective via the derivative-free (BOBYQA) outer optimizer. Estimators the mixture
-    // objective is not wired for, FOCEI quadrature and per-class Ω/Σ under Bayes are
+    // Mixture models (#977). The K-fold log-sum-exp objective runs the outer optimizer
+    // `resolve_outer_optimizer` picks, `auto` as for a single population (#3025).
+    // Estimators the mixture objective is not wired for and per-class Ω/Σ under Bayes are
     // refused rather than silently ignoring the mixture structure; so are `init_params`
     // with no per-class Ω/Σ (`E_PARAM_SHAPE` / `E_MIXTURE_METHOD`, #1788). Inter-occasion
     // variability under a mixture fits (#985): the per-class inner solve carries the shared
     // base `omega_iov`, and the outer gradient is the exact one at every class's modes
     // (`mixture_gradient_salvaged`).
     first_error(&crate::api::validation::check_mixture_options(model, options, init_params))?;
-    // Start the SS-equilibration non-convergence sink clean so a prior in-process call's residue
-    // can't leak into this fit's warnings; drained back out just before `Ok(result)` (#867).
+    // The run's SS non-convergence notes are its search's and leave with this scope; the fit
+    // reports those of its pass at the estimates (`ss_notes_at_estimates`, #1522).
     let _ss_run = crate::dosing::run_scope();
-    crate::dosing::clear_ss_nonconvergence_warnings();
     // Reject one_cpt_transit + unsupported feature (SS/IOV/TV-cov/infusion, #386)
     // before any prediction reaches the superposition dispatch's `unreachable!` arms.
     // `E_TRANSIT_UNSUPPORTED` / `E_IG_UNSUPPORTED`, as `ferx check` and `predict` (#1772).
@@ -1231,12 +1251,6 @@ fn fit_unstamped(
         let res = install_on_fit_pool(options, run)?;
         return res.map(|mut result| {
             result.warnings.splice(0..0, ltbs_warnings);
-            // Surface any SS-equilibration non-convergence seen during this (default, single-start)
-            // fit's prediction passes (#867). This is the common path — `n_starts` defaults to 1 —
-            // so it must drain the sink too, not just the multi-start arm below.
-            for w in crate::dosing::take_ss_nonconvergence_warnings() {
-                result.warnings.push(w);
-            }
             rebuild_warnings_structured(&mut result);
             result
         });
@@ -1323,13 +1337,6 @@ fn fit_unstamped(
             // answer the user ran multi-start for, so it is said when start 0 wins too.
             result.warnings.push(StartSpread::of(&starts).line());
             result.starts = starts;
-            // Surface any SS-equilibration non-convergence seen during this fit's prediction passes
-            // (#867). The capped nonlinear pulse-train can silently under-report the SS trough and
-            // bias estimates low; the sink deduplicated it across every objective evaluation and
-            // multi-start replicate to a single message.
-            for w in crate::dosing::take_ss_nonconvergence_warnings() {
-                result.warnings.push(w);
-            }
             rebuild_warnings_structured(&mut result);
             Ok(result)
         }
@@ -1688,6 +1695,10 @@ fn fit_inner(
     // The plans' keys read this fit's fingerprints instead of hashing per lookup.
     let _prints =
         crate::parser::model_parser::rhs_regcode::kernel_jit::register(model, &population.subjects);
+    // The fit's last phase boundary (#3077): whatever the last plan consumer is — the settle
+    // check applies to integrated models only — the plans and every worker's caches go here,
+    // before the registration above ends the scope.
+    let _release_last_phase = crate::parser::model_parser::rhs_regcode::kernel_jit::ReleaseOnDrop;
     // LTBS needs the inner EBE loop converged tighter than the default for
     // reproducible standard errors (see `FitOptions::effective_inner_tol` /
     // `LTBS_FIT_INNER_TOL`). Resolve it once here so both the outer optimisation and
@@ -2865,6 +2876,9 @@ fn fit_inner(
     }
 
     let mut result = result.expect("method chain must have at least one stage");
+    // Estimation is over: its plans go before the post-fit phases record their own, so the
+    // post-fit peak replaces the estimation plateau instead of stacking on it (#3077).
+    crate::parser::model_parser::rhs_regcode::kernel_jit::release_fit_plans();
     // Overwrite with chain-aware totals
     result.n_iterations = total_iterations;
 
@@ -2945,39 +2959,35 @@ fn fit_inner(
     // subjects (#1329) and `SolverStatsScope` is thread-local — a scope held on this thread
     // would have reported zero of everything. The `bool` is what the `.then()` used to decide.
     let ode_model = integrates_odes(model);
-    let (mut subjects, mut ode_solver_stats) = compute_subject_results(
-        model,
-        population,
-        &result.params,
-        &result.eta_hats,
-        &result.h_matrices,
-        &result.kappas,
-        options.interaction,
-        mixest_classes.as_deref(),
-        ode_model,
-    );
-    // The prediction sweep above is `f64`, so the guard's jet-finiteness clause — the one
-    // decision only a dual solve can take (#1204) — leaves no trace in it. One analytic
-    // sensitivity solve per subject is what makes that clause reportable: the solve the fit's
-    // gradient ran throughout, run once more at the estimates the fit reports. No-ops for
-    // every model not on the analytic ODE sensitivity path, and for every FD fit.
-    //
-    // It gets its **own** scopes, and exactly one field crosses back. Sharing the prediction
-    // pass's scope would double every step, clamp and escalation count across two different
-    // solves — and worse, a `min_dt` clamp that happened only in the gradient solve would
-    // fire the warning's clamp clause, which tells the user their *predictions* were
-    // freeze-padded. Only `auto_stiff_rejected_jets` describes something the prediction pass
-    // structurally cannot observe, so only it is carried over.
-    if ode_model {
-        ode_solver_stats.auto_stiff_rejected_jets = sweep_sensitivity_solver_stats(
+    // A quadrature objective's own `(n_agq, anchor)`, so each subject's contribution is its
+    // term (#3149). Not a mixture's: its class-marginal is not split by subject.
+    let agq_term = objective_stage_opts
+        .as_ref()
+        .filter(|_| mixest_classes.is_none())
+        .and_then(|o| Some((o.agq_nodes()?, o.hessian_anchor())));
+    let t_subject_results = std::time::Instant::now();
+    // The SS non-convergence notes this fit reports are this pass's, at its estimates (#1522).
+    let ((mut subjects, ode_solver_stats), ss_notes) = crate::dosing::ss_notes_at_estimates(|| {
+        compute_subject_results(
             model,
             population,
             &result.params,
             &result.eta_hats,
+            &result.h_matrices,
+            &result.kappas,
+            options.interaction,
             mixest_classes.as_deref(),
+            agq_term,
+            ode_model,
         )
-        .auto_stiff_rejected_jets;
-    }
+    });
+    result.warnings.extend(ss_notes);
+    let subject_results_wall_time_secs = t_subject_results.elapsed().as_secs_f64();
+    // No second, sensitivity sweep here (#3076). One used to run the analytic η-Hessian per
+    // subject at the estimates, for the one counter an `f64` pass cannot set,
+    // `auto_stiff_rejected_jets` — but the derivative solves are compiled plans whose ODE loops
+    // integrate on the value lane, where the jet clause cannot fire either, so it read zero
+    // while costing gigabytes on a large ODE model.
 
     // Mixture (#977 Phase 5): thread the converged per-subject posteriors onto
     // each SubjectResult so output.rs can emit the PMIX_1..PMIX_K and MIXEST
@@ -3459,9 +3469,9 @@ fn fit_inner(
         // subjects (#2038) and rereads the label from them (#2265) — after the
         // de-duplication, which matches the estimator's copy on the sentence both
         // share before any reread.
-        // The contributions are the post-hoc FOCE/FOCEI score whatever produced the
-        // objective, so the source says which, and the scorer splits out the terms the
-        // predictions cannot describe (#2267).
+        // The source says what the contributions score, and the scorer splits out the terms
+        // the predictions cannot describe (#2267): under quadrature only the data terms, as
+        // the FOCE/FOCEI curvature parts are not parts of its term (#3149).
         let source =
             ContributionSource::of(objective_stage, options, mixest_classes.is_some(), ofv_prior);
         let scorer = |i: usize, data: &Subject, s: &SubjectResult| {
@@ -3470,7 +3480,7 @@ fn fit_inner(
                 data,
                 &result.params,
                 &s.eta,
-                result.h_matrices.get(i),
+                result.h_matrices.get(i).filter(|_| agq_term.is_none()),
                 options.interaction,
                 result.kappas.get(i).map_or(&[][..], |k| k.as_slice()),
                 mixest_classes.as_ref().and_then(|m| m.get(i).copied()),
@@ -3570,20 +3580,43 @@ fn fit_inner(
     // objective is the K-class marginal, which this single-population re-score would not
     // reproduce, and the Monte-Carlo estimators publish an objective it does not compute, so
     // both are out of scope.
+    let mut ofv_settlement_wall_time_secs = 0.0;
     {
         use crate::estimation::ode_tolerance_check as otc;
+        use crate::parser::model_parser::rhs_regcode::kernel_jit::release_fit_plans;
         // The owner's options are recorded by every stage this check can re-score; an
         // `imp_eval_only` owner records none and is out of scope anyway.
         let stage = objective_stage_opts.filter(|o| otc::method_in_scope(o.method));
         if let (Some(stage), None) = (stage, &result.mixture_posteriors) {
-            match otc::ofv_tolerance_shift(
-                model,
-                population,
-                &result.params,
-                &result.eta_hats,
-                &result.kappas,
-                &stage,
-            ) {
+            // The check re-records every subject at a tighter solver override, which a plan
+            // carries (`Plan::ode_override`): it starts from no plans of the phases before it
+            // (SIR's draws, the output columns) and leaves none behind (#3077).
+            let shift = if otc::tightened_override(model, &stage).is_none() {
+                None
+            } else if !stage.ode_ofv_check {
+                let (msg, entry) = super::postfit::ode_ofv_check_off_warning();
+                warnings.push(msg);
+                native_warnings.push(entry);
+                None
+            } else {
+                let t_check = std::time::Instant::now();
+                release_fit_plans();
+                let shift = otc::ofv_tolerance_shift(
+                    model,
+                    population,
+                    &result.params,
+                    &result.eta_hats,
+                    &result.kappas,
+                    &stage,
+                );
+                release_fit_plans();
+                // A check cancelled mid-pass did not run: its time stays `0.0`.
+                if shift.is_some() {
+                    ofv_settlement_wall_time_secs = t_check.elapsed().as_secs_f64();
+                }
+                shift
+            };
+            match shift {
                 Some(Ok(shift)) => {
                     if let Some((msg, entry)) = super::postfit::ode_ofv_not_settled_warning(&shift)
                     {
@@ -3744,6 +3777,8 @@ fn fit_inner(
         method_chain: chain.clone(),
         method_wall_times_secs,
         covariance_wall_time_secs,
+        ofv_settlement_wall_time_secs,
+        subject_results_wall_time_secs,
         converged,
         ofv,
         ofv_data,

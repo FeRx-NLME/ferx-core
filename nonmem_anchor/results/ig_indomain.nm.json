@@ -1,0 +1,120 @@
+{
+ "nonmem_version": "7.6.0",
+ "data_file": "ig_indomain.csv",
+ "data_records": 260,
+ "observations": 240,
+ "individuals": 20,
+ "nmtran_warnings": [2],
+ "markers": [
+  "MINIMIZATION SUCCESSFUL"
+ ],
+ "steps": [
+  {
+   "method": "First Order Conditional Estimation with Interaction",
+   "objv": -1303.639,
+   "objv_without_constant": -1303.6393367130017,
+   "objv_with_constant": -862.5488407747589,
+   "function_evaluations": 157,
+   "significant_digits": 3.1,
+   "etabar": [
+    [0.001948, -0.0019106]
+   ],
+   "etabar_se": [
+    [0.038282, 0.077695]
+   ],
+   "p_val": [
+    [0.95942, 0.98038]
+   ],
+   "etashrinksd": [
+    [4.8121, 1.3253]
+   ],
+   "etashrinkvr": [
+    [9.3927, 2.633]
+   ],
+   "ebvshrinksd": [
+    [4.7118, 1.1794]
+   ],
+   "ebvshrinkvr": [
+    [9.2016, 2.3449]
+   ],
+   "relativeinf": [
+    [90.782, 97.637]
+   ],
+   "epsshrinksd": [
+    [7.7879]
+   ],
+   "epsshrinkvr": [
+    [14.969]
+   ],
+   "final": {
+    "theta": [5.31, 48.2, 1.99, 0.298],
+    "omega": {
+     "ETA1": [0.0324],
+     "ETA2": [0.0, 0.124]
+    },
+    "sigma": {
+     "EPS1": [0.0241]
+    }
+   },
+   "standard_error": {
+    "theta": [0.221, 4.08, 0.0244, 0.00461],
+    "omega": {
+     "ETA1": [0.00786],
+     "ETA2": [null, 0.0413]
+    },
+    "sigma": {
+     "EPS1": [0.00245]
+    }
+   },
+   "markers": [
+    "MINIMIZATION SUCCESSFUL"
+   ]
+  }
+ ],
+ "control_stream_as_run": [
+  "$PROBLEM In-domain inverse-Gaussian absorption -- NONMEM FOCEI anchor for ferx analytic pk one_cpt_ig (#790)",
+  "$INPUT ID TIME DV AMT EVID CMT MDV",
+  "$DATA ig_indomain.csv IGNORE=@",
+  "",
+  "$SUBROUTINES ADVAN13 TOL=9",
+  "$MODEL",
+  "  COMP=(DEPOT,DEFDOSE)",
+  "  COMP=(CENTRAL,DEFOBS)",
+  "",
+  "$PK",
+  "  CL  = THETA(1)*EXP(ETA(1))",
+  "  V   = THETA(2)*EXP(ETA(2))",
+  "  MAT = THETA(3)",
+  "  CV2 = THETA(4)",
+  "  K20 = CL/V",
+  "  PI  = 3.14159265358979312",
+  "  IF (AMT.GT.0.0.AND.CMT.EQ.1) PODO = AMT",
+  "  IF (AMT.GT.0.0.AND.CMT.EQ.1) TDOS = TIME",
+  "  F1  = 0.0",
+  "",
+  "$DES",
+  "  TAD = T - TDOS",
+  "  IF (TAD.LE.1.0E-10) TAD = 1.0E-10",
+  "  ARG = -(TAD - MAT)**2 / (2.0*CV2*MAT*TAD)",
+  "  RIN = PODO*SQRT(MAT/(2.0*PI*CV2*TAD**3))*EXP(ARG)",
+  "  DADT(1) = 0.0",
+  "  DADT(2) = RIN - K20*A(2)",
+  "",
+  "$ERROR",
+  "  IPRED = A(2)/V",
+  "  Y = IPRED*(1.0 + EPS(1))",
+  "",
+  "$THETA",
+  "  (0.1,  4.5,  100)   ; 1 CL",
+  "  (5.0,  45.0, 500)   ; 2 V",
+  "  (0.05, 2.5,  24)    ; 3 MAT",
+  "  (0.001,0.4,  10)    ; 4 CV2",
+  "$OMEGA",
+  "  0.09    ; IIV CL",
+  "  0.09    ; IIV V",
+  "$SIGMA",
+  "  0.0225  ; proportional residual variance",
+  "$ESTIMATION METHOD=1 INTER MAXEVAL=9999 PRINT=5 NSIG=3 SIGL=9 NOABORT",
+  "$COVARIANCE"
+ ]
+}

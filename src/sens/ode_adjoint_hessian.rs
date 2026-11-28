@@ -1269,11 +1269,7 @@ impl<'a> CovPlan<'a> {
         let is_agq = matches!(self.objective, Objective::Agq { .. });
         // FOCE's population prediction at η = 0 (beside a non-Gaussian term production takes
         // the conditional variance).
-        let pop = if n_obs > 0
-            && !is_agq
-            && !interaction
-            && model.error_spec.has_f_dependent_variance()
-        {
+        let pop = if n_obs > 0 && !is_agq && !interaction && model.has_f_dependent_variance() {
             let zero_t = |_: usize, _: usize| 0.0;
             let zeros = vec![0.0; pn];
             Some(self.plan_run(
@@ -1476,7 +1472,7 @@ impl<'a> CovPlan<'a> {
         };
         // A tangent pass of a structured subject keeps the kernel's inputs for [`st`] instead of
         // running the recorded kernel — where its rows hold at this point. Where they do not (a
-        // row off its domain, FOCE past its Woodbury gate, where production factors `R̃` itself,
+        // row off its domain, FOCE past its Woodbury gate, where `foce_f` leaves Woodbury's form,
         // or a structured stage 1 that did not form), this pass is laid out at the structured
         // width and, under quadrature, has no recorded stage 1: it is declined here and
         // [`psi_lanes`] reruns every pass on the recorded kernels, one direction each.

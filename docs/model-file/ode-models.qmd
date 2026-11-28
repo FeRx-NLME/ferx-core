@@ -448,6 +448,13 @@ Scope and limits:
 
   Each of those can still return a finite OFV, so a check that did not really run never
   reads as a settled objective.
+- The check is two inner-loop passes over every subject, which on a run that only scores a
+  model at given estimates (`maxiter = 0`) can cost as much as the evaluation, and on a stiff
+  model much more: the tighter pass integrates at a tolerance where the stepper may take
+  many times the steps. `ofv_settlement_wall_time_secs` in the fit's `estimation:` block
+  says what it took. `ode_ofv_check = false` skips it; the fit then carries
+  `W_ODE_OFV_SETTLEMENT_UNCHECKED` with `ode_ofv_check = false` as its reason, so a skipped
+  check never reads as a settled objective either (#3157).
 - Both sides re-find the EBEs the same way: one warm solve per subject from the fit's modes,
   under the settings of the stage that published the OFV (such as the tighter `inner_tol` a
   `laplace` stage uses). Only the ODE tolerance differs between them, so further movement of
@@ -840,6 +847,11 @@ pin a stepper, name one:
   ode_method = rk45      # or rodas4, rodas5p, rosenbrock23, vern7
 ```
 
+Pinning `rk45` on a model that is stiff does not skip a cost, it can change the answer: `rk45`
+can exhaust its step budget on the stiff segments and freeze-pad them, and the OFV can then be
+wrong by orders of magnitude (#3154), which `W_ODE_SOLVER_DIAGNOSTICS` reports. The `W_ODE_SOLVER_ESCALATION_NOTE` says how many segments
+`auto` escalated; compare the OFV against a stiff method before pinning `rk45`.
+
 Before each integration, ferx builds the Jacobian `J = ∂f/∂u` of your `[odes]` right-hand
 side at the state that integration is about to start from, and reads its eigenvalues. The
 discriminator is the fastest mode,
@@ -1083,13 +1095,11 @@ limited. Run your model and look at the solver's step counts:
 #### Where the step counts show up
 
 After a fit, ferx runs one pass over every subject at the final estimates — the ordinary
-prediction dispatch, plus one analytic sensitivity solve per subject for models on the
-analytic ODE sensitivity path — and reports what the solver did there as an `ode_solver`
+prediction dispatch — and reports what the solver did there as an `ode_solver`
 warning (see [Warnings](../warnings.qmd#warning-codes)). It fires when a step clamped at the
 minimum
 step size, when a returned segment stopped before its requested end, when an `auto` escalation
-had to be discarded and re-solved explicitly, when that explicit fallback also failed, when an
-escalation was discarded because its derivatives overflowed, when `ode_stiff_abort_after`
+had to be discarded and re-solved explicitly, when that explicit fallback also failed, when `ode_stiff_abort_after`
 cut a segment short, or when a walk was abandoned *before integrating* because the subject's
 timeline could not be ordered — and, at `Info` severity, when `auto` escalated
 and everything worked, so an escalation is never invisible. Either way it says how many
@@ -1137,13 +1147,13 @@ running at the edge of what `f64` can represent. Naming a different method will 
 Check the units and scaling instead: a state carried in ng rather than mg, a rate constant on
 a per-second clock, or a growth term with nothing bounding it.
 
-Because no `f64` pass can observe that decision, the post-fit sweep runs a sensitivity solve
-of its own to report it: the second-order provider (gradient **and** Hessian, what FOCEI
-differentiates) when the model has an analytic outer gradient, and the light first-order one
-when only the inner loop is analytic. A fit run with `gradient = fd` sweeps nothing, because
-it computed no analytic derivatives to overflow. The counter is collected separately from the
-prediction pass, so it is the one key in the warning's `details` payload that is disjoint from
-the escalation counts rather than a subset of them.
+This decision is taken only by a solve carried out directly at a dual number type. A fit's
+analytic derivatives come from compiled plans instead, whose ODE loops integrate on the values
+and so cannot take it, and the post-fit prediction pass is plain `f64`. So `fit()` currently
+always reports `auto_stiff_rejected_jets` as 0. It no longer runs a separate sensitivity solve
+per subject to look for it, because that solve went through the same plans, could not observe
+the decision either, and cost gigabytes of memory on large ODE models (#3076). On a fit, an
+overflow like this shows up as a failed analytic Hessian, not as this counter.
 
 Only a segment that *entered* with finite jets is scored. Derivatives that have already
 overflowed stay overflowed for the rest of a subject's event chain, and re-solving a later

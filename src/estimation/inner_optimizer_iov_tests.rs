@@ -2662,20 +2662,7 @@ fn fallback_certifier_honours_the_stall_stop_on_a_noise_floored_objective() {
 fn a_walk_served_iov_subject_stops_on_the_gradient_not_the_stall() {
     use crate::parser::model_parser::parse_model_string;
     let model = parse_model_string(TRANSIT_IOV_MODEL).expect("parse transit IOV");
-    let subject = Subject {
-        id: "1".into(),
-        doses: vec![
-            DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0),
-            DoseEvent::new(24.0, 100.0, 1, 0.0, false, 0.0),
-        ],
-        obs_times: vec![0.5, 1.0, 2.0, 6.0, 12.0, 24.5, 25.0, 26.0, 30.0, 36.0],
-        observations: vec![3.0, 6.0, 8.0, 9.0, 8.5, 12.0, 14.0, 16.0, 15.0, 14.0],
-        obs_cmts: vec![1; 10],
-        cens: vec![0; 10],
-        occasions: vec![1, 1, 1, 1, 1, 2, 2, 2, 2, 2],
-        dose_occasions: vec![1, 2],
-        ..Default::default()
-    };
+    let subject = transit_iov_walk_subject();
     let params = model.default_params.clone();
     let solve = |tol: f64| {
         let r = find_ebe_iov(
@@ -2730,6 +2717,93 @@ fn a_walk_served_iov_subject_stops_on_the_gradient_not_the_stall() {
         "at tol 1e-10 the solve must converge with its gradient below tol, not stop on a plateau \
          or give up (converged {conv}, max |g| {gmax:e})"
     );
+}
+
+/// #2868 on a closed form with an ODE twin, IOV side: a transit + IOV subject earns the
+/// integrating step only at an iterate the twin serves. The model-level gate is open for
+/// both solves (asserted), so the difference between them is the per-iterate filter's: a
+/// cold start the absorption walk serves keeps the roundoff step on every call, and a start at
+/// `κ_occ2 = 6`, where the second dose's pair is in flip-flop, takes `1e-3` on its first.
+/// Dropping the filter reddens the cold solve, and a filter that never opens the warm one.
+#[test]
+fn a_transit_iov_fd_search_takes_the_integrating_step_only_where_the_twin_serves() {
+    use crate::parser::model_parser::parse_model_string;
+    let mut model = parse_model_string(TRANSIT_IOV_MODEL).expect("parse transit IOV");
+    model.gradient_method = GradientMethod::Fd;
+    let subject = transit_iov_walk_subject();
+    let params = model.default_params.clone();
+    assert_eq!(
+        model_integrating_fd_step(&model),
+        Some(1e-3),
+        "the transit model counts its ODE twin as its integrator"
+    );
+    // Stacked layout [η_V, κ_occ1, κ_occ2]; at κ_occ2 = 6, ke = 0.2·e⁶/10 = 8.07 ≥ KTR = 4.
+    let flipped = [0.0, 0.0, 6.0];
+    assert!(
+        std::ptr::eq(
+            crate::pk::effective_model_for_eval_iov(&model, &subject, &params.theta, &[0.0; 3]),
+            &model
+        ),
+        "fixture drift: κ = 0 must be served by the absorption walk"
+    );
+    assert!(
+        !std::ptr::eq(
+            crate::pk::effective_model_for_eval_iov(&model, &subject, &params.theta, &flipped),
+            &model
+        ),
+        "fixture drift: κ_occ2 = 6 must send the subject to the twin"
+    );
+    let steps = |init: Option<&[f64]>, init_is_mode: bool| {
+        arm_ebe_fd_calls();
+        find_ebe_iov(
+            &model,
+            &subject,
+            &params,
+            200,
+            1e-6,
+            init,
+            None,
+            EbeVariance::Conditional,
+            init_is_mode,
+        );
+        let calls = take_ebe_fd_calls();
+        assert!(!calls.is_empty(), "an FD solve differences its objective");
+        calls.into_iter().map(|c| c.0).collect::<Vec<_>>()
+    };
+
+    let cold = steps(None, false);
+    assert!(
+        cold.iter().all(Option::is_none),
+        "a walk-served solve keeps the roundoff step on every call: {cold:?}"
+    );
+    // Certified, so the start is kept: uncertified, its objective is over the ODE + IOV
+    // start-rejection gate and the search restarts at κ = 0, in the walk's domain.
+    let warm = steps(Some(&flipped), true);
+    assert_eq!(
+        warm.first(),
+        Some(&Some(1e-3)),
+        "a twin-served start takes the integrating step: {warm:?}"
+    );
+    assert!(warm.iter().all(|h| h.is_none() || *h == Some(1e-3)), "one of the two steps: {warm:?}");
+}
+
+/// Two doses on two occasions, ten observations, for [`TRANSIT_IOV_MODEL`]: at κ = 0 the
+/// absorption walk serves every (dose, interval) pair.
+fn transit_iov_walk_subject() -> Subject {
+    Subject {
+        id: "1".into(),
+        doses: vec![
+            DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0),
+            DoseEvent::new(24.0, 100.0, 1, 0.0, false, 0.0),
+        ],
+        obs_times: vec![0.5, 1.0, 2.0, 6.0, 12.0, 24.5, 25.0, 26.0, 30.0, 36.0],
+        observations: vec![3.0, 6.0, 8.0, 9.0, 8.5, 12.0, 14.0, 16.0, 15.0, 14.0],
+        obs_cmts: vec![1; 10],
+        cens: vec![0; 10],
+        occasions: vec![1, 1, 1, 1, 1, 2, 2, 2, 2, 2],
+        dose_occasions: vec![1, 2],
+        ..Default::default()
+    }
 }
 
 /// #1082 PR3: the analytic IOV inner gradient of a nested-level model is over the compact
@@ -5094,7 +5168,9 @@ fn iov_solve_at_a_tight_tolerance_certifies_a_partial_at_its_mode() {
             0,
             EbeVariance::Conditional,
             false,
+            false,
             InnerHessianSeed::None,
+            false,
         )
     };
     let flat = |r: &EbeResult| {
@@ -5583,6 +5659,75 @@ fn iov_multistart_runs_on_cold_solves_only() {
     assert_eq!(started(), before + 1, "a cold one does");
 }
 
+/// #2900: an exactly-zero joint start an earlier pass returned (`PrevEtas::Solved`) is warm,
+/// as in the non-IOV solve (#2691), so it starts no multi-start; the same zeros as the cold
+/// placeholder do, and so does a solved η̂ alone (the ODE+IOV cache's), whose κ restart at 0.
+/// (An IOV subject none of whose η and κ the predictions read is re-scanned at every
+/// evaluation otherwise: 134 times in a 10-subject `warfarin_iov` fit.)
+#[test]
+fn iov_solved_zero_start_runs_no_multistart() {
+    let (model, subject) = two_mode_fixture(TWO_MODE_RESET, "1");
+    let r = cold_iov_solve(&model, &subject, 0, 1e-6, None);
+    let zero = vec![0.0; r.eta.len() + r.kappas.iter().map(|k| k.len()).sum::<usize>()];
+    let started = || EBE_MULTISTARTS_STARTED.with(|n| n.get());
+    let n_eta = r.eta.len();
+    for (prev, start, runs) in [
+        (PrevEtas::Solved, &zero[..], 0),
+        (PrevEtas::Placeholder, &zero[..], 1),
+        (PrevEtas::Solved, &zero[..n_eta], 1),
+    ] {
+        let before = started();
+        find_ebe_for_stage_with_prev(
+            &model,
+            &subject,
+            &model.default_params,
+            500,
+            1e-6,
+            Some(start),
+            None,
+            4,
+            &crate::types::FitOptions::default(),
+            prev,
+        );
+        assert_eq!(started() - before, runs, "{prev:?}, start of {}", start.len());
+    }
+}
+
+/// #2900: the same start is seeded with the Gauss–Newton metric as a solved zero joint start
+/// and left unseeded as the cold placeholder or a solved η̂ alone, as the non-IOV solve does.
+/// Mutation: `is_warm_start(eta_init, init_is_mode)` back at the seed gate -> the first row
+/// reads unseeded.
+#[test]
+fn iov_solved_zero_start_is_seeded() {
+    let prep = crate::prepare_run("examples/warfarin_iov.ferx", Some("data/warfarin_iov.csv"))
+        .expect("prepare");
+    let (model, p) = (prep.parsed.model, prep.init_params);
+    let s = &prep.population.subjects[0];
+    let n_flat = model.n_eta + model.n_kappa * crate::stats::stacked_layout::group_count(s);
+    let zero = vec![0.0; n_flat];
+    for (warm, start, seeded) in
+        [(true, &zero[..], true), (false, &zero[..], false), (true, &zero[..model.n_eta], false)]
+    {
+        find_ebe_iov_seeded(
+            &model,
+            s,
+            &p,
+            200,
+            1e-6,
+            Some(start),
+            None,
+            0,
+            EbeVariance::Conditional,
+            false,
+            warm,
+            InnerHessianSeed::GaussNewton,
+            false,
+        );
+        let used = LAST_INITIAL_HESSIAN.with(|h| h.borrow().is_some());
+        assert_eq!(used, seeded, "warm {warm}, start of {}", start.len());
+    }
+}
+
 /// The issue's second validation: a unimodal IOV subject stays bit-identical, across a
 /// range of `tol` that makes the seeds' descents stop at points of their own on the same
 /// mode, some measurably below the primary's: the objective guard alone would take those.
@@ -5873,6 +6018,81 @@ fn section_has_barrier_needs_a_rise_and_a_fall() {
     assert!(!section_has_barrier(&inf_mid, &x, &seed));
 }
 
+/// #2868: the IOV search's FD gradient takes the integrating step on an adaptively integrated
+/// ODE subject and the roundoff step on a closed-form one or one on the exact matrix-exponential
+/// path, and is stepped from η: it moves `ψ = η + μ`, so it hands `ebe_gradient_fd` μ as the
+/// origin. Read off the calls themselves, on the engines of one model, so the gate straddles:
+/// the regressions this catches are the IOV arm passing no integrating step (or one for a
+/// closed form or a `linear` solve, hence the `auto` leg on this affine `[odes]`), a step that
+/// ignores the fit's tolerance (hence the `1e-6` leg, armed as `fit` arms it), or no origin.
+#[test]
+fn the_iov_fd_inner_gradient_steps_by_the_engine_from_eta() {
+    use crate::ode::OdeMethod;
+    let mu = [0.7];
+    // (fit's ode_method, its ode_reltol, the method the ODE fixture resolves to, and the step
+    // an ODE subject takes: 1e-3·(reltol / 1e-4)^(1/3) when adaptive, roundoff when linear).
+    for (method, reltol, resolved, ode_step) in [
+        (None, None, OdeMethod::Linear, None),
+        (Some(OdeMethod::Rk45), None, OdeMethod::Rk45, Some(1e-3)),
+        (Some(OdeMethod::Rk45), Some(1e-6), OdeMethod::Rk45, Some(2.154_434_690_031_884e-4)),
+    ] {
+        let _fit =
+            crate::ode::solver::arm_ode_solver_override(crate::ode::solver::OdeSolverOverride {
+                method,
+                reltol,
+                ..Default::default()
+            });
+        for (label, mut m) in unlabelled_dose_models() {
+            if let Some(spec) = m.integrator_spec() {
+                assert_eq!(
+                    spec.effective_solver_opts().method,
+                    resolved,
+                    "{label}, method {method:?}: the leg must resolve to its engine"
+                );
+            }
+            let s = unlabelled_dose_subject(&m);
+            m.gradient_method = GradientMethod::Fd;
+            IOV_AGRAD_ROUTE.with(|c| c.set((0, 0)));
+            arm_ebe_fd_calls();
+            let ebe = find_ebe_iov(
+                &m,
+                &s,
+                &m.default_params,
+                200,
+                1e-5,
+                None,
+                Some(&mu),
+                EbeVariance::Conditional,
+                false,
+            );
+            let (analytic, fd) = IOV_AGRAD_ROUTE.with(|c| c.get());
+            let calls = take_ebe_fd_calls();
+            assert!(
+                ebe.nll.is_finite() && ebe.nll < 1e19,
+                "{label}, reltol {reltol:?}: EBE objective {}",
+                ebe.nll
+            );
+            assert!(
+                analytic == 0 && fd > 0 && calls.len() == fd,
+                "{label}, reltol {reltol:?}: {analytic} analytic / {fd} FD steps, {} FD calls",
+                calls.len()
+            );
+            let want = ode_step.filter(|_| label.starts_with("ode"));
+            assert!(
+                calls.iter().all(|(step, origin)| {
+                    origin.as_deref() == Some(&mu[..])
+                        && match (step, want) {
+                            (Some(h), Some(w)) => (h / w - 1.0).abs() < 1e-12,
+                            (None, None) => true,
+                            _ => false,
+                        }
+                }),
+                "{label}, method {method:?}, reltol {reltol:?}: want {want:?}, {calls:?}"
+            );
+        }
+    }
+}
+
 /// An SDE + IOV subject's EBE search takes the per-row IOV assembler, which reads the EKF
 /// variance rows off the subject's plan: the route is analytic, and the search runs no
 /// finite-difference step. (Its gradient against central differences of `individual_nll_iov`
@@ -5970,4 +6190,116 @@ fn an_iov_dose_only_subject_is_not_counted_as_finite_differences() {
         "control: the observed subject takes the exact IOV route"
     );
     assert_eq!(fd_fallback_warning(&model, &pop, theta), None);
+}
+
+/// IOV value/gradient fusion (#3088): the value [`analytic_eta_nll_value_gradient_iov_frozen`]
+/// scores off the recording's predictions is the native IOV objective
+/// (`individual_nll_iov_frozen_in`) bit for bit, under the conditional (FOCEI) and the frozen
+/// (FOCE) variance, and its gradient is the plain gradient bit for bit. The EBE search puts the
+/// value in its objective memo, where the line search compares it with native values, so any
+/// rounding gap would be read as a step's gain.
+#[test]
+fn iov_fused_value_is_the_native_objective_bit_for_bit() {
+    let prep = crate::prepare_run("examples/warfarin_iov.ferx", Some("data/warfarin_iov.csv"))
+        .expect("prepare");
+    let (m, p) = (&prep.parsed.model, &prep.init_params);
+    let omega_iov = p.omega_iov.as_ref().expect("IOV model");
+    let mut n_points = 0usize;
+    for s in prep.population.subjects.iter().take(6) {
+        let layout = crate::stats::stacked_layout::StackedLayout::sens_of(m, s).unwrap();
+        let k = crate::stats::stacked_layout::group_count(s);
+        let f0 = crate::stats::likelihood::population_variance_preds_iov(
+            m, s, &p.theta, m.n_eta, m.n_kappa, k,
+        )
+        .expect("population predictions");
+        let mult = m.ruv_obs_mult(s, &p.theta);
+        for scale in [0.0, 0.3, -0.5] {
+            let b: Vec<f64> =
+                (0..layout.n_stacked()).map(|c| scale * (1.0 + 0.1 * c as f64)).collect();
+            assert!(iov_eval_route(m, s, &p.theta, &b).1, "closed form: the value is native");
+            for frozen in [None, Some(f0.as_slice())] {
+                let mut v = None;
+                let g = analytic_eta_nll_value_gradient_iov_frozen(
+                    m,
+                    s,
+                    &layout,
+                    &p.theta,
+                    &b,
+                    &p.omega,
+                    omega_iov,
+                    &p.sigma.values,
+                    mult.as_deref(),
+                    frozen,
+                    &mut Vec::new(),
+                    Some(&mut v),
+                )
+                .expect("in scope");
+                let g0 = analytic_eta_nll_gradient_iov_frozen(
+                    m,
+                    s,
+                    &layout,
+                    &p.theta,
+                    &b,
+                    &p.omega,
+                    omega_iov,
+                    &p.sigma.values,
+                    mult.as_deref(),
+                    frozen,
+                    &mut Vec::new(),
+                )
+                .expect("in scope");
+                assert_eq!(
+                    g.iter().map(|x| x.to_bits()).collect::<Vec<_>>(),
+                    g0.iter().map(|x| x.to_bits()).collect::<Vec<_>>(),
+                    "the fused pass must return the plain gradient bit for bit"
+                );
+                let kappas: Vec<Vec<f64>> =
+                    b[m.n_eta..].chunks(m.n_kappa).map(<[f64]>::to_vec).collect();
+                let want = individual_nll_iov_frozen_in(
+                    m,
+                    s,
+                    &layout,
+                    &p.theta,
+                    &b[..m.n_eta],
+                    &kappas,
+                    &p.omega,
+                    Some(omega_iov),
+                    &p.sigma.values,
+                    m.residual_cov_at(p),
+                    &mut crate::pk::EventPkParams::default(),
+                    None,
+                    frozen,
+                );
+                let v = v.expect("a plain Gaussian IOV subject is scored");
+                assert_eq!(
+                    v.to_bits(),
+                    want.to_bits(),
+                    "subject {} at {scale} (frozen: {}): fused {v} vs native {want}",
+                    s.id,
+                    frozen.is_some()
+                );
+                n_points += 1;
+            }
+        }
+    }
+    assert_eq!(n_points, 36);
+}
+
+/// The IOV EBE search takes the fused value (#3088): on a closed-form IOV model, under both
+/// variance conventions, gradient passes land their value in the objective memo, and every
+/// subject still converges.
+#[test]
+fn iov_ebe_search_memoises_the_fused_value() {
+    let prep = crate::prepare_run("examples/warfarin_iov.ferx", Some("data/warfarin_iov.csv"))
+        .expect("prepare");
+    let p = &prep.init_params;
+    for variance in [EbeVariance::Conditional, EbeVariance::Population] {
+        IOV_MEMO_FUSED_PUTS.with(|c| c.set(0));
+        for s in prep.population.subjects.iter().take(4) {
+            let r = find_ebe_iov(&prep.parsed.model, s, p, 200, 1e-6, None, None, variance, false);
+            assert!(r.converged, "subject {} ({variance:?})", s.id);
+        }
+        let puts = IOV_MEMO_FUSED_PUTS.with(|c| c.get());
+        assert!(puts > 0, "{variance:?}: no fused value reached the memo");
+    }
 }

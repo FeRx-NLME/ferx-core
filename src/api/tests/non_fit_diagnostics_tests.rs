@@ -808,6 +808,57 @@ fn the_abandoned_clause_and_the_escalation_note_carry_the_phase() {
     );
 }
 
+/// #3154: the escalation-only note must not offer `rk45` as an equal alternative. Every
+/// escalated segment is one the probe judged stiff, so pinning the explicit stepper integrates
+/// exactly those explicitly: on the issue's stiff-gate model it moved the OFV from −579.41 to
+/// 370882. Asserted for one escalated segment and for many, so a wording that depends on the
+/// count and is wrong on either side fails.
+///
+/// The advice is asserted as a whole, not as the old strings absent: `rk45` may be named only
+/// to say what pinning it costs, so no `ode_method = rk45` anywhere, and every clause of the
+/// remedy is pinned. Mutation: restore "set ode_method = rk45 to pin the explicit stepper", or
+/// reword it to "set ode_method = rk45 to skip the probe", and the first assert fails; delete
+/// the stiff-method names, the "verdict can be wrong" clause, the "only if" condition or the
+/// `W_ODE_SOLVER_DIAGNOSTICS` pointer and the matching assert fails. Only a fit's note names an
+/// OFV: a `predict()` or `simulate()` pass has none (#3196 review).
+#[test]
+fn the_escalation_note_does_not_offer_rk45_as_a_safe_pin() {
+    let o = FitOptions::default();
+    for (phase, wrong) in [
+        (SolverStatsPhase::PostfitPredictions, "a wrong OFV"),
+        (SolverStatsPhase::Predict, "wrong predictions"),
+        (SolverStatsPhase::Simulate, "wrong simulated trajectories"),
+    ] {
+        for escalated in [1, 60] {
+            let (note, entry) = ode_solver_diagnostics_warning(
+                &crate::ode::OdeSolverStats {
+                    attempted_steps: 400,
+                    accepted_steps: 400,
+                    auto_stiff_segments: escalated,
+                    ..Default::default()
+                },
+                &o,
+                phase,
+            )
+            .expect("an info note");
+            assert!(!note.contains("ode_method = rk45"), "{note}");
+            assert_eq!(note.contains("OFV"), phase == SolverStatsPhase::PostfitPredictions);
+            for clause in [
+                "To skip the probe, name a stiff method (ode_method = rodas5p or rodas4)",
+                ", which then runs every segment",
+                "can be wrong on a model that is not stiff",
+                "Pin rk45 only if those segments are not stiff",
+                format!("can exhaust its step budget, freeze-pad them and return {wrong}").as_str(),
+                "W_ODE_SOLVER_DIAGNOSTICS",
+                "Compare the results against a stiff method",
+            ] {
+                assert!(note.contains(clause), "missing {clause:?}: {note}");
+            }
+            assert_eq!(entry.message, note, "the typed entry carries the same text");
+        }
+    }
+}
+
 // ── the synthesized FitOptions view ──────────────────────────────────────────
 
 /// A non-fit entry point must name the `ode_method` the model is *actually* integrated at.
@@ -960,19 +1011,18 @@ fn a_dv_free_simulation_template_does_not_trip_the_dv_reading_member_of_the_bund
     );
 }
 
-/// The production `SolverStatsScope::enter` sites are exactly the four this enum has phases
+/// The production `SolverStatsScope::enter` sites are exactly the three this enum has phases
 /// for — pinned at **exact counts per file**, against the source.
 ///
-/// Regression this catches: a fifth entry point opening a scope and reporting it under some
+/// Regression this catches: a fourth entry point opening a scope and reporting it under some
 /// other phase's wording, or — the #1304 defect in reverse — a scope opened and never routed
 /// into a warning at all. Either way the count moves and this fails, naming the file.
 ///
-/// The four, and the phase each answers to:
+/// The three, and the phase each answers to:
 ///
 /// | site | phase |
 /// |---|---|
 /// | `postfit::compute_subject_results` (per subject task) | `PostfitPredictions` |
-/// | `postfit::sweep_sensitivity_solver_stats` (per subject task) | `PostfitPredictions` |
 /// | `postfit::solver_stats_scope` (the shared gate) | `Simulate` / `SimulateAdaptive` / `PredictSurvival` |
 /// | `predict::predict_diag` (per subject task) | `Predict` |
 ///
@@ -983,7 +1033,7 @@ fn a_dv_free_simulation_template_does_not_trip_the_dv_reading_member_of_the_bund
 #[test]
 fn the_production_scope_sites_are_the_phases_this_enum_lists() {
     const SITES: [(&str, &str, usize); 4] = [
-        ("postfit.rs", include_str!("../postfit.rs"), 3),
+        ("postfit.rs", include_str!("../postfit.rs"), 2),
         ("predict.rs", include_str!("../predict.rs"), 1),
         ("simulate.rs", include_str!("../simulate.rs"), 0),
         ("adaptive.rs", include_str!("../adaptive.rs"), 0),

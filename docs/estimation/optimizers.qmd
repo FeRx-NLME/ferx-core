@@ -214,9 +214,9 @@ arm that silently became derivative-free.
 
 Both gradient-based NLopt optimizers start with their quasi-Newton Hessian set to the identity, so their opening search direction is simply $-\nabla f$. On a typical PK model the scaled analytic gradient is large at the initial estimates ($10^2$–$10^3$ in log/Cholesky space), so that first step lands in a corner of the parameter box, the objective there explodes, and the line search fails — leaving the fit sitting on (or a hair off) its initial estimates for the rest of the budget.
 
-ferx rescales the gradient by a single scalar on that opening step, so it stays inside a sane per-dimension budget. The direction is unchanged. The rescale is deliberately *not* held on afterwards: L-BFGS reconstructs its Hessian from successive gradient differences, and rescaling those differences corrupts the curvature it has learned (SLSQP re-solves its subproblem from scratch each step, so it is rescaled throughout).
+ferx rescales that opening step by a single scalar $c$, chosen on the first gradient so the step stays inside a sane per-dimension budget. NLopt minimises $f/c$ with gradient $\nabla f/c$ for the first leg, so the direction is unchanged and the objective and its gradient stay consistent: every line search and secant pair after the first sees one scaled function. The `ftol`/`xtol` stops are relative; Luksan's PLIS gradient test is absolute (`tolg`), so it can stop the first leg early at the scaled gradient's floor, and the verification (FOCE/FOCEI) and polish (quadrature) legs that follow run on the unscaled objective. Dividing the gradient alone, as ferx did before [#3153](https://github.com/FeRx-NLME/ferx-core/issues/3153), left L-BFGS's first line search and first secant pair comparing a raw objective with a $c$-times-smaller slope. On a one-state turnover model with no random effects, that pair failed its curvature condition, the optimizer restarted on the raw gradient, and the step ran to the parameter bound: the fit ended 1887 OFV above its optimum on a `KIN` guard, reported converged. SLSQP, rescaled on every evaluation, ended at a degenerate point 8000 OFV above.
 
-If the fit nevertheless ends up still on its initial estimates, ferx re-runs it once from the same start with the rescale **held on until the fit escapes** — a fit that never moved has no curvature worth protecting. The second attempt is reported only if it both left the initial estimates *and* reached a lower OFV; if it stalled as well, the first attempt stands (together with its "did not converge" warning), so a fit reported as non-convergent is never one that quietly picked up a lower objective at a point it never reached. A fit that was descending normally never triggers any of this and follows exactly the trajectory it always did.
+If the fit nevertheless ends up still on its initial estimates, ferx re-runs it once from the same start with the gradient rescale **held on until the fit escapes** — a fit that never moved has no curvature worth protecting. The second attempt is reported only if it both left the initial estimates *and* reached a lower OFV; if it stalled as well, the first attempt stands (together with its "did not converge" warning), so a fit reported as non-convergent is never one that quietly picked up a lower objective at a point it never reached. A fit that was descending normally never triggers any of this and follows exactly the trajectory it always did.
 
 A fit that nonetheless fails to leave its initial estimates **through this path** is reported with `converged = false` and a "did not converge" warning — never as a converged fit whose estimates and standard errors happen to be the starting values. If you see this, the usual remedies are better initial estimates, a different `optimizer`, or `parameter_scaling` (see [`fit_options`](../model-file/fit-options.qmd)).
 
@@ -272,7 +272,10 @@ restart ends with the objective at the start.
 Because the question is answered by the optimizer itself, bounds, flat directions and
 saddles are handled the way every fit handles them, and the check covers any model and
 objective, AGQ and mixtures included. It costs one extra optimization from near the start,
-paid only by a fit that did not move.
+paid only by a fit that did not move. A basin-shift or mid-descent restart that does not leave its
+own start is asked the same question
+([#2707](https://github.com/FeRx-NLME/ferx-core/issues/2707),
+[details](foce.qmd#restart-at-its-own-start)).
 
 A model with a `profile`d θ block runs the same check
 ([#2591](https://github.com/FeRx-NLME/ferx-core/issues/2591)). Only its structural
@@ -489,7 +492,16 @@ own because its inner solves run to `1e-10`. Over the A2 grid the legs cost 19% 
 in total and doubled the wall time (9.7 s to 20.7 s for 80 fits); on `warfarin_iov` they add 21
 evaluations to a 49-evaluation fit. The fit's reported OFV is still the final cold
 re-solve at your `inner_tol`, so a repaired stop reports, say, +2.75e-7 rather than the +4e-8 the
-leg itself reached. Quadrature objectives (`n_agq > 1`, Laplace) and mixtures do not take the leg.
+leg itself reached. Quadrature objectives (`n_agq > 1`, Laplace) do not take the leg.
+
+A `[mixture]` fit does (#2745), since `optimizer = auto` sends it to L-BFGS when the analytic outer
+gradient is in scope. It takes the legs from the incumbent's modes, each class solved at the leg's
+tolerance, but not the rounds below, whose cold solve and Newton step score a single population.
+Each evaluation of a mixture objective solves every class, so its leg costs that many times a single
+population's. On Linux aarch64 the leg gained 9.1e-13 and 1.1e-13 on `mixture_iv` and
+`mixture_iv_iov` (both stops were already the minimum) for 4 and 6 more evaluations (25 against 21,
+36 against 30). On the 120-subject `mixture_2cpt_oral_iov` example it gained 1.8e-8 and added 11
+evaluations to a 35-evaluation fit (395 s to 484 s, macOS arm64).
 
 #### Rounds from outside the incumbent's modes
 
@@ -498,7 +510,7 @@ legs have settled, two more rounds of legs may run (#2645). Each opens from some
 not reach, and the fit keeps a round only if it ended lower; otherwise the incumbent and its verdict
 stand. Neither start wins everywhere, which is why the warm legs run first: a cold start left a
 subject unconverged on the `transit_flip_flop` ODE twin, and on one simulated dataset the cold
-round ended several OFV above the incumbent.
+round ended several OFV above the incumbent. A `[mixture]` fit runs neither round (#2745).
 
 - **From a cold solve's modes.** A cold solve at the verified point runs, and if any subject's `−2LL`
   term differs from the incumbent's by more than 1e-3, *in either direction*, a round starts at the

@@ -11,7 +11,7 @@ $PROBLEM Warfarin M3 BLOQ, integer columns written as integers (ferx-core #1496)
 ; final estimates identical to every printed digit. With that one row at MDV=0
 ; instead: 110 records, #OBJV 281.06112134711015, so the MDV cell is live here.
 ; Model: tests/nonmem/warfarin_bloq.ctl unchanged but for $INPUT (II ADDL appended),
-; $DATA and $TABLE FILE. Its committed warfarin_bloq.lst is NONMEM 7.5.1
+; $DATA and $TABLE FILE. Its committed warfarin_bloq.nm.json is NONMEM 7.5.1
 ; (-216.78754391843171); on 7.6.0 the same integer file gives -216.78754377790631, so
 ; that 1.4e-7 gap is the version, not the data format.
 ; Cross-check for ferx's M3 likelihood + analytic M3 inner EBE gradient.

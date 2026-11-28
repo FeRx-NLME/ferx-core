@@ -7,7 +7,7 @@
 #
 # That equivalence is what makes this file an anchor rather than a duplicate.
 # The `[odes]` model is externally anchored to NONMEM 7.6.0 (ADVAN13 TOL=9,
-# `results/dose_form_lag_ss.lst`), so agreement between the two ferx engines
+# `results/dose_form_lag_ss.nm.json`), so agreement between the two ferx engines
 # transfers that anchor to the closed-form event-driven walk — which has its own
 # SS + lagtime handling (`pk/event_driven.rs`) that no NONMEM run covers
 # directly.

@@ -1020,3 +1020,55 @@ fn cross_block_dw_takes_only_pairs_that_join_blocks_in_time() {
     let (pairs, dw) = run([1.0; 4], vec![], running);
     assert_eq!((pairs, dw.is_nan()), (0, true), "one block");
 }
+
+/// `r_matrix_g`'s coupling blocks (#3060) are the serial groups, read from the data and not
+/// from row adjacency (the arms are interleaved), and every entry between two blocks is the
+/// structural zero the blocked factorisation skips — for each kind. Dies on: blocks taken as
+/// contiguous runs, a block spanning the two arms, a pair written into `R` without being
+/// joined (an off-block entry that is not zero), and an unassigned population (`R` all `NaN`)
+/// split into blocks instead of left one.
+#[test]
+fn r_matrix_g_blocks_are_the_serial_groups() {
+    let subject = Subject {
+        obs_times: times(),
+        obs_raw_times: times(),
+        obs_rgroup: rgroup(),
+        observations: vec![1.0; 6],
+        obs_cmts: vec![1; 6],
+        ..Default::default()
+    };
+    let loadings = |j: usize| vec![(0usize, IPREDS[j]), (1usize, WEIGHTS[j])];
+    for kind in [ResidualSerialKind::Cs, ResidualSerialKind::Ar1, ResidualSerialKind::Car1] {
+        let (r, blk) =
+            r_matrix_g(loadings, 6, &subject, &SIGMA, cov(kind, 0.4), |_| 0.0, Some(0.4));
+        for j in 0..6 {
+            let want: Vec<usize> = (0..6).filter(|&k| ROWS[k].0 == ROWS[j].0).collect();
+            assert_eq!(blk.rows(j), &want[..], "{kind:?}: row {j}'s block");
+            for k in 0..6 {
+                assert_eq!(blk.same(j, k), ROWS[j].0 == ROWS[k].0, "{kind:?}: ({j}, {k})");
+                if !blk.same(j, k) {
+                    assert_eq!(r[j][k].to_bits(), 0.0f64.to_bits(), "{kind:?}: R[{j}][{k}]");
+                } else {
+                    assert!(r[j][k] != 0.0, "{kind:?}: R[{j}][{k}] is coupled");
+                }
+            }
+        }
+    }
+    // No serial term: every row its own block.
+    let plain = ResidualCov { pairs: &[], serial: None };
+    let (_, blk) = r_matrix_g(loadings, 6, &subject, &SIGMA, plain, |_| 0.0, None);
+    assert!((0..6).all(|j| blk.rows(j) == [j]));
+    // Rows never given their blocks: `R` is all `NaN`, one block (nothing is skipped).
+    let unassigned = Subject { obs_rgroup: Vec::new(), ..subject };
+    let (r, blk) = r_matrix_g(
+        loadings,
+        6,
+        &unassigned,
+        &SIGMA,
+        cov(ResidualSerialKind::Cs, 0.4),
+        |_| 0.0,
+        Some(0.4),
+    );
+    assert!(r.iter().flatten().all(|v| v.is_nan()));
+    assert!((0..6).all(|j| blk.rows(j) == [0, 1, 2, 3, 4, 5]));
+}

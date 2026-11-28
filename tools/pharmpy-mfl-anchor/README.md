@@ -1,17 +1,17 @@
 # Pharmpy MFL anchor
 
 The external reference for ferx's Model Feature Language parser and `@`-symbol
-resolver (`crates/ferx-tools/src/search/{mfl,resolve}.rs`, #1179). MFL is
+resolver (`crates/ferx-search/src/search/{mfl,resolve}.rs`, #1179). MFL is
 Pharmpy's grammar, so Pharmpy's own parser is the oracle: every line of
 `corpus.txt` is fed to `pharmpy.tools.mfl.parse.parse`, and a set of
 symbol-bearing statements is `expand()`ed on a reference model. The dump is
-committed as `crates/ferx-tools/tests/data/mfl_pharmpy_anchor.json` and
+committed as `crates/ferx-search/tests/data/mfl_pharmpy_anchor.json` and
 replayed by the Tier-1 test module `mfl_pharmpy_anchor.rs`, which parses the
 same strings with ferx and compares normalised structures.
 
 ```bash
 tools/pharmpy-mfl-anchor/run.sh     # regenerate the JSON (needs docker + a Pharmpy image)
-cargo test -p ferx-tools --lib search::mfl::pharmpy_anchor
+cargo test -p ferx-search --lib search::mfl::pharmpy_anchor
 ```
 
 The container is only needed to *regenerate*; CI replays the committed JSON.

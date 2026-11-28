@@ -81,6 +81,22 @@ and `#anchor`), never per PR, so a flaky site cannot redden one. Run the same
 check locally with `tools/check-external-links.py`; `--list` shows what it
 would fetch.
 
+### R4 on `llms.txt`
+
+`docs/llms.txt`, the site index for language models
+([Using ferx from an agent](../agents.qmd)), is copied verbatim to the site
+root, so its links are absolute URLs. R4 maps every URL under the `site-url`
+in `_quarto.yml` back to its source: `page.html` and its Markdown twin
+`page.llms.md` resolve to `page.qmd`, a URL ending in `/` to `index.qmd`, and
+the `#anchor` is checked as on any page. A relative link there is a violation,
+because an agent reading the file by URL may have nothing to resolve it
+against. URLs on other sites are left to `tools/check-external-links.py`.
+
+The Markdown twins and `llms-full.txt` are generated at render time and never
+committed: `website: llms-txt: true` makes Quarto write a `.llms.md` beside
+every page, and the post-render script `docs/_llms.py` replaces Quarto's
+generated `llms.txt` with the curated one and concatenates the twins.
+
 ### Callout titles are not sections
 
 The heading that opens a callout is that callout's **title**. Pandoc lifts it
