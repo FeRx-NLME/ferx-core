@@ -1,0 +1,91 @@
+# Feature Maturity
+
+Not every feature in ferx-core is equally battle-tested. Some — like FOCE/FOCEI estimation and the analytical PK solutions — have been validated against gold standard engines across many datasets. Others are newer and have only been exercised on a handful of examples. To make this explicit, every major feature carries a **maturity label**.
+
+Where a feature has its own dedicated reference page, that page repeats its label in a banner at the top, e.g.:
+
+> **Maturity: beta** — see [Feature Maturity](maturity.llms.md) for what this means.
+
+The table below is the authoritative list; a few features documented inside a shared reference page (e.g. the gradient method under [Fit Options](model-file/fit-options.llms.md)) or only in an example carry their label here rather than in a per-page banner.
+
+## Maturity levels
+
+| Label | Meaning |
+|----|----|
+| **stable** | Well-tested functionality with proven stability across diverse datasets and estimation options. Performance is comparable to (or better than) gold standard NLME engines (NONMEM, Monolix). Safe for production use. |
+| **beta** | Stable in limited testing and across a range of fit settings, but some caution is warranted before relying on it in production on unseen datasets. Validate against a reference where you can. |
+| **experimental** | New functionality tested only on a single example or a small handful of (often toy) examples. Behaviour and syntax may change. Results should be treated as provisional and validated carefully. |
+
+These labels describe ferx-core’s *current* state and will move upward as features accumulate testing and cross-validation. Most of ferx-core is currently **beta**, with a mature core approaching **stable**; a few features remain **experimental**.
+
+## Runtime warnings
+
+Two **experimental** features emit a warning at fit time (surfaced in `FitResult.warnings`, the CLI output, and `ferx check`) so their status is visible at the point of use. The others are flagged only by their label here and on their reference page:
+
+| Feature                                           | Warning code         |
+|---------------------------------------------------|----------------------|
+| Stochastic differential equations (`[diffusion]`) | `W_EXPERIMENTAL_SDE` |
+| Neural networks (`[covariate_nn]`)                | `W_EXPERIMENTAL_NN`  |
+
+**Beta** and **stable** features do not emit a maturity warning.
+
+## Feature reference
+
+### Model file features
+
+| Feature | Maturity | Reference |
+|----|----|----|
+| Parameters (theta / omega / sigma, block omega) | **stable** | [Parameters](model-file/parameters.llms.md) |
+| Inter-occasion variability (IOV) | **stable** | [IOV](model-file/iov.llms.md) |
+| Covariates | **stable** | [Covariates](model-file/covariates.llms.md) |
+| Structural model — analytical PK (1/2/3-cpt) | **stable** | [Structural Model](model-file/structural-model.llms.md) |
+| Lag time | **stable** | [Lagtime](model-file/lagtime.llms.md) |
+| Steady-state doses (SS) | **stable** | [Steady-State Doses](model-file/steady-state.llms.md) |
+| Multiple dosing (ADDL / II) | **stable** | [Multiple Dosing](examples/multiple-dosing.llms.md) |
+| Error model (additive / proportional / combined) | **stable** | [Error Model](model-file/error-model.llms.md) |
+| Simulation | **stable** | [Simulation](model-file/simulation.llms.md) |
+| Individual parameters DSL | **beta** | [Individual Parameters](model-file/individual-parameters.llms.md) |
+| Random-effect shape transforms (`boxcox` / `tdist` / `johndraper`, `[eta_shape]`) | **experimental** | [Random-Effect Shapes](model-file/eta-shape.llms.md) |
+| BLOQ / censored observations (M3) | **beta** | [BLOQ](model-file/bloq.llms.md) |
+| ODE models (Dormand-Prince RK45) | **beta** | [ODE Models](model-file/ode-models.llms.md) |
+| Stiff ODE steppers (`ode_method` = Rosenbrock23 / Rodas4 / Rodas5P) | **beta** | [Stiff systems](model-file/ode-models.llms.md#stiff-systems) |
+| High-order ODE stepper (`ode_method` = Vern7) | **experimental** | [Choosing a method](model-file/ode-models.llms.md#stiff-systems) |
+| Automatic stiff-solver selection (`ode_method = auto`, the default) | **beta** | [Letting ferx pick the stepper](model-file/ode-models.llms.md#letting-ferx-pick-the-stepper-ode_method--auto) |
+| Built-in absorption models (transit / inverse-Gaussian / Weibull) | **beta** | [Absorption](model-file/absorption.llms.md) |
+| Scaling | **beta** | [Scaling](model-file/scaling.llms.md) |
+| Data selection | **beta** | [Data Selection](model-file/data-selection.llms.md) |
+| Derived columns | **beta** | [Derived Columns](model-file/derived.llms.md) |
+| Output columns | **beta** | [Output Columns](model-file/output.llms.md) |
+| Time-to-event endpoints (TTE) | **beta** | [Time-to-Event Endpoints](model-file/event-model.llms.md) |
+| Stochastic differential equations (SDE) | **experimental** | [SDE](model-file/diffusion.llms.md) |
+| Neural networks (DCM / NODE) | **experimental** | [Neural Networks](model-file/neural-networks.llms.md) |
+| Adaptive (feedback) dosing — `[adaptive_dosing]` block / `simulate_adaptive()` | **beta** | [Adaptive Dosing](model-file/adaptive-dosing.llms.md) |
+
+### Estimation features
+
+| Feature | Maturity | Reference |
+|----|----|----|
+| FOCE / FOCEI | **stable** | [FOCE / FOCEI](estimation/foce.llms.md) |
+| Gauss-Newton (BHHH) — `gn`, `gn_hybrid` | **beta** | [Gauss-Newton](estimation/gauss-newton.llms.md) |
+| SAEM | **beta** | [SAEM](estimation/saem.llms.md) |
+| SIR | **beta** | [SIR](estimation/sir.llms.md) |
+| Importance sampling (IMP) | **beta** | [Importance Sampling](estimation/importance-sampling.llms.md) |
+| Outer optimizers (BOBYQA, SLSQP, L-BFGS, MMA, trust-region) | **beta** | [Outer Optimizers](estimation/optimizers.llms.md) |
+| Time-to-event estimation (TTE) | **beta** | [Time-to-Event](estimation/tte.llms.md) |
+
+### Model-based meta-analysis (MBMA) features
+
+The pieces of an MBMA model, in the order [Model-based meta-analysis: start here](model-file/mbma.llms.md) introduces them. Each is labelled **beta** on the strength of the NONMEM anchor named in its row (catalogued in `nonmem_anchor/README.md`); the anchors cover single models, not the range of datasets **stable** asks for.
+
+| Feature | Maturity | Reference | NONMEM anchor |
+|----|----|----|----|
+| θ level blocks (`theta NAME[LEVEL]`; `sum_to_zero` / `sum_to_zero_within` / contrasts; per-level SEs) | **beta** | [Theta level blocks](model-file/parameters.llms.md#theta-level-blocks) | `level_two_block`, `level_se_{a,b}`, `level_no_gaussian` (read by a TTE hazard) |
+| `profile`d level blocks (incl. bounded) | **beta** | [Profiled level blocks](model-file/parameters.llms.md#profiled-level-blocks) | `profile_mbma`, `profile_mbma_bound`, `profile_mbma_tve0_55`; with a `correlation` line, no NONMEM run: it matches the anchored unprofiled fit ([With a profiled level block](model-file/residual-correlation.llms.md#with-a-profiled-level-block)) |
+| Nested variability levels (`level … in …`, `kappa … at LEVEL`) | **beta** | [Nested levels](model-file/iov.llms.md#nested-levels) | `nested_levels_3` (OFV, EBEs), `nested_levels_3_cov` (R-matrix SEs) |
+| Within-arm residual correlation (`cs` / `ar1` / `car1`, incl. with a kappa) | **beta** | [Within-group residual correlation](model-file/residual-correlation.llms.md) | `residual_correlation/*` (naproxen, real data); `nested_levels_3_ar1/*` (with kappa) |
+| Residual `weight =` and kappa `weight =` | **beta** | [Residual weighting](model-file/error-model.llms.md#residual-weighting-weight-...), [Sample-size-weighted IOV](model-file/iov.llms.md#sample-size-weighted-iov-weight-...) | `mbma_canakinumab` (both, real data); `residual_correlation/*` (residual); `nested_levels_3` (kappa) |
+| Compartment-free (algebraic) `[structural_model]` | **beta** | [Compartment-Free Models](model-file/structural-model.llms.md#compartment-free-models-the-pred-equivalent) | `algebraic_emax` vs `$PRED` |
+
+For the MBMA group, a feature’s section banner and its row in this table must agree; when one changes, change the other in the same PR.
+
+> The label reflects the engine’s overall confidence in a feature, not the presence or absence of tests — a beta feature may still have extensive automated tests; “stable” additionally requires broad cross-validation against reference engines across diverse datasets.

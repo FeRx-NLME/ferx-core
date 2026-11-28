@@ -1,0 +1,68 @@
+# Model File Reference
+
+ferx-core models are defined in `.ferx` files using a declarative DSL. Each file is organized into blocks, each denoted by a `[block_name]` header.
+
+Fitting a model-based meta-analysis of arm-level summary data? Start at [Model-based meta-analysis: start here](../model-file/mbma.llms.md).
+
+## Block Overview
+
+| Block | Required | Purpose |
+|----|----|----|
+| `[parameters]` | Yes | Define theta, omega, and sigma parameters |
+| `[individual_parameters]` | Yes | Map population parameters to individual PK parameters |
+| `[structural_model]` | Yes | Specify the PK model (analytical or ODE) |
+| `[error_model]` | Yes | Define the residual error model |
+| `[odes]` | If ODE | ODE right-hand-side equations |
+| `[adaptive_dosing]` | No | Feedback / TDM dose controller for `simulate()` |
+| `[covariates]` | No | Declare which data columns are covariates (and how they interpolate) |
+| `[covariate_nn NAME]` | No | Neural-network covariate model (needs `--features nn`) |
+| `[data]` | No | Point at the dataset CSV (`$DATA` equivalent); overridden by an explicit CLI/R path |
+| `[data_selection]` | No | Row/subject filters applied to the dataset |
+| `[derived]` | No | Post-hoc derived quantities written to sdtab |
+| `[diffusion]` | No | SDE diffusion terms |
+| `[fit_options]` | No | Configure estimation method and optimizer |
+| `[initial_conditions]` | No | Non-zero compartment initial amounts |
+| `[mixture]` | No | Mixture (subpopulation) model |
+| `[output]` | No | Extra sdtab output columns |
+| `[scaling]` | No | Compartment scaling / observation readouts |
+| `[simulation]` | No | Define a simulation trial design |
+| `[binary_model]` | No | Binary / logistic endpoint (needs `--features survival`) |
+| `[count_model]` | No | Poisson / negative-binomial count endpoint (needs `--features survival`) |
+| `[event_model]` | No | Time-to-event endpoint (needs `--features survival`) |
+| `[markov_model]` | No | Continuous-time Markov endpoint (needs `--features markov`) |
+
+Block names are **closed-world**: a header that is not in this table is an error (`E_UNKNOWN_BLOCK`), reported with its line number and a did-you-mean when there is a near match. A misspelled optional block used to be ignored in silence — a `[fit_option]` typo left the fit running with the default method and no covariance step while `ferx check` still reported `valid: true`.
+
+The same applies to the instance-name form: `[covariate_nn NAME]` requires a name, and every other block refuses one (`E_BLOCK_INSTANCE_NAME`). A block whose cargo feature this binary lacks is refused too, rather than quietly dropped (`E_BLOCK_FEATURE_DISABLED`); the valid-set the error message enumerates is likewise the set *this* build accepts, so a default build does not advertise `[event_model]`.
+
+`[initial_values]` is **not** a block. Initial estimates are declared inline in `[parameters]` (`theta NAME(init, lower, upper)`, `omega NAME ~ variance`); the separate block predates that and has not been read for several releases. A file still carrying one parses, with a `W_DEPRECATED_BLOCK` warning naming the replacement: the block’s contents are ignored, exactly as they have been for several releases, so deleting it cannot change the fit — delete the block.
+
+## Model name
+
+A file may name its model on one line **before the first `[block]` header**, in either spelling:
+
+    model warfarin_pk
+    model = warfarin_pk
+
+The name is what `fit$model_name`, `ferx run`’s summary line, the `-fit.json` `model_name` field and `ferx check --json`’s `model` field report; a file with no `model` line is named after its file stem (`warfarin_pk.ferx` → `warfarin_pk`). It does **not** name the output files: `{stem}-fit.yaml`, `{stem}-sdtab.csv` and friends are always derived from the file stem, so `model warfarin_pk` in `run3.ferx` still writes `run3-fit.yaml` (and `-fit.yaml` itself carries no name field). Names are letters, digits and underscores. A `model` line the parser cannot read (`model = two words`), or a second one, is an error naming the accepted forms — `model = NAME` used to be dropped in silence, leaving the stem in place with no diagnostic. Only the preamble is read: a `model NAME` / `model = NAME` declaration inside any block is an error naming the block, since a block that ignores unrecognised lines would otherwise drop it silently. A line that merely starts with the keyword (`model = CL * 2`) is that block’s own line. Other non-comment preamble text is ignored.
+
+## Minimal Example
+
+    [parameters]
+      theta TVCL(0.1, 0.001, 10.0)
+      theta TVV(10.0, 0.1, 500.0)
+      omega ETA_CL ~ 0.09
+      omega ETA_V  ~ 0.04
+      sigma ADD_ERR ~ 1.0
+
+    [individual_parameters]
+      CL = TVCL * exp(ETA_CL)
+      V  = TVV  * exp(ETA_V)
+
+    [structural_model]
+      pk one_cpt_iv(cl=CL, v=V)
+
+    [error_model]
+      DV ~ additive(ADD_ERR)
+
+Lines beginning with `#` are treated as comments.

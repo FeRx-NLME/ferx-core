@@ -1,0 +1,179 @@
+# Parsing
+
+## Model Parsing
+
+### `parse_model_file()`
+
+Parse a `.ferx` file into a `CompiledModel`. Only the core model blocks are processed (`[parameters]`, `[individual_parameters]`, `[structural_model]`, `[error_model]`).
+
+``` rust
+pub fn parse_model_file(path: &Path) -> Result<CompiledModel, String>
+```
+
+### `parse_model_string()`
+
+Parse a model from a string instead of a file.
+
+``` rust
+pub fn parse_model_string(content: &str) -> Result<CompiledModel, String>
+```
+
+**Example:**
+
+``` rust
+let model_str = r#"
+[parameters]
+  theta TVCL(0.1, 0.001, 10.0)
+  theta TVV(10.0, 0.1, 500.0)
+  omega ETA_CL ~ 0.09
+  sigma ADD_ERR ~ 1.0
+
+[individual_parameters]
+  CL = TVCL * exp(ETA_CL)
+  V  = TVV
+
+[structural_model]
+  pk one_cpt_iv(cl=CL, v=V)
+
+[error_model]
+  DV ~ additive(ADD_ERR)
+"#;
+
+let model = parse_model_string(model_str)?;
+```
+
+### `parse_full_model_file()`
+
+Parse a complete model file including `[fit_options]` and `[simulation]` blocks.
+
+``` rust
+pub fn parse_full_model_file(path: &Path) -> Result<ParsedModel, String>
+```
+
+Returns a `ParsedModel` which contains:
+
+``` rust
+pub struct ParsedModel {
+    pub model: CompiledModel,
+    pub simulation: Option<SimulationSpec>,
+    pub fit_options: FitOptions,
+    /// 1-based source line of each unnamed `[block]` header, keyed by the
+    /// lowercased block type (e.g. `"individual_parameters" -> 7`).
+    pub block_lines: std::collections::HashMap<String, usize>,
+}
+```
+
+## Validation
+
+### `validate_model_file()`
+
+Validate a model file (and optionally a dataset) **without fitting**, returning a structured [`CheckReport`](../file-formats/check-report.llms.md). This is the engine behind the [`ferx check`](../cli.llms.md) CLI command: it runs the parser plus every data-independent and data-dependent check, collecting *all* findings rather than stopping at the first (as `fit()` does).
+
+``` rust
+pub fn validate_model_file(model_path: &str, data_path: Option<&str>) -> CheckReport
+```
+
+**Example:**
+
+``` rust
+let report = validate_model_file("model.ferx", Some("data.csv"));
+if !report.valid {
+    for d in &report.diagnostics {
+        eprintln!("{:?} [{}]: {}", d.severity, d.code, d.message);
+    }
+}
+```
+
+When `data_path` is `None`, only parse / structural checks run. The same validators feed `fit()` (via the internal `check_model_data` / `check_model_data_warnings` functions), so a clean `check` and a `fit()` agree on what is and isn’t valid.
+
+### `validate_model_file_with()`
+
+`validate_model_file()` checks against the model file’s own `[fit_options]` and `[data_selection]`. A fit run with call-time overrides — ferx-r’s `ferx_fit(settings = list(iov_occasion = "dose", ignore = "TIME > 24"))` — reads other options, so the check can report a finding that fit would not produce and miss one it would. `validate_model_file_with()` takes the overrides as `(key, value)` pairs and checks against the merged options ([\#2165](https://github.com/FeRx-NLME/ferx-core/issues/2165)):
+
+``` rust
+pub fn validate_model_file_with(
+    model_path: &str,
+    data_path: Option<&str>,
+    overrides: &[(String, String)],
+) -> CheckReport
+```
+
+Each pair is applied in order on top of the file’s options with `apply_fit_option`, the function the parser reads `[fit_options]` with: a later scalar value wins, and an `ignore` / `accept` / `ignore_subjects` clause is added to the file’s. Every check then reads the merged options — the method / covariance compatibility checks, the variance-rail, box and prior checks, the data read’s selection filter and `iov_column`, and the `iov_occasion` the model–data checks group occasions by. A pair that cannot be applied is an `E_FIT_OPTION` error and ends the check, as a parse failure does. An empty list is exactly `validate_model_file()`.
+
+``` rust
+let overrides = vec![("iov_occasion".to_string(), "dose".to_string())];
+let report = validate_model_file_with("warfarin_iov.ferx", Some("warfarin.csv"), &overrides);
+assert!(report.valid); // without the override: E_IOV_MISSING_OCC
+```
+
+## Data Parsing
+
+### `read_population_for()`
+
+Read a NONMEM-format CSV file into a `Population` **for a given model** (`ferx_core::api::read_population_for`). This is the reader every fitting entry point uses, and the one to call from library code: it knows which compartments the model declares as non-Gaussian endpoints (`[event_model]`, `[binary_model]`, a Markov block) and routes those rows to `Subject::obs_records` instead of the Gaussian observation grid.
+
+``` rust
+pub fn read_population_for(
+    model: &CompiledModel,
+    covariate_decls: &Option<Vec<CovariateDecl>>,
+    data_path: &str,
+    fallback_columns: Option<&[&str]>,
+    iov_column: Option<&str>,
+    filter: Option<&SelectionFilter>,
+    column_map: &[(String, String)],
+) -> Result<(Population, Option<CovariateTable>), String>
+```
+
+``` rust
+use ferx_core::api::read_population_for;
+
+let parsed = parse_full_model_file(Path::new("model.ferx"))?;
+let (population, _table) = read_population_for(
+    &parsed.model, &parsed.covariate_decls, "data.csv", None, None, None, &[],
+)?;
+```
+
+For a Gaussian-only model it is equivalent to `read_nonmem_csv()` below.
+
+### `read_nonmem_csv()`
+
+Read a NONMEM-format CSV file into a `Population`, **without a model**.
+
+> **WARNING:**
+>
+> `read_nonmem_csv()` (and its `_with_covariates` / `_filtered` variants) does not know the model, so every `EVID=0` row becomes a Gaussian observation. Read a dataset for a model with a non-Gaussian endpoint this way and the endpoint’s rows are concentrations on its CMT, with no event records. `fit()`, `simulate()`, `predict()`, `predict_categorical()`, `run_covariance()` and `run_sir()` refuse such a population with `E_ENDPOINT_UNROUTED` (naming the CMT and `read_population_for()`), and `fit()` / `run_covariance()` / `run_sir()` refuse a routed population whose declared endpoint has no rows at all — typically a missing `CMT` column — with `E_ENDPOINT_NO_RECORDS`. Before these guards the fit ran the Gaussian half only and reported a plausible, wrong objective ([\#1199](https://github.com/FeRx-NLME/ferx-core/issues/1199)).
+
+``` rust
+pub fn read_nonmem_csv(
+    path: &Path,
+    covariate_columns: Option<&[&str]>,
+) -> Result<Population, String>
+```
+
+**Parameters:** - `path`: Path to the CSV file - `covariate_columns`: Optional list of covariate column names. If `None`, all non-standard columns are auto-detected as covariates.
+
+**Example:**
+
+``` rust
+// Auto-detect covariates
+let pop = read_nonmem_csv(Path::new("data.csv"), None)?;
+
+// Explicit covariate list
+let pop = read_nonmem_csv(
+    Path::new("data.csv"),
+    Some(&["WT", "CRCL", "AGE"]),
+)?;
+
+println!("{} subjects, {} observations",
+         pop.subjects.len(), pop.n_obs());
+```
+
+### Data Processing Details
+
+- Column names are matched case-insensitively
+- Standard NONMEM columns (`ID`, `TIME`, `DV`, `EVID`, `AMT`, `CMT`, `RATE`, `MDV`, `II`, `SS`) are recognized automatically
+- Missing values (`.`, empty string) are handled appropriately
+- Rows with `EVID=1` are treated as dose events
+- Rows with `EVID=0` and `MDV=0` are treated as observations
+- Time-constant covariates use the first non-missing value per subject
+- Time-varying covariates use Last Observation Carried Forward (LOCF) per event — `[individual_parameters]` is re-evaluated at each dose and observation row using that row’s covariate values (NONMEM-equivalent semantics). Currently supported on 1- and 2-compartment IV bolus / infusion models and all ODE-defined models; oral and 3-compartment models fall back to a single first-row snapshot

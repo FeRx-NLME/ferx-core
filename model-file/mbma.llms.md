@@ -1,0 +1,112 @@
+# Model-based meta-analysis: start here
+
+A model-based meta-analysis (MBMA) fits a model to published summary data: one mean per trial arm and visit, each with its standard error and arm size. ferx supports it through several features, each documented on its own reference page. This page lists them in the order you meet them when you build such a model, and links to the section that holds the details.
+
+## Maturity
+
+Every MBMA-specific piece below is **beta**: θ level blocks, `profile`, nested levels, within-arm residual correlation, residual and kappa `weight =`, and compartment-free models. Each is marked so at the top of its own section, and each has a row in the [MBMA group of the Feature Maturity table](../maturity.llms.md#model-based-meta-analysis-mbma-features) naming the NONMEM anchor behind the label. Several pieces are limited to `method = foce` or `focei`; where a step is limited, it says so.
+
+## A minimal model
+
+The pieces fit together like this. The model is ferx-core’s `tests/data/mbma_placebo/mbma_placebo.ferx` (the same model ferx-r bundles as `mbma_placebo`), with the optional `profile` and `correlation` additions marked:
+
+    [parameters]
+      theta TVE0(45.0, 0.0, 200.0)      # mean placebo level over a study's visits
+      theta EMAX(8.0, 0.0, 100.0)       # maximum drug effect
+      theta ED50(20.0, 0.1, 1000.0)     # dose at half-maximal effect
+      theta ET50(2.0, 0.01, 100.0)      # time to half-maximal drug effect
+      theta PLACEBO[STUDY, TIME, contrast = sum_to_zero_within](0.0, -50.0, 50.0) profile  # `profile` optional
+      theta RHO(0.3, 0.0, 0.95)         # optional: only with the correlation line
+
+      omega ETA_E0 ~ 4.0 (sd)           # between-study variability
+      kappa KAPPA_ARM ~ 4.0 (sd) weight = NARM   # between-arm variability (BTAV)
+
+      sigma ADD_ERR ~ 1.0 (variance) FIX         # all precision is in the weight
+
+    [covariates]
+      STUDY categorical
+      NARM  continuous
+      SE    continuous
+      DOSE  continuous
+
+    [individual_parameters]
+      BASE = TVE0 + PLACEBO + ETA_E0 + KAPPA_ARM
+
+    [structural_model]
+      DRUG = EMAX * DOSE / (ED50 + DOSE) * TIME / (TIME + ET50)
+      y    = BASE - DRUG
+
+    [error_model]
+      DV ~ additive(ADD_ERR) weight = SE
+      correlation car1(RHO) by OCC      # optional
+
+    [fit_options]
+      method     = focei
+      iov_column = OCC
+      covariance = true
+
+Without the `profile` keyword and the two optional lines it is the fixture as committed. With them it parses with `ferx check` and fits on the fixture’s data.
+
+## 1. Arm-level data
+
+Each row is one arm of one study at one visit. `ID` is the study, an occasion column (`OCC`, named by `iov_column`) is the arm, and `DV` is the reported arm mean on its natural scale. The arm’s standard error and size are ordinary data columns (`SE`, `NARM` above). In the MBMA layout the arms of a study are its occasions, and each arm carries the study’s visit grid ([Kappas](../model-file/parameters.llms.md#kappas)). See [Required Columns](../data-format.llms.md#required-columns) and [Occasion Column (IOV)](../data-format.llms.md#occasion-column-iov).
+
+There are no dose records. The model is a [compartment-free model](../model-file/structural-model.llms.md#compartment-free-models-the-pred-equivalent): a `[structural_model]` with no `pk` or `ode` line, whose `y = ...` equation reads the dose as a data column. The dataset needs no `AMT` column, and dose records it carries anyway are not applied ([What a compartment-free model does not have](../model-file/structural-model.llms.md#what-a-compartment-free-model-does-not-have)). A kappa on such a model keeps the analytic gradient at any number of random effects per subject, counting the stacked η and kappas over its occasions ([Gradients](../model-file/structural-model.llms.md#gradients)).
+
+In R, `ferx_mbma_data()` builds and checks such a dataset ([Counted form](../model-file/parameters.llms.md#counted-form-theta-namen)). For a model already written in nlmixr2, `ferxtranslate::nlmixr2_to_ferx()` translates a compartment-free model (`pred <- ...; pred ~ add(sd)`) into this form ([translator#75](https://github.com/FeRx-NLME/translator/pull/75)). When the source is weighted by hand, `pred <- f * sqrt(W)` with `DV` already multiplied by `sqrt(W)`, the default translation keeps that and is fitted to the same data. `weighting = "weight"` instead emits `y = f` with `weight = 1/sqrt(W)` on the error line; a model without that shape is refused. Fit that translation to the data returned by `ferxtranslate::ferx_weighted_data()`, which divides `DV` back by `sqrt(W)`, not to the data the nlmixr2 model read.
+
+## 2. Inverse-variance weighting
+
+Add `weight = SE` to the error-model line and fix the additive sigma at 1: each row then contributes $1/SE^2$ to the objective, and `DV`, `PRED`, the sdtab and the VPC stay on the natural scale ([Residual weighting](../model-file/error-model.llms.md#residual-weighting-weight-...)). Whether sigma is fixed stays your choice: fix it for a continuous endpoint with a known SE, estimate it for a weighted logit of a proportion ([Is sigma fixed?](../model-file/error-model.llms.md#is-sigma-fixed)). The reported OFV differs from a hand-built `DV/SE` fit by $\sum_j 2\ln SE_j$, a constant that cancels from every ΔOFV ([Objective-function value](../model-file/error-model.llms.md#objective-function-value)). [OFV conventions across tools](../model-file/error-model.llms.md#ofv-conventions) gives the term to add for each of NONMEM (with and without `N·log 2π`) and nlmixr2’s precision-weighted `DV·√w` form.
+
+## 3. Between-arm variability
+
+`kappa KAPPA_ARM ~ 4.0 (sd) weight = NARM` declares an arm random effect with variance $\gamma^2 / N$, so a large arm’s mean varies less than a small arm’s ([Sample-size-weighted IOV](../model-file/iov.llms.md#sample-size-weighted-iov-weight-...)). The estimate reported is the unweighted $\gamma^2$, and the fit prints the SD at the median arm size on the next line ([What is reported](../model-file/iov.llms.md#what-is-reported)). The weight may read covariates, `FIX`ed thetas and `TIME`, and the kappa may be read only in `[individual_parameters]` ([Rules and diagnostics](../model-file/iov.llms.md#rules-and-diagnostics)).
+
+## 4. Placebo time course as a level block
+
+`theta PLACEBO[STUDY, TIME](...)` declares one fixed effect per (study, visit) cell in the data, so no parametric placebo curve is imposed ([Theta level blocks](../model-file/parameters.llms.md#theta-level-blocks), [Data-driven form](../model-file/parameters.llms.md#data-driven-form-theta-namecol-...)). Next to an intercept and a study random effect, one degree of freedom per study has to go. `contrast = sum_to_zero_within`, the default for this shape, makes the levels sum to zero within each study ([Identifiability](../model-file/parameters.llms.md#identifiability)). `TVE0 + ETA_E0` is then each study’s mean placebo level over its own visits, and the levels are each visit’s deviation from it. A block of 20 or more coefficients is summarised rather than listed in the estimate table; the derived level of each study is not a coefficient and does not count ([Fitting at this scale](../model-file/parameters.llms.md#fitting-at-this-scale)).
+
+## 5. Profiled level blocks
+
+Marking the block `profile` takes its levels out of the optimizer’s search: at every outer evaluation they are solved exactly for the structural parameters being tried. The objective is unchanged, so the OFV, the estimates and a likelihood-ratio test agree with the unprofiled fit ([Profiled level blocks](../model-file/parameters.llms.md#profiled-level-blocks)). It pays off when the block has many levels; on a small model it can be slower ([When to profile](../model-file/parameters.llms.md#when-to-profile)). The block must enter every prediction linearly, under `foce`/`focei` at `n_agq = 1` with an additive, untransformed Gaussian error and no M3 ([When it applies](../model-file/parameters.llms.md#when-it-applies)). A profiled block takes bounds, and a level held on its bound gets no standard error ([Bounds on a profiled block](../model-file/parameters.llms.md#bounds-on-a-profiled-block)). `r`, `s` and `rsr` all work on a profiled fit ([Standard errors](../model-file/parameters.llms.md#standard-errors)).
+
+## 6. Nested levels
+
+For sponsor → study → arm, put the coarsest grouping in `ID` and declare the finer ones with `level NAME by COLUMN in PARENT`, then attach each kappa with `kappa ... at LEVEL` ([Nested levels](../model-file/iov.llms.md#nested-levels), [Declaring levels](../model-file/iov.llms.md#nested-levels-declaring)). A `level` replaces `iov_column`. Every record needs a numeric label at every level ([The data](../model-file/iov.llms.md#nested-levels-data)). Nested levels are estimated with `foce` or `focei` at `n_agq = 1` only ([What this release supports](../model-file/iov.llms.md#nested-levels-scope)).
+
+Each subject’s inner problem is over its η plus one kappa per group of every level it contains, so a coarse `ID` such as a sponsor stacks every arm of every study into one problem and the fit slows much faster than the row count grows. Make `ID` the coarsest grouping that needs its own random effect, and declare a level only where its kappa is needed ([Cost grows with the groups inside each subject](../model-file/iov.llms.md#nested-levels-cost)).
+
+## 7. Within-arm residual correlation
+
+`correlation cs|ar1|car1(RHO) by ARM` lets the residuals of one arm’s visits correlate ([Within-group residual correlation](../model-file/residual-correlation.llms.md)). It is fitted by `foce` and `focei` only ([Scope](../model-file/residual-correlation.llms.md#scope)). `cs` and an arm kappa are the same covariance, so `cs` over the groups of a kappa-carrying level is refused; with a kappa at the arm, use `ar1` or `car1` ([With kappa and nested levels](../model-file/residual-correlation.llms.md#with-kappa-and-nested-levels), [Choosing a structure](../model-file/residual-correlation.llms.md#choosing-a-structure)). The line fits next to a profiled level block, and its refusals come first ([With a profiled level block](../model-file/residual-correlation.llms.md#with-a-profiled-level-block)).
+
+A positive Durbin–Watson warning ([`dw_autocorrelation`](../warnings.llms.md#codes-residuals)) on a compartment-free model suggests this line, `by` the grouping the model declares: its `iov_column` (which a single `level` also sets), or the innermost level’s name when levels are nested. With no grouping declared, it suggests the line `by` any data column that labels the group, and a `kappa` at that grouping as the alternative. A model with compartments keeps the structural advice. The statistic pairs only rows of one arm or level cell when they restart the clock, so declaring the arms also stops it pairing one arm’s last visit with the next arm’s first. A grouping whose groups follow one another in time, such as visits, is one series ([IWRES Autocorrelation](../output.llms.md#iwres-autocorrelation)). The warning then suggests `correlation ar1(RHO) by ID`, a line whose block is the whole subject, because a line `by` the visits cannot correlate rows of two visits ([Occasions in time](../model-file/residual-correlation.llms.md#occasions-in-time)). The bundled `mbma_naproxen` model, whose arms are not declared, gets the no-grouping advice (Durbin–Watson 1.22); a `kappa` on `E0` at the arm (`iov_column = ARM`) absorbs the shared part (1.87, silent) before any `correlation` line is added.
+
+With few studies, do not read the OFV drop for `ρ` against a χ² distribution. On the 6-study `mbma_placebo` data, which the generator draws with no serial correlation, `car1(RHO) by OCC` lowers the OFV by 7.6. In 50 data sets simulated from the fit without the line (ferx-r `ferx_simulate(model, data, n_sim = 50, seed = 1, fit = fit)`), each fitted with and without it, the drop was at least 3.84 in 26% of them (macOS arm64, core `32dbb309`). A χ²₁ reference puts 5% there; since `ρ ≥ 0` places the null on the boundary of its range, the asymptotic reference is the 50:50 χ²₀/χ²₁ mixture, which puts 2.5% there. Calibrate the test by simulating from the model without the line, as the ferx book’s MBMA chapter does in [Correlated residuals within an arm](https://ferx-nlme.org/ferx-book/chapters/24-mbma.html#correlated-residuals-within-an-arm).
+
+## 8. Uncertainty with few studies
+
+The default `covariance_method = r` gives the model-based SEs ([Covariance estimator](../estimation/foce.llms.md#covariance-estimator-r-s-or-sandwich)). When the analytic R-matrix is out of scope and the model has more than 100 free coordinates, a defaulted method routes to `s` with a warning; set `covariance_method = r` to keep it ([Fitting at this scale](../model-file/parameters.llms.md#fitting-at-this-scale)). `s` needs more subjects than free parameters, so a level block with a level per study leaves `S` rank-deficient and `s` reports no SEs. On a block whose levels are each read by one subject, the `rsr` level SEs are not usable; read them from `r`, and ferx warns with `W_COV_RSR_ONE_SUBJECT_LEVELS` ([Standard errors](../model-file/parameters.llms.md#standard-errors)).
+
+An omega or kappa variance the optimizer leaves on ferx’s internal lower guard ($e^{-12} = 6.144 \times 10^{-6}$) has collapsed. ferx lists it in `held_at_bound` and prints its SE as `N/A`; when the covariance step’s `R` is clean, every other SE is conditional on that variance at its estimate, as with a `FIX` ([Held parameters](../estimation/parameterization.llms.md#held-parameters)). Read the fit’s `Status:` line, not `converged` alone. `converged` means only that the optimizer’s stop was verified. The status is `CONVERGED WITH ISSUES` or `NOT CONVERGED`, with its reasons, when for example the covariance step failed or a collapsed variance could not be held ([Fit status](../output.llms.md#fit-status)).
+
+On an arm-level dataset of a few hundred rows a fit usually takes well under a second, so `n_starts = 8` is a cheap check that the reported optimum is not a local one ([Small datasets](../examples/multistart.llms.md#small-datasets)). Nested levels that stack many random effects into one subject are the exception: such a fit can take several seconds ([Cost grows with the groups inside each subject](../model-file/iov.llms.md#nested-levels-cost)).
+
+[SIR](../estimation/sir.llms.md) (`sir = true`, beta) samples from the covariance step’s proposal. It never samples a `FIX`ed sigma, so the fixed residual of the weighting stays fixed ([Rank-deficient and non-identified proposals](../estimation/sir.llms.md#rank-deficient-and-non-identified-proposals)). On the 6-study `mbma_placebo` fixture the default `sir_scale = packed` gives a higher effective sample size than `natural`, whose target has a heavy upper tail for a variance informed by few groups ([Choosing the target scale](../estimation/sir.llms.md#choosing-the-target-scale)). `covariance_fallback = sir` runs it when the Hessian is not positive definite ([SIR fallback](../estimation/foce.llms.md#sir-fallback-for-non-pd-hessians)).
+
+With an additive study effect and an additive residual, as here, the random effects enter linearly, so FOCEI is the exact likelihood and the estimator to report SEs from. After `method = saem` the covariance step is taken on the FOCEI objective at SAEM’s estimate, and on the 6-study `mbma_placebo` fixture SAEM stops 1–11 OFV units away from that objective’s minimum while reporting convergence. The default run then gets no SEs (`W_COV_NON_STATIONARY_ESTIMATE`), and other seeds report SEs at an equally non-stationary point with no warning ([Standard errors at a SAEM estimate](../estimation/saem.llms.md#saem-standard-errors)). The cause is the one-line `BASE = TVE0 + PLACEBO + ETA_E0 + KAPPA_ARM`, which leaves TVE0 un-mu-referenced. Give the study-level typical value a line of its own, `E0 = TVE0 + ETA_E0`, and build `BASE = E0 + PLACEBO + KAPPA_ARM` on it, so that SAEM can take the closed-form update for TVE0 ([Additive mu-references](../estimation/saem.llms.md#saem-mstep-additive)). For SEs, fit with FOCEI or chain `method = [saem, focei]`, whose SEs are FOCEI’s at the FOCEI estimate.
+
+## 9. Bundled examples
+
+- `examples/mbma_naproxen.ferx` with `data/mbma_naproxen.csv`: the published naproxen-versus-placebo MBMA of Boucher & Bennetts (2018), 18 trials and 36 arms, with between-study random effects and no kappa. It keeps the published weighting, written by hand: `DV` divided in the data, `y` divided by `WPSE`, sigma `FIX` at 1, the construction `weight =` replaces ([Replaces the hand-built three-site construction](../model-file/error-model.llms.md#replaces-the-hand-built-three-site-construction)). `data/mbma_naproxen.README.md` gives the provenance. **The data are licensed CC BY-NC 4.0, not MIT** (`data/mbma_naproxen.LICENSE`): commercial use is not granted.
+
+  ``` bash
+  ferx examples/mbma_naproxen.ferx --data data/mbma_naproxen.csv
+  ```
+
+- `tests/data/mbma_placebo/`: the synthetic model above, with data. ferx-r bundles it as `ferx_example("mbma_placebo")`, and the ferx book’s [MBMA chapter](https://ferx-nlme.org/ferx-book/chapters/24-mbma.html) works through it end to end from R.
+
+  ``` bash
+  ferx tests/data/mbma_placebo/mbma_placebo.ferx --data tests/data/mbma_placebo/mbma_placebo.csv
+  ```

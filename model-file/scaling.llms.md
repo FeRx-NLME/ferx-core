@@ -1,0 +1,302 @@
+# Scaling
+
+> **Maturity: beta** — see [Feature Maturity](../maturity.llms.md) for what this means.
+
+The optional `[scaling]` block declares how the structural model’s raw output maps to the observed `DV`. It exists so the user does not have to fold unit conversion or amount-to-concentration arithmetic into the structural model itself — keeping `[odes]` and `[structural_model]` readable, and making mixed-unit data (e.g. data in ng/mL when the model thinks in mg/L) straightforward.
+
+The convention is **divisive**: `pred_scaled = pred_raw / scale`. This matches the natural reading of `obs_scale = V/1000` as *“divide amount by V/1000 to get concentration in the user’s units.”*
+
+**What “raw output” is depends on the structural model.** For `ode(...)`/ `ode_template(...)`, the raw output is the compartment amount — `obs_scale = V` is the required, standard way to convert it to concentration. For a **built-in `pk <model>(...)` block** (`pk one_cpt_iv(...)`, `pk two_cpt_oral(...)`, etc.), the raw output is **already concentration** — the closed-form kernel divides by the volume parameter (`v`/`v1`) internally, matching NONMEM’s implicit `S1=V1`. Adding `obs_scale = V` (or whatever individual parameter is bound to that `pk` block’s `v`/`v1` role) on top of a `pk` block therefore divides by the volume parameter a *second* time — a common mistake when translating an `ode(...)` model (where that division is needed) to an equivalent closed-form `pk` block (where it already happens). `ferx check` warns on this pattern, but does not reject it, since `obs_scale` referencing an individual parameter is also a real, supported feature (see Form B) for an intentional additional transform on top of the built-in concentration output.
+
+> **IMPORTANT:**
+>
+> The volume case above is a *warning* because a further division by `V` can be a deliberate transform. A **dose attribute** is not: if the `pk(...)` call maps `f=F` or `lagtime=TLAG`, the engine already applies that value at the dose, so an `obs_scale`/`y` that also reads it applies it twice — measured at exactly `F` on the prediction. There is no reading of that model under which the doubling is intended, so it is rejected with `E_DOSE_ATTR_DOUBLE_USE` ([\#1004](https://github.com/FeRx-NLME/ferx-core/issues/1004)) rather than warned about. The fix is to drop the `f=`/`lagtime=` mapping if the parameter is an ordinary one — renaming does not help, because the mapping follows the parameter — or to drop the read if it really is the dose attribute.
+>
+> NONMEM computes the same doubled value silently: `$PK` with both `F1` and `S2 = V/F1` runs clean. That is the `CL/F`, `V/F` apparent-parameter convention being written *on top of* a separately-defined `F1`, which double-counts there too; ferx is deliberately stricter.
+
+Three forms are supported. Each is optional; omitting `[scaling]` keeps the historical “raw prediction equals DV” behaviour.
+
+## Form A — scalar divisor
+
+Use for fixed unit conversion (e.g. mg/L → mg/mL is a constant 1000).
+
+``` ferx
+[scaling]
+  obs_scale = 1000
+```
+
+Applies to analytical PK models and ODE models alike: every prediction is divided by the constant before reaching the residual error model.
+
+## Form B — expression divisor
+
+Use when the scale depends on theta, eta, or a covariate.
+
+``` ferx
+[scaling]
+  obs_scale = WT / 70
+```
+
+Expressions may reference:
+
+- thetas (e.g. `TVV`),
+- etas (e.g. `ETA_CL`),
+- covariates (e.g. `WT`, `CR`),
+- individual parameters declared in `[individual_parameters]` (e.g. `V`, `CL`) — these are resolved from a subject-static evaluation of `pk_param_fn` at scale-evaluation time, so `obs_scale = 1000 / V` uses the per-subject V (typical value times the EBE eta). On a built-in `pk <model>(...)` block, referencing the same name bound to its `v`/`v1` role divides by that volume a second time — see the note above. On a `pk <model>(...)` block, a parameter **no** `pk(...)` role binds (a scale factor `SCF = WT / 70`, say) takes a free differentiable PK slot of its own, as a Form C readout parameter does. Before \#1898 it had none and silently read `CL`’s value. These slots are shared with `y = …` and `[initial_conditions]`; more distinct such parameters than the model leaves free is a parse error (inline the expression instead).
+
+The scale is evaluated **once per subject** with subject-level covariates (matching the no-TV path). Time-varying covariate support for expression scales is a Phase 1.5 follow-up.
+
+Because the divisor is subject-static, `obs_scale` **cannot reference the `TIME` built-in** (or its `T` alias): it is evaluated once, at `t = 0`, and the result divides every observation, so a `TIME` reference would always read `0`. The parser rejects it and points you at Form C, where the readout is evaluated per observation and `TIME` resolves to each row’s own time.
+
+## Form C — explicit output expression
+
+> **NOTE:**
+>
+> Form C is a readout **on top of** a compartment model. If the prediction is an equation with no compartments underneath — a dose-response curve, a response time-course, a meta-regression — write it directly in `[structural_model]` instead; it uses this same grammar, including the named intermediates and continuation lines described below. See [Compartment-Free Models](../model-file/structural-model.llms.md#compartment-free-models-the-pred-equivalent). A `[scaling]` block alongside such a model is rejected: that block already declares the prediction.
+
+Use when the built-in concentration readout is not the observed quantity — e.g. an ODE state is held as an amount and the observation is a concentration, or the observation is a nonlinear function of the concentration (a protein-binding correction, a free-vs-total switch, a parent/metabolite sum). Form C replaces the default readout entirely.
+
+``` ferx
+[structural_model]
+  ode(states=[depot, central])     # no obs_cmt — Form C provides it
+
+[odes]
+  d/dt(depot)   = -KA * depot
+  d/dt(central) = KA * depot - CL/V * central   # central holds amount
+
+[scaling]
+  y = central / V
+```
+
+The right-hand side may reference state names (`depot`, `central`), individual parameters (`CL`, `V`, `KA`), thetas (`TVCL`), etas (`ETA_CL`), and covariates (`WT`). All five name classes are looked up at evaluation time — states from the ODE solver, individual parameters from the subject-static `pk_param_fn`, and thetas/etas/covariates from the values supplied by the caller.
+
+### Signed readouts (since \#1020)
+
+A Form C readout is an arbitrary expression, so it may legitimately be **negative** — a change from baseline, a difference from a comparator, a z-score, or the `sqrt(N) * logit(p)` transform used in model-based meta-analysis of a bounded endpoint. Its negative part is preserved.
+
+``` ferx
+[scaling]
+  y[CMT=1] = sqrt(N) * log(P / (1 - P))    # negative for every arm below 50%
+```
+
+The negative-prediction clamp that guards the ODE solver applies only to the **default readout** — the bare compartment state (`obs_cmt`, and the analytical PK concentration), where non-negativity is a physical property of the quantity and a negative value can only be integration overshoot. It is not applied to Form C.
+
+The same gate applies to the adaptive-dosing monitor path: a `Dv` monitor’s assay floor (`max(0)` after the residual draw) fires only on the bare-state readout, so a Form C signal a controller thresholds is not silently floored at `0` over its whole negative region (#1039). See [Adaptive dosing](../model-file/adaptive-dosing.llms.md).
+
+Forms A and B (`obs_scale = <expr>` / `obs_scale[CMT=n] = <expr>`) keep the default bare-state readout — the divisor is applied *downstream* of it — so the clamp still guards the compartment state they read. Only Form C (`y = <expr>`) replaces the readout and so opts out of the clamp.
+
+Before \#1020 the ODE path clamped the final prediction vector unconditionally, after the Form C expression had been evaluated, so every negative readout was silently returned as exactly `0`: no warning, no error, and a fit that converged to plausible-looking parameters with the residual σ inflated to absorb the mismatch. (The analytical Form C path — \#650 — always left the readout unclamped; the two paths now agree.)
+
+`NaN` is still not clamped on either path: it propagates to a `NaN` objective so the optimizer rejects the step, which is what surfaces a bad scale or a missing per-CMT entry loudly (see [Runtime behaviour on bad scales](#runtime-behaviour-on-bad-scales)).
+
+This matches NONMEM, which applies no non-negativity guard to `$ERROR` output. Anchored on NONMEM 7.5.1 (`nonmem_anchor/signed_readout.ctl`): a one-compartment `$DES` model read out as a change from baseline, `IPRED = A(1)/V - BASE`, with `CL = 4`, `V = 12`, `BASE = 2` all `FIX` and `MAXEVAL=0`.
+
+| t (h) | NONMEM `IPRED` | ferx `y = central / V - BASE` |
+|-------|----------------|-------------------------------|
+| 0.25  | 5.6670         | 5.667037                      |
+| 1     | 3.9711         | 3.971094                      |
+| 4     | 0.19664        | 0.196643                      |
+| 12    | −1.8474        | −1.847370                     |
+| 24    | −1.9972        | −1.997204                     |
+
+The two sub-baseline points come back negative on both engines; before \#1020 ferx returned exactly `0` for them. Every point agrees to within the reference table’s own 5-significant-figure rounding. The ferx run pins `ode_reltol` / `ode_abstol` tight, because a readout written as a *difference* of two numbers of size ~2 amplifies any solver-level disagreement by the cancellation — worth doing in your own model too when the readout is a change from baseline. The test is `tests/signed_readout_nonmem_anchor.rs`.
+
+### `TIME` in a Form C readout
+
+A Form C readout is evaluated **per observation**, so it may reference the `TIME` built-in — spelled `TIME` or `T`, the same two spellings `[odes]` accepts — and it resolves to that observation’s own time. This is what a response-versus-time readout needs, and it is the direct way to write one:
+
+``` ferx
+[scaling]
+  y[CMT=1] = EMAX * TIME / (TIME + T50)
+```
+
+Until [\#1028](https://github.com/FeRx-NLME/ferx-core/issues/1028), `TIME` parsed in `[scaling]` but was never bound to the observation, so it read `0` and collapsed the whole structural prediction with no diagnostic. Models that worked around this with a dummy integrating state —
+
+``` ferx
+[structural_model]
+  ode(states=[clock])
+[odes]
+  d/dt(clock) = 1
+```
+
+— no longer need it, and are better off without: `clock` starts at the subject’s **first record**, not at `t = 0`, so it silently disagrees with `TIME` on any dataset with no `TIME = 0` row.
+
+The value is the **raw data-file `TIME`**, the same clock sdtab/covtab `TIME`, `predict()` / `simulate()` `TIME`, `[derived]` integral windows, and a custom residual-error magnitude report. This matters only for datasets with stacked reset occasions whose `TIME` restarts: there the integrator runs on an internal monotonic timeline, and the readout — like NONMEM’s `$ERROR`, whose `TIME` is also not `$DES`’s clock — stays on the user clock.
+
+#### If your dataset has a column named `T`
+
+`T` and `t` are the `[odes]` spellings of the model-time built-in, and `[scaling]` folds them the same way — so a `T` **column** would otherwise be silently replaced by the clock. Declaring it wins:
+
+``` ferx
+[covariates]
+  T continuous
+[scaling]
+  y = central / V * T     # the column, not the clock
+```
+
+The declaration is matched **case-insensitively** against both spellings, so declaring `T` also protects a `t` reference and vice versa — the fold treats the two as one built-in, so the escape hatch has to as well. It covers the whole block: Form C `y`, and `obs_scale`, where an undeclared `T` is instead rejected as a time reference in a subject-static divisor.
+
+The declaration also reaches `[adaptive_dosing] observe`, which compiles through the same readout compiler — so a declared `T` is the data column there too, rather than the same model reading the column in `[scaling]` and the clock in `observe`.
+
+Whenever `T` / `t` *is* folded into the built-in, ferx emits a parse warning saying so and naming both escapes (spell it `TIME`, or declare the column). Writing `TIME` is unambiguous and never warns.
+
+`TAFD` and `TAD` are *not* built-ins here. They stay ordinary covariate references in `[scaling]`, so a `TAFD` / `TAD` **column** in the dataset resolves normally — unlike in `[odes]`, where the two names are reserved for the solver-injected anchors and a same-named data column is unreachable. If the column is absent, the resulting `E_MISSING_COVARIATE` names that scope split, so “I meant the `[odes]` built-in” is not mistaken for a typo.
+
+### Undefined names are data columns, not zeros
+
+Any identifier in a `[scaling]` expression that does not resolve to a state, an individual parameter, a theta, an eta, or the `TIME` built-in is treated as a **covariate**, and therefore as a required data column — in `obs_scale` (Form A/B) exactly as in `y` (Form C). A name the dataset does not carry is reported as `E_MISSING_COVARIATE` by `fit()`, `simulate()`, and `predict()` alike; it is never read as a silent `0.0`. So a typo in `[scaling]` fails loudly instead of quietly fitting a different structural model (#1028).
+
+### Form C on analytical PK models (since \#650)
+
+Form C is also accepted on **analytical** (closed-form) PK models. There the readout replaces the built-in concentration; it can reference the same name classes, with the compartment-amount scope tied to what the closed forms expose:
+
+- `central` — the central compartment **amount** (always available). The analytic engine computes a concentration internally; the readout sees the amount, i.e. `central = concentration × V`, so `y = central / V` recovers the concentration and any additive term layers on top.
+- `depot` — the oral **depot** amount, for first-order oral models (`one_cpt_oral` / `two_cpt_oral` / `three_cpt_oral`). It is reconstructed by dose superposition, so a subject with an EVID=3/4 reset or a dose into a non-default compartment is refused — by `fit()`, `predict()` and, since \#1488, every `simulate*` entry point. Use an ODE model there.
+- **Peripheral** compartments are *not* available (the closed forms don’t expose a cross-compartment amount) — referencing `periph`/`peripheral…` is a parse error pointing you to an ODE model, mirroring `[initial_conditions]`.
+
+Individual parameters that are **not** a structural PK role (e.g. a binding capacity `BMAX` or dissociation constant `KD`) may be referenced in an analytic readout and are differentiated exactly — they become first-class differentiable parameters (#650). `if/else` works, so a per-row covariate can switch the readout.
+
+A free-vs-total fluconazole readout on an analytic 1-cpt model, with a saturable albumin-binding correction on the total-drug rows:
+
+``` ferx
+[individual_parameters]
+  CL   = TVCL * exp(ETA_CL)
+  V    = TVV  * exp(ETA_V)
+  BMAX = TVBMAX
+  KD   = TVKD
+
+[structural_model]
+  pk one_cpt_iv(cl=CL, v=V)
+
+[scaling]
+  y = if (FREE == 0) central / V + BMAX * (central / V) / (KD + central / V) \
+      else           central / V
+```
+
+Form C **replaces** the built-in readout, so it cannot be combined with a divisive `obs_scale` on the same model (fold any unit conversion into `y`, e.g. `y = central / V / 1000`); the parser rejects the combination.
+
+Covariates in a Form C expression are read from the **per-observation covariate snapshot** — the values on each observation’s own data row — so a time-varying covariate drives the readout at the time it is observed (since \#535/#538). Because a Form C covariate is therefore an input the prediction depends on, it is a **required data column**: if the readout references a covariate that is absent from the dataset the fit fails with `E_MISSING_COVARIATE` rather than silently reading the missing value as `0.0`. For time-constant covariates the readout is unchanged.
+
+This matches NONMEM’s per-record `$ERROR` semantics. Validated against a free/total protein-binding model (NONMEM ADVAN3 TRANS4 whose `$ERROR` selects the total concentration when `FREE==0` and the unbound concentration when `FREE==1`, with paired assay rows at the same time): evaluated at identical parameters, ferx’s per-record population predictions reproduce NONMEM’s `PRED` to ~1e-4 relative on both the total-assay and free-assay rows — the two rows at a given time differing only by that per-record covariate.
+
+The **analytical** Form C readout (#650) inherits this NONMEM anchor: on an IV 1-cpt model the analytic central amount (`concentration × V`) equals the ODE `central` state amount, so a saturable-binding total-vs-free readout gives bit-for-bit-equal predictions on the analytic and ODE paths at matched parameters — the analytic-vs-ODE equivalence is checked by `analytic_form_c_matches_ode_form_c_binding_readout`.
+
+## Named intermediates (since \#1030)
+
+Any line in `[scaling]` whose key is **not** `obs_scale` or `y` declares a **named intermediate** — a local binding the `obs_scale` / `y` entries below it can reference, exactly as `[individual_parameters]` already allows. This is what makes a bounded-endpoint readout writable once instead of once per occurrence.
+
+The standard model-based meta-analysis readout — a weighted logit of an Emax time course with the published `[0.01, 0.99]` clamp — reads as three lines:
+
+``` ferx
+[scaling]
+  ACR20    = EMAX * TIME / (TIME + T50)
+  ACR20SAT = min(max(ACR20, 0.01), 0.99)
+  y        = log(ACR20SAT / (1 - ACR20SAT)) * sqrt(NARM)
+```
+
+Before intermediates existed the same model was one ~200-character line with the guarded sub-expression written four times, because there was nowhere to name it.
+
+The rules are the ones `[individual_parameters]` uses, plus two that follow from `[scaling]`’s two reserved keys:
+
+- **Define above, use below.** An intermediate may reference intermediates declared above it; a forward or self reference is a parse error, not a silent `0.0`. Reference cycles are therefore unrepresentable. The rule binds the `obs_scale` / `y` entries too: an entry may only read an intermediate declared above it, so the block always reads top-to-bottom.
+- **No `[CMT=N]` subscript.** That belongs to `obs_scale` / `y`; a subscripted unknown key is still an unknown-key error.
+- **No shadowing.** A name that is already a theta, an eta, an individual parameter, or a compartment is rejected — a reference to it would resolve to the thing already in scope, never to the binding, so the binding would be silently dead. The same goes for the `TIME` / `T` built-ins and the eval-time built-ins `TAD`, `TAFD`, `MACHEPS`. A name declared in `[covariates]` is rejected for the mirror-image reason: there the *binding* would win, silently shadowing the data column and dropping it from the required-column set. Either way, one name means one thing.
+- **No dead bindings.** An intermediate that no `obs_scale` / `y` entry reaches is a parse error. Before \#1030 every key other than `obs_scale` / `y` was rejected outright, which is what caught a misspelt `obs_scal = V`; now that any key is legal syntax, rejecting the unread binding is what keeps that typo from silently disabling scaling.
+
+Intermediates are **inlined** into the entry that uses them, so they are not a separate evaluation stage and nothing downstream can tell them from the hand-expanded form: covariates reached only through an intermediate are required data columns just the same (see *Undefined names are data columns, not zeros* above), the dose-attribute double-use rejection sees through them, and the analytic-sensitivity path is unaffected. The one consequence of inlining is that an intermediate used twice is *evaluated* twice — which is exactly what writing it out by hand costs. Note that `min` / `max` count as two uses each (see below), so a two-sided clamp on a named value expands that value four times — or three times written as `clamp(x, lo, hi)`.
+
+### `min(a, b)`, `max(a, b)` and `clamp(x, lo, hi)`
+
+Two-argument `min` / `max` and three-argument `clamp` are available in every expression the DSL parses — `[scaling]`, `[individual_parameters]`, `[odes]`, `[derived]`. They desugar to the inline conditional (`max(a, b)` → `if (a >= b) a else b`), so they differentiate and compile exactly like the hand-written form.
+
+The set of callable names is closed, and the same in every one of those blocks — see [Supported Operators and Functions](../model-file/individual-parameters.llms.md#supported-operators-and-functions). Anything outside it is a parse error rather than the silent identity it used to be ([\#1332](https://github.com/FeRx-NLME/ferx-core/issues/1332)).
+
+The desugaring puts **both** arguments in the guard *and* in a branch, so each one appears twice in the compiled tree, and the duplication multiplies through nesting: `min(max(x, 0.01), 0.99)` contains four copies of `x`, and reading that clamp from two places in a readout makes eight. Clamp a *named* value rather than a long expression — that is the pairing the block above uses, and it keeps the growth on a short leaf instead of on a whole sub-model.
+
+`clamp(x, lo, hi)` is the two-sided bound written as one call, and desugars to the same nested conditional the pair does: `if (x <= lo) lo else if (x >= hi) hi else x`. On each bound the *bound* is returned, so the derivative there is zero. It puts `x` in the tree three times rather than the nested form’s four, but the advice above is unchanged — clamp a named value, not a long expression. Any arity other than three is a parse error, and literal bounds the wrong way round (`clamp(x, 0.9, 0.1)`) are rejected rather than silently returning a bound for every `x`; bounds that are not both literals are not checked.
+
+`clamp` differs from the nested pair in one place, deliberately: on a `NaN` input. `NaN` fails both `x <= lo` and `x >= hi`, so `clamp` falls through to `x` and the `NaN` propagates — into the prediction, and from there into the objective function, where it is caught. The nested `min(max(x, lo), hi)` instead returns `lo`, because `max`’s `x >= lo` is false for `NaN` and the `else` branch is the bound. So if you rewrite an existing `min`/`max` pair as `clamp` around a quantity that can go `NaN` — `x ^ 0.5` of something that dips negative mid-search, or a covariate that is missing for some subject — that model was being quietly pinned to `lo`, and will now surface the `NaN` instead. That is the intended direction: a silently bounded `NaN` is a wrong number that fits. A `log` or `sqrt` never gives a `NaN` to surface, because both floor their argument ([Values outside an operation’s domain](../model-file/individual-parameters.llms.md#values-outside-an-operations-domain)).
+
+In `[derived]`, `min` / `max` also name the row aggregate (`max(IPRED, TIME > 0)` is “the largest `IPRED` over rows where `TIME > 0`”). The two are told apart by the second argument: a comparison is a row filter, anything else is the numeric clamp. An aggregate cannot be combined into a larger expression — `max(IPRED) * 2` is an error, not a scaled maximum. `clamp` has no aggregate spelling, so it is unambiguous there.
+
+## Runtime behaviour on bad scales
+
+If an expression scale (Form B or C) evaluates to a non-positive or non-finite value at runtime — for example `WT / 70` when `WT` is missing (reads 0) or `1 / (TVV - x)` near a singularity — every prediction for that subject is set to `NaN`. The outer NLL then evaluates to `NaN` and the optimizer rejects the step. This matches established NLM convention (NONMEM’s `OBJFN = NaN` → step rejection) and surfaces bad scales in the per-subject diagnostics rather than silently producing a mis-scaled fit.
+
+## Comparison with NONMEM and nlmixr2
+
+| Need | NONMEM | nlmixr2 | ferx |
+|----|----|----|----|
+| Scalar unit conversion | `S1 = 1000` | (multiplier in `cmt`/`f`) | `[scaling] obs_scale = 1000` |
+| Amount-state ODE with concentration DV | `S2 = V/1000` plus `Y = A(2)/S2` | `cmt(central); f = central/V/1000` | `[scaling] y = central / (V/1000)` |
+
+The ferx form is divisive by convention, so an `obs_scale = V/1000` reads as “divide raw by V/1000” — matching NONMEM’s `S2`.
+
+## Interaction with gradients
+
+All `[scaling]` variants on the **analytical PK path** support the default `gradient = auto` setting and forced finite differences (`gradient = fd`):
+
+| Form | `auto` | `fd` | Notes |
+|----|----|----|----|
+| Scalar `obs_scale = K` | exact analytic | exact FD | The constant threads as one entry per observation. |
+| Expression `obs_scale = <expr>` | subject-static analytic | exact FD | See subject-static caveat below. |
+| Per-CMT `obs_scale[CMT=N]` | subject-static analytic | exact FD | One per-observation scale entry per observation, dispatched by `subject.obs_cmts[i]`. |
+| Form C `y[…] = <expr>` (ODE) | exact analytic (in-scope ODE) | exact FD | The adjoint (#486; before it the ODE sensitivity provider, \#410/#439) differentiates the Form C readout — uniform `y = <expr>` and per-CMT `y[CMT=N] = <expr>` — on both loops, including **covariate references** in the readout (#540): a covariate threads in as a constant from the per-observation snapshot, so a free→total protein-binding readout gated on a `FREE` flag stays analytic. A θ or η referenced *directly* in the readout (rather than via an `[individual_parameters]` entry) is also analytic since \#486 — the parser desugars each bare `THETA(i)`/`ETA(k)` into a hidden individual parameter, so the readout’s `∂y/∂θ`/`∂y/∂η` rides the individual-parameter sensitivity chain; a term the parser could not give a slot is read from the recorded θ and η, so no readout shape leaves the analytic path. |
+| Form C `y = <expr>` (analytical) | exact analytic | exact FD | The adjoint (#486; before it the analytic provider, \#650) differentiates an analytical Form C readout on both loops, on the static dose-superposition path, the **time-varying-covariate / oral-infusion event-walk** path, and (since \#655) **IOV** subjects (`kappa` declarations) — so a readout gated on a per-row covariate (a free-vs-total `FREE` flag) stays analytic, including under IOV. The readout’s central-compartment amount (`concentration × V`), the individual parameters it references — **including non-structural ones** like a binding `BMAX`/`KD`, which get a free differentiable PK slot — and covariates all flow through the exact η/θ chain; under IOV the readout is evaluated **per occasion**, with that observation’s `[η, κ]` — so an individual parameter that carries a `kappa` (say an additive baseline `BASE = TVBASE * exp(KAPPA_B)`) takes its occasion value, exactly as NONMEM’s per-record `$ERROR` does. (Before \#1079 the closed-form path evaluated those parameters at `kappa = 0`; the ODE path was always per-occasion. A readout referencing `KAPPA_*` **directly** is still rejected at parse — put the occasion dependence in an individual parameter and reference that.) A θ or η referenced **directly** in the readout (rather than via an `[individual_parameters]` entry) is analytic too since \#486, the same way it is on the ODE path above: the parser desugars each bare reference into a hidden individual parameter, which then draws a free differentiable PK slot like any other non-structural readout parameter. A readout referencing the oral **depot** amount (reconstructed by dose superposition at the subject’s `t = 0` parameters, as in prediction), a per-CMT `y[CMT=N]`, a `[initial_conditions]` baseline (added before the readout, as in prediction) and one whose parameters overflow the free slots are all analytic. A model whose readout parameters fit the spare slots but push the *total* differentiated-parameter count past the width the closed-form sensitivity kernels are compiled for falls back to FD, and since \#486 it is **reported** as `fd` rather than mislabelled `analytic`. |
+
+**Analytic outer gradient handles expression scaling exactly.** The adjoint gradient that drives the gradient-based outer optimizers (`bfgs`, `lbfgs`, `slsqp`, …) records an `obs_scale` *expression* on its tape and differentiates the scaled prediction `f / scale` **exactly** — including its η and θ dependence. So an η-dependent scale like `1000 / V` is handled exactly by the analytic FOCE/FOCEI outer gradient with no `gradient = fd` needed.
+
+**Inner EBE loop also handles expression scaling analytically (since \#486).** The light inner-gradient provider now carries the η-only quotient rule `∂(f/scale)/∂η = (∂f/∂η)/scale − f·(∂scale/∂η)/scale²` — the η-block of the outer’s quotient rule, evaluated once per subject over the same `Dual2`-differentiable scale program — so the per-subject inner EBE loop is exact for an η-dependent expression `obs_scale` like `1000 / V`, not just the outer gradient. The ODE (`[odes]`) path also serves an η-dependent `obs_scale` analytically on both loops: on the static walk since \#486, on the **non-IOV time-varying-covariate** walk since \#486 (the divisor is subject-static, so one subject-static jet is applied post-walk), for IOV since \#575, and for IOV subjects that also have time-varying covariates since \#590. The **closed-form (analytical 1-/2-/3-compartment) IOV** path serves it analytically on both loops since \#486 as well, including IOV subjects with time-varying covariates — the same per-occasion post-walk quotient the ODE IOV path uses. The IOV expression-scale quotient follows production semantics: the scale is evaluated once per occasion group with the subject-level covariate snapshot, while the event walk still uses per-event covariate snapshots for the dynamics. Per-CMT `obs_scale[CMT=N]` and ODE expression scaling combined with LTBS are served too. Result-neutral — estimates and SEs are unchanged.
+
+## Interaction with SDE / `[diffusion]`
+
+In Phase 1, `[scaling]` is **not supported** on SDE models. The EKF / Kalman update computes both the predicted mean and the prediction covariance `p_obs` in the observation space, and the per-observation `r_obs` callback evaluates the residual variance from that predicted mean. Forms A/B post-multiply only the mean, so the EKF variance would remain in the unscaled space — producing mis-scaled OFVs.
+
+A correct SDE+scaling integration needs the scale factor threaded into both the EKF `p_obs` propagation (scales by `1/K²`) and the residual variance callback. That’s a wider change deferred to Phase 1.5. Until then, the parser rejects any `[scaling]` block on a model with a `[diffusion]` block (Forms A, B, and C alike).
+
+## Multi-analyte / per-CMT scaling
+
+For models that observe multiple compartments (parent + metabolite, sum-of-moieties, free vs. total, …), specify a separate scale per observed CMT using the `obs_scale[CMT=N]` (Forms A/B) or `y[CMT=N]` (Form C) syntax. `N` is the 1-based CMT index from the data file’s `CMT` column.
+
+``` ferx
+[scaling]
+  obs_scale[CMT=1] = 1000    # parent in mg/L → mg/mL
+  obs_scale[CMT=2] = 1       # metabolite already in target units
+```
+
+Form C (ODE) per-CMT:
+
+``` ferx
+[structural_model]
+  ode(states=[depot, parent, metab])
+
+[scaling]
+  y[CMT=1] = parent / V_parent
+  y[CMT=2] = metab  / V_metab
+```
+
+### Coverage: both directions
+
+**Coverage rule** — every CMT that has at least one observation in the data must have a matching `[CMT=N]` entry. The parser only checks syntax; the fit-time validation (run automatically at the top of `fit()`) errors with a list of the missing CMTs:
+
+    [scaling]: per-CMT scaling is missing entries for observed CMTs [2, 3].
+    Every observed CMT must have an `obs_scale[CMT=N]` (or `y[CMT=N]` for ODE) entry.
+
+**The other direction is a warning** (since [\#1405](https://github.com/FeRx-NLME/ferx-core/issues/1405)) — a `[CMT=N]` entry that *no* observation is recorded on is inert rather than wrong, so `fit()` and `ferx check --data` report `W_PER_CMT_UNMATCHED` naming the dead compartments instead of refusing the model. It fires on all three per-CMT channels, `obs_scale[CMT=N]`, `y[CMT=N]` and `[error_model] CMT=N:`. The usual cause is a `CMT` column that never carries the declared value — a typo, an endpoint removed by `[data_selection]`, or a block carried over from another model. On a dataset with *no* `CMT` column every observation is keyed to compartment 1 and **both** codes fire: `W_CMT_DEFAULTED` for the defaulting itself, this one for the entries the defaulting left dead. The message offers that reading only when the data is consistent with it — every observation on compartment 1 — so a model whose observations sit on compartment 2 is told its entries are inert without being sent to audit a `CMT` column that is present and correct. When a `[data_selection]` clause emptied one of the dead compartments the message says so and names it; a clause that removed rows on some *other* compartment is not offered as the cause. Validating a model without `--data` reports nothing here: an empty population is no evidence about which entries are exercised.
+
+### Mixing rule
+
+**Mixing rule** — the uniform form (`obs_scale = K`) and the per-CMT form (`obs_scale[CMT=N] = K`) are mutually exclusive within the same group. The parser rejects mixing them so the user is explicit about intent. The same rule applies to `y` and `y[CMT=N]`.
+
+### Gradients
+
+**Gradients** — per-CMT `obs_scale[CMT=N]` works with both `gradient = auto` and `gradient = fd`. The analytic route materialises a per-observation scale array (one entry per observation in the subject) from a subject-static `pk_param_fn` evaluation. See [Interaction with gradients](#interaction-with-gradients) for the subject-static caveat that applies to all expression-form scales.
+
+Form C per-CMT (`y[CMT=N] = <expr>`) is differentiated analytically by the adjoint (since \#486; before it the ODE sensitivity provider, \#439): each endpoint’s compiled output program is recorded per observation, dispatched by `subject.obs_cmts[i]`, on both loops. So `gradient = auto` serves it; `gradient = fd` is no longer required.
+
+Since \#486, an η-dependent **expression `obs_scale = <expr>`** divisor on an **ODE** model is also differentiated analytically (previously a Form-C readout `y = state/V` was the only analytic route). The same quotient rule the closed-form provider uses (`apply_expression_scale_*`) is applied to the ODE prediction jet for both the outer θ/Ω/σ gradient and the inner EBE η-gradient. The static ODE walk evaluates one scale jet per subject; because the divisor is **subject-static even under time-varying covariates** (production evaluates it at the subject covariate snapshot), the **non-IOV time-varying-covariate** walk applies the same single subject-static jet post-walk since \#486. The ODE IOV walk evaluates one scale jet per occasion group, so an IOV model with time-varying covariates in the dynamics and `obs_scale = V` stays on the analytic route since \#590. Combined with **LTBS**, an ODE expression `obs_scale` is analytic too.
+
+### Numerical validation
+
+**Numerical validation.** The per-CMT analytic gradient inherits the NONMEM validation of the user-ODE sensitivity engine (#410): the gradient machinery — the augmented RK45 recording and the η/θ chain — is unchanged, and per-CMT only selects, per observation, which CMT’s compiled Form-C output program to evaluate. Each such program is the same readout already validated for the uniform `y = <expr>` case. The per-observation routing itself is verified by the `ode_provider_percmt_matches_production` test (analytic `f`, `∂f/∂η`, `∂f/∂θ` vs the production predictor + finite differences on a two-endpoint model) and the `ode_provider_percmt_light_matches_full` test (the inner η-gradient equals the outer one to 1e-9). A dedicated NONMEM cross-check on a multi-endpoint model is therefore not re-run here; it is covered transitively by \#410’s validation plus these routing tests.
+
+The **time-varying-covariate** analytic gradient (#439) inherits \#410’s NONMEM validation on the same basis: it switches the per-event PK parameters at each covariate breakpoint (the event-driven walk) but the underlying integrator and η/θ chain are unchanged, exactly mirroring how production’s `compute_predictions_with_tv` switches parameters over `f64`. The walk is verified against that production predictor + finite differences — first order by `ode_provider_tvcov_matches_production` and the second-order Hessian blocks (`d2f_deta2`, `d2f_deta_dtheta`) by central-differencing the validated first-order gradient — and the inner equals the outer (`ode_provider_tvcov_light_matches_full`).

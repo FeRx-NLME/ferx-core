@@ -1,0 +1,118 @@
+# Time-to-Event Endpoints (`[event_model]`)
+
+> **Maturity: beta** — see [Feature Maturity](../maturity.llms.md) for what this means.
+
+The `[event_model]` block registers a CMT column as a TTE (time-to-event) endpoint. Observations on that CMT are routed to a parametric survival likelihood rather than the Gaussian residual-error model.
+
+See [Time-to-Event Estimation](../estimation/tte.llms.md) for the full reference including data format, hazard families, and comparison with nlmixr2 / NONMEM.
+
+## Syntax
+
+    [event_model]
+      cmt    = <integer>    # CMT column value in the data file
+      family = exponential  # exponential | weibull | gompertz
+      scale  = <expression> # theta/eta/covariate expression — Exponential (rate λ) and Weibull
+      rate   = <expression> # alias for scale (Exponential only)
+      shape  = <expression> # Weibull only (required; error if present for exponential/gompertz)
+      alpha  = <expression> # Gompertz only: baseline hazard at t=0
+      gamma  = <expression> # Gompertz only: hazard growth rate
+      loghr  = <expression> # optional (all families): proportional-hazards covariate term;
+                            #   multiplies the full hazard by exp(loghr)
+      type   = tte          # tte (default, single event) | rtte (repeated events)
+      clock  = forward      # RTTE only: forward (default, total time) | reset (gap time)
+
+> **Expression namespace:** expressions are evaluated in the theta / eta / covariate namespace, and may also reference names defined in `[individual_parameters]` (e.g. a hazard driven by an individual `CL`), including ones defined with a NONMEM-style `if (...) { ... } else { ... }` block. Those references are resolved per subject at evaluation time; only the individual parameters the hazard actually uses are computed. A referenced individual parameter may **not** depend on an inter-occasion (IOV/kappa) random effect — the hazard has no occasion context, so that is rejected with an error. Nor may a hazard parameter read the `TIME` built-in, directly or through a referenced individual parameter: an analytic family’s parameters are evaluated once per subject with no time argument, so `TIME` would silently read 0, and the model is rejected at parse ([\#1919](https://github.com/FeRx-NLME/ferx-core/issues/1919)). The family’s own time dependence lives in its closed form; for a hazard that varies in `TIME` some other way, write it as an [ODE-accumulated `hazard =`](#joint-pk-tte-ode-accumulated-hazard-hazard) with the `TIME` term in that expression. The check follows the block path by path, and recognises two separate `if` statements as testing the same condition when the conditions are written identically and nothing they read is re-assigned in between. Equivalent conditions written differently (`TVKT > 0` and `0 < TVKT`) are treated as independent, so a `TIME` dependency on a path no execution takes can still be refused; the message says so, and writing the conditions identically (or merging the `if` statements) resolves it. Writing the full theta/eta expression directly (e.g. `TVLAMBDA * exp(ETA_LAMBDA)`) also works.
+
+Named blocks allow multiple TTE endpoints:
+
+    [event_model DROPOUT]
+      cmt    = 2
+      family = exponential
+      scale  = TVLAMBDA_DROPOUT * exp(ETA_LAMBDA)
+
+    [event_model DEATH]
+      cmt    = 3
+      family = weibull
+      scale  = TVSCALE_DEATH
+      shape  = TVSHAPE_DEATH
+
+## Joint PK-TTE: ODE-accumulated hazard (`hazard =`)
+
+For a **drug-driven** hazard — one that depends on the (ODE) PK state — use the `hazard` key instead of an analytic `family`:
+
+    [event_model]
+      cmt    = 3
+      hazard = H0 * exp(BETA * (central / V))   # references ODE states + individual parameters
+
+The parser appends a cumulative-hazard accumulator to the model’s ODE system (`d/dt(__chz) = <hazard>`, starting at 0) and estimates it **jointly** with the PK; the TTE likelihood reads `H(t)` from that state and `h(t)` from its derivative, so the PK and the event model share the same random effects (a common frailty). Notes:
+
+- Requires an **ODE model** (`ode(...)` in `[structural_model]` with an `[odes]` block).
+- `hazard` is **mutually exclusive** with the analytic `family` / `scale` / `shape` / `alpha` / `gamma` keys.
+- The expression compiles in the **`[odes]` RHS namespace** — it may reference ODE state names (e.g. `central`) and `[individual_parameters]` (e.g. `V`, `H0`), but **not** raw thetas or covariates directly, so declare hazard parameters and any between-subject variability in `[individual_parameters]`.
+- **IOV is not yet supported** with an ODE hazard (rejected at parse time).
+- An `SS=1` dose equilibrates the PK compartments only; the accumulator keeps its value at the dose record, so `H` starts at `0` for a first dose and is preserved across a later one — see [SS with an ODE-accumulated hazard](../model-file/steady-state.llms.md#ss-with-an-ode-accumulated-hazard).
+- `fit()`, `predict_survival()` and `simulate()` all work. Drug-driven event times are drawn by root-finding the augmented ODE for the first time the cumulative hazard reaches `-log U`, so `simulate()` needs a finite `horizon` — a drug-driven hazard can vanish, so there is no implicit window and one is not guessed.
+
+See [Joint PK-TTE](../estimation/tte.llms.md#joint-pk-tte) for a worked example.
+
+## Repeated events (RTTE)
+
+Set `type = rtte` when a subject can experience the **same event more than once** (recurrent seizures, hypoglycaemic episodes, exacerbations). The data then carries several `DV = 1` rows per subject on the TTE CMT, in time order, typically ending in a `DV = 0` administrative-censoring row at the end of observation:
+
+    [event_model]
+      cmt    = 2
+      type   = rtte
+      family = exponential
+      scale  = TVLAMBDA * exp(ETA_LAMBDA)   # frailty shared across a subject's events
+
+The `clock` key selects how the hazard measures time between events:
+
+| `clock` | Model | Likelihood | Status |
+|----|----|----|----|
+| `forward` (default) | Andersen–Gill / total time — hazard is a function of *absolute* time; the cumulative hazard is **not** reset at events | `Σ_k log h(t_k) − H(T)` | supported |
+| `reset` | Renewal / gap time — hazard depends on time *since the previous event*; the clock resets at each event | `Σ_k log h(Δ_k) − Σ_k H(Δ_k)` | supported (analytic families) |
+
+For a time-homogeneous hazard (e.g. exponential) the two clocks coincide; they differ only when the hazard varies with time (Weibull, Gompertz, or a covariate-on-time term). Under `clock = reset` a subject’s inter-event gaps are independent draws from the hazard family, so a fixed-effects reset fit reduces to an ordinary survival regression on the gap durations.
+
+> **WARNING:**
+>
+> Laplace-based methods (`focei`, `foce`, the Gauss–Newton variants) can **severely underestimate the frailty variance ω²** for RTTE at low event rates (Karlsson et al. 2009 report −91 % to −96 % bias below a 43 % event rate). ferx emits a warning and recommends **`method = saem`** or **`method = imp`**, which are unbiased. Laplace remains available and is fine for fixed-effects or high-event-rate RTTE.
+
+Notes:
+
+- Repeated-event rows must be **sorted by TIME** within each subject; out-of-order rows are rejected at the fit boundary (the clock-forward likelihood telescopes the cumulative hazard across a subject’s records).
+- `clock` is only valid with `type = rtte`.
+- A **drug-driven ODE hazard** (`hazard =`) with `type = rtte` is a later slice and is rejected for now — use an analytic `family` for repeated events.
+- Left truncation (`TENTRY`) applies to the subject’s first record.
+- **`simulate()` draws a recurrent stream** per subject to the administrative `[simulation] horizon` (both clocks; analytic families). See [Simulating repeated events](../estimation/tte.llms.md#simulating-repeated-events) for the method and validation. A finite horizon is required; left truncation, multiple RTTE causes, an RTTE cause mixed with a competing single-event cause, and EVID=3/4 resets are rejected rather than silently mis-sampled. The stream is **regenerated from `t = 0`**, so — unlike fitting — `simulate()` does not read the input event rows: the fit-boundary input-shape checks above (sort order, interval censoring, finite times) do not apply to it.
+
+## TTE-only models
+
+For models with only TTE endpoints and no Gaussian PK data, the `[structural_model]`, `[error_model]`, and `[individual_parameters]` blocks may all be omitted:
+
+    [parameters]
+      theta TVLAMBDA(0.05, 0.001, 10.0)
+      omega ETA_LAMBDA ~ 0.09
+
+    [event_model]
+      cmt    = 2
+      family = exponential
+      scale  = TVLAMBDA * exp(ETA_LAMBDA)
+
+    [fit_options]
+      method  = focei
+      maxiter = 300
+
+See `examples/tte_weibull.ferx` and `examples/tte_gompertz.ferx` for complete Weibull and Gompertz examples using this compact syntax.
+
+## DV coding
+
+| DV | Meaning |
+|----|----|
+| `0` | Right-censored |
+| `1` | Exact event at this TIME |
+| `2` | Interval-censored right bound (pair with a preceding DV=0 row on same CMT) |
+
+## TENTRY column
+
+Add `TENTRY` to the data file to apply left-truncation (delayed entry): the likelihood conditions on survival past `TENTRY`.

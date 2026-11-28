@@ -1,0 +1,406 @@
+# Simulation
+
+## `simulate()`
+
+Generate simulated observations from a model with random effects and residual error.
+
+``` rust
+pub fn simulate(
+    model: &CompiledModel,
+    population: &Population,
+    params: &ModelParameters,
+    n_sim: usize,
+) -> Result<Vec<SimulationResult>, EngineError>
+```
+
+**Parameters:** - `model`: Compiled model - `population`: Template population (dose events and observation times are used; DV values are ignored) - `params`: True parameter values for simulation - `n_sim`: Number of simulation replicates
+
+**Returns:** `Ok` with a vector of `SimulationResult`, one per observation per subject per replicate, or `Err` when the model and data fail a precondition — the same message `fit()` gives for that input (see [Entry-point errors](../warnings.llms.md#entry-point-errors)). The `Err` is an `EngineError`, which also carries `ferx check`’s code for the refusal when there is one (see [Matching on the code](../warnings.llms.md#entry-point-error-codes)).
+
+**Example:**
+
+``` rust
+use ferx_core::api::read_population_for;
+
+let model = parse_model_file(Path::new("model.ferx"))?;
+let (population, _) = read_population_for(&model, &None, "data.csv", None, None, None, &[])?;
+
+// Simulate 1000 replicates
+let sims = simulate(&model, &population, &model.default_params, 1000)?;
+
+for sim in &sims[..5] {
+    println!("Sim {}, ID {}, TIME {}, IPRED {:.3}, DV {:.3}",
+             sim.sim, sim.id, sim.time, sim.ipred, sim.outcome.continuous_value());
+}
+```
+
+## `read_population_for_simulation()`
+
+Read a NONMEM-format CSV that will be **simulated from** rather than fitted.
+
+``` rust
+pub fn read_population_for_simulation(
+    model: &CompiledModel,
+    covariate_decls: &Option<Vec<CovariateDecl>>,
+    data_path: &str,
+    fallback_columns: Option<&[&str]>,
+    iov_column: Option<&str>,
+    filter: Option<&SelectionFilter>,
+    column_map: &[(String, String)],
+) -> Result<(Population, Option<CovariateTable>), String>
+```
+
+Identical to `read_population_for()` — the reader every fitting entry point uses — except in how it reads a **missing `DV`** on a scored row (`EVID=0`, `MDV=0`). For a fit, a missing `DV` means “no observation here”, so the row is skipped and counted for the `W_MISSING_DV` warning. For a simulation the `DV` is the *output*, so the same row is a **design point**: a sampling time whose value has not been generated yet.
+
+That makes the natural design template simulate as written:
+
+``` csv
+ID,TIME,DV,EVID,AMT,CMT,MDV
+1,0,.,1,100,1,1
+1,0.25,.,0,.,1,0
+1,1,.,0,.,1,0
+1,4,.,0,.,1,0
+```
+
+``` rust
+let (population, _covariates) =
+    read_population_for_simulation(&model, &None, "design.csv", None, None, None, &[])?;
+let sims = simulate(&model, &population, &model.default_params, 1000)?;
+```
+
+Read with `read_population_for()` the same file yields zero simulated rows. Rows marked `MDV=1` are excluded on both paths. Retained rows are reported once as a `W_DESIGN_DV` warning on the returned population, so a simulation run off an *observed* dataset makes visible that it kept rows a fit of the same data would have skipped.
+
+The retained rows carry a placeholder `DV` (`NaN`, or the endpoint’s first declared state code for an integer-coded endpoint) that the simulated value replaces, so the returned population is **for simulation only** — do not pass it to `fit()`. That is enforced, not merely advised: a population carrying non-finite observations is rejected by `fit()` (and reported by `ferx check`) as `E_NONFINITE_DV`, and propensity-score-matched simulation (`SimulateOptions::match_method`) rejects it too, since a design template has nothing to compute posthoc etas from.
+
+## `simulate_with_seed()`
+
+Same as `simulate()` but with a fixed random seed for reproducibility.
+
+``` rust
+pub fn simulate_with_seed(
+    model: &CompiledModel,
+    population: &Population,
+    params: &ModelParameters,
+    n_sim: usize,
+    seed: u64,
+) -> Result<Vec<SimulationResult>, EngineError>
+```
+
+## `simulate_with_options()` — propensity-score matching
+
+Same outputs as `simulate()`, with options for a seed and for **propensity-score matching** of the simulated random effects.
+
+``` rust
+pub fn simulate_with_options(
+    model: &CompiledModel,
+    population: &Population,
+    params: &ModelParameters,
+    n_sim: usize,
+    opts: &SimulateOptions,
+) -> Result<Vec<SimulationResult>, EngineError>
+
+pub struct SimulateOptions {
+    pub seed: Option<u64>,                  // None draws from entropy
+    pub match_method: Option<MatchMethod>,  // None disables matching
+    pub horizon: Option<f64>,               // TTE administrative censoring time; None = per-record window
+    pub iov_occasion: Option<IovOccasionRule>, // derive IOV occasion labels; None = the data's own
+}
+
+pub enum MatchMethod {
+    Optimal,   // global minimum total distance (linear assignment); recommended default
+    Nearest,   // greedy nearest-neighbour in subject order
+    Rank,      // pair by Mahalanobis-norm rank (k-th order statistic to k-th)
+}
+```
+
+Propensity-score matching is refused on a `[mixture]` model (`E_PROPENSITY_INPUT`): each subject’s posthoc η would be estimated under class 1 rather than under its own class. Simulate without `match_method` instead.
+
+With `match_method`, `horizon` and `iov_occasion` all `None` this is identical to `simulate_with_seed()` (or `simulate()` when `seed` is `None`).
+
+`iov_occasion = Some(rule)` labels the occasions of a `kappa` model the way `fit()` does, for a model whose `[fit_options]` derive them with `iov_occasion = dose` or `time(...)` instead of reading an `iov_column`. Pass the rule the model was fitted under: `FitResult::iov_occasion`, or the model file’s `fit_options.iov_occasion`. Without it a population read with no occasion column carries no labels, every subject is simulated at κ = 0, and `simulate_with_options_diag()` returns a `W_IOV_NO_OCCASIONS` warning. It has no effect on a model without `kappa`, and `Some(IovOccasionRule::Column)` keeps the data’s labels as given. See [IOV: Simulation](../model-file/iov.llms.md#simulation).
+
+`horizon = Some(t)` sets an administrative censoring time for **time-to-event** endpoints, decoupled from the observed event times: it overrides each TTE record’s per-record observation window so a re-simulated event-bearing subject (a competing-risks VPC) censors at the planned study end `t` rather than drawing unbounded. It has no effect on Gaussian endpoints. See [TTE simulation](../model-file/simulation.llms.md#tte-simulation).
+
+### Why match?
+
+In real-world data, therapy is often **adapted in response to a patient’s own PK** — e.g. high-clearance patients are given longer dosing intervals or more frequent sampling. A standard VPC draws each subject’s `eta` *independently* of its dosing/sampling design, so this design↔︎eta association is lost and the VPC can show spurious model misspecification even when the model is correct.
+
+Propensity-score matching restores the association. For each replicate:
+
+1.  Draw a pool of `N` etas from $N(0, \Omega)$ (`N` = number of subjects).
+2.  Match the `N` drawn etas 1:1 (without replacement) to the `N` subjects’ **fitted (posthoc) etas** under the **Mahalanobis** distance over the model $\Omega$: $d^2(a,b) = (a-b)^\top \Omega^{-1} (a-b)$ using the chosen `MatchMethod`:
+    - **`Optimal`** — global minimum of the total matched distance (the linear assignment problem); mirrors `MatchIt(method = "optimal", distance = "mahalanobis")`. Best on average in simulation, the recommended default.
+    - **`Nearest`** — greedy nearest-neighbour in subject order; mirrors `MatchIt(method = "nearest", distance = "mahalanobis")`.
+    - **`Rank`** — pair subjects and draws by the rank of their Mahalanobis norm $\lVert \eta \rVert = \sqrt{\eta^\top \Omega^{-1} \eta}$ (k-th order statistic to k-th).
+3.  Each subject keeps its own observed design but is simulated with the drawn eta that matched its fitted eta — so a high-clearance draw lands on a subject whose adaptive design reflects high clearance.
+
+The fitted etas are computed once via a posthoc (MAP) inner-loop pass over the observed `population` at `params`; only the drawn pool and the matching change across replicates.
+
+**Requires observed data**: every subject must carry observations (so its posthoc eta is defined). The function returns `Err` if the population is empty or any subject has no observations. The matching is the only correction applied; binning and plotting the VPC is left to the caller (e.g. the `vpc` R package).
+
+### Validation against R
+
+The matching numerics were cross-checked against R on a fixed 8-subject, 2-eta scenario:
+
+- the Mahalanobis cost matrix matches R’s `mahalanobis()` under Ω to `2e-11`;
+- ferx-core’s optimal assignment is **identical** to two independent optimal solvers — `clue::solve_LSAP` and `optmatch::pairmatch` (the engine `MatchIt(method = "optimal")` uses) — with the same total cost to 10 dp.
+
+A direct `MatchIt(method = "optimal", distance = "mahalanobis")` call (as in the PAGE-poster workflow) returns a slightly different *pairing*, because MatchIt scales the Mahalanobis metric by the *empirical* covariance of the combined etas rather than the model Ω. The optimal-matching algorithm is the same (optmatch); only the metric differs, which is the documented modelling choice here (Ω is exact for draws from `N(0, Ω)` and needs no extra estimation).
+
+**Example:**
+
+``` rust
+let pop = read_nonmem_csv(Path::new("rwd.csv"), None)?;   // observed data
+let fit = fit(&model, &pop, &model.default_params, &opts)?;
+
+// Recover the fitted ModelParameters (theta/Omega/sigma) from the result.
+let params = fitted_params_from_result(&fit, &model)?;
+let sims = simulate_with_options(
+    &model, &pop, &params, 200,
+    &SimulateOptions {
+        seed: Some(42),
+        match_method: Some(MatchMethod::Optimal),
+        iov_occasion: fit.iov_occasion.clone(), // the fit's own occasion rule, if any
+        ..Default::default()
+    },
+)?;
+// → 200 replicates; build the pmVPC from `sims` as usual.
+```
+
+## `predict()`
+
+Population predictions without random effects (eta = 0). No simulation noise is added.
+
+``` rust
+pub fn predict(
+    model: &CompiledModel,
+    population: &Population,
+    params: &ModelParameters,
+) -> Result<Vec<PredictionResult>, EngineError>
+```
+
+**Returns:** `Ok` with a vector of `PredictionResult` holding population-level predictions, or `Err` on a failed precondition, as for `simulate()`.
+
+**Example:**
+
+``` rust
+let preds = predict(&model, &population, &model.default_params)?;
+for p in &preds {
+    println!("ID {}, TIME {}, PRED {:.3}", p.id, p.time, p.pred);
+}
+```
+
+## `simulate_with_uncertainty()`
+
+Simulate observations while propagating **population parameter uncertainty**. For each parameter draw from the uncertainty distribution, etas (from the drawn Omega) and epsilons (from the drawn Sigma) are sampled — giving simulation bands that include both individual variability *and* uncertainty in the population estimates.
+
+``` rust
+pub fn simulate_with_uncertainty(
+    model: &CompiledModel,
+    population: &Population,
+    fit_result: &FitResult,
+    opts: &SimulateUncertaintyOptions,
+) -> Result<Vec<SimulationResult>, EngineError>
+```
+
+``` rust
+pub struct SimulateUncertaintyOptions {
+    pub n_uncertainty_draws: usize,      // parameter sets drawn
+    pub n_sim_per_draw: usize,           // eta/eps replicates per draw
+    pub method: UncertaintyMethod,       // Asymptotic | Sir
+    pub seed: Option<u64>,
+    pub horizon: Option<f64>,            // TTE administrative horizon, every draw
+}
+
+pub enum UncertaintyMethod {
+    Asymptotic,   // MVN around ML estimate using FitResult.covariance_matrix
+    Sir,          // resamples from FitResult.sir_resamples_packed
+}
+```
+
+**Parameters:** - `fit_result`: Result of a previous `fit()` call. Must include `covariance_matrix` (Asymptotic) or `sir_resamples_packed` (SIR). - `opts.n_uncertainty_draws`: number of parameter sets drawn. - `opts.n_sim_per_draw`: number of subject-level replicates per draw. - `opts.method`: how to draw the parameter sets. - `opts.horizon`: administrative censoring horizon for TTE endpoints, the same one for every draw. It is the `SimulateOptions::horizon` of `simulate_with_options()`, checked by the same code: finite, `> 0`, and not below any subject’s entry time (`E_SIMULATE_HORIZON` otherwise). `None` keeps each record’s own window. No effect on continuous endpoints.
+
+A repeated-event (`type = rtte`) or drug-driven (joint PK-TTE) hazard has no implicit window, so it requires `opts.horizon`; without one the call is refused with `E_SIMULATE_HORIZON`. Each draw is simulated the way `simulate_with_options()` simulates that draw’s parameters under the same horizon. The two calls do not return the same rows from the same seed: drawing the parameter sets advances the random stream first.
+
+**Returns:** `Vec<SimulationResult>`. For continuous endpoints its length is `n_uncertainty_draws * n_sim_per_draw * n_subjects * n_obs`; a TTE endpoint returns its event and censoring rows instead, and a repeated-event stream has a variable number per subject. Each row carries a `draw` index (1..=n_uncertainty_draws) and a `sim` index (1..=n_sim_per_draw).
+
+**Prerequisites:** - For `UncertaintyMethod::Asymptotic`: run `fit()` with `run_covariance_step = true` (or `covariance = true` in `[fit_options]`). - For `UncertaintyMethod::Sir`: run with `sir = true` *and* `sir_keep_samples = true` so the resampled vectors are kept on the `FitResult`.
+
+**Example:**
+
+``` rust
+let fit_opts = FitOptions {
+    run_covariance_step: true,
+    ..FitOptions::default()
+};
+let fit = fit(&model, &population, &model.default_params, &fit_opts)?;
+
+let sims = simulate_with_uncertainty(
+    &model,
+    &population,
+    &fit,
+    &SimulateUncertaintyOptions {
+        n_uncertainty_draws: 200,
+        n_sim_per_draw: 10,
+        method: UncertaintyMethod::Asymptotic,
+        seed: Some(42),
+        horizon: None,                   // Some(h) for a TTE endpoint
+    },
+)?;
+```
+
+### With diagnostics: `simulate_with_uncertainty_diag()`
+
+`simulate_with_uncertainty_diag()` takes the same arguments and returns a `SimulationOutput { results, warnings, parameters }`. `results` holds exactly the rows `simulate_with_uncertainty()` returns, bit for bit. `warnings` holds the same bundle `simulate_with_options_diag()` reports, plus one `W_UNCERTAINTY_DRAWS_SKIPPED` warning when draws were skipped in the flip-flop regime (below). Data-reader warnings reach it through the same filter `fit()` uses. So a caller that relays them should take them from here, not from `Population::warnings`, which still holds the ones the filter withholds (`W_NO_DOSES` on a compartment-free model, for example). See [Which entry points report warnings](../warnings.llms.md#entry-points).
+
+#### Draws in the flip-flop regime
+
+A twin-less transit or inverse-Gaussian closed form (one carrying a user `[odes]` / `[scaling]` / `[initial_conditions]` block, or whose ODE twin was declined) has no solution where elimination is at least as fast as absorption. A draw that lands there is skipped, and the run reports one `W_UNCERTAINTY_DRAWS_SKIPPED` warning with the count and the draw indices. The rest of the draws are a truncated sample of the uncertainty distribution, so the interval they give is biased away from the tail in which elimination is at least as fast as absorption. A point estimate already in that regime is refused with the flip-flop error `simulate()` gives at that θ, `E_TRANSIT_FLIP_FLOP` (`E_IG_FLIP_FLOP`), and so is a run in which every draw is skipped. Writing the model as an explicit ODE `transit()` / `igd()` model avoids the skip altogether.
+
+A draw that *survives* can still contain individuals in that regime, because the skip is decided at the draw’s typical (η = 0) parameters. Those are counted separately; see [Individuals in the flip-flop regime](#simulated-flip-flop).
+
+## Individuals in the flip-flop regime
+
+The checks above all read a **fixed** η: every entry point refuses a model whose typical (η = 0) parameters are in the flip-flop regime of a twin-less transit / inverse-Gaussian closed form, and `simulate_with_uncertainty()` skips a *parameter draw* whose own typical values land there. Neither sees an individual whose **sampled η** pushes `ke` to or past the tilting abscissa — `KTR = (n+1)/mtt` for transit, `1/(2·MAT·CV²)` for inverse-Gaussian.
+
+A twin-*carrying* model reroutes such an individual to its exact ODE twin, which is valid in both regimes, and nothing is lost. A twin-less one has nothing to reroute to: the closed form clamps, and that individual’s **entire dose-driven concentration becomes zero** — none of its rows carries any contribution from the doses the subject was given. The rows are still returned and still plotted, and they are not necessarily zeros (see below) — nor necessarily finite, if an η-dependent `obs_scale` goes non-positive for that draw (see the table).
+
+They are *undosed*, which is not the same as drug-free: an `[initial_conditions]` baseline is itself drug and survives the clamp, so those rows carry its decay.
+
+The `_diag` entry points report this as one per-run count ([\#1823](https://github.com/FeRx-NLME/ferx-core/issues/1823)):
+
+    W_SIMULATED_FLIP_FLOP: 27 of 600 simulated individuals dosed before one of their
+    observations were evaluated at an η inside the flip-flop regime (disposition rate
+    ≥ transit rate KTR = (n+1)/mtt), where the twin-less one_cpt_transit closed form
+    has no solution and clamps its dose-driven concentration to zero. None of their
+    rows carries any contribution from the doses the subject was given — by that
+    clamp, or, for an individual whose absorption never reaches an observation (a
+    `lagtime` past it, or `f = 0`), because the dose never arrived. Those rows are
+    still returned and still summarised, so every VPC band, prediction interval or
+    mean computed over them describes an undosed subject. Whether they read as a
+    literal `ipred = 0` depends on what this model layers on the closed form's output
+    afterwards, so searching the output for a zero row will not reliably find them.
+    Rewrite the model as an explicit ODE `transit()` model, which reroutes per
+    individual and is valid in both regimes.
+
+### Why looking for a zero row will not find them
+
+The clamp removes the closed form’s **dose-driven** term. Five steps then run on that output, in this order (`pk/mod.rs`) — four of which can lift a clamped row off zero, and one of which cannot:
+
+| Step | What it does to a clamped (zero) prediction |
+|----|----|
+| `add_analytical_init` — `[initial_conditions] init(central) = ...` | adds the baseline’s decay, so the row is the baseline alone |
+| `apply_analytic_readout` — Form-C `[scaling] y = <expr>` | whatever `<expr>` evaluates to at a zero state |
+| `apply_scaling` — Form-A/B `[scaling] obs_scale = <expr>` | divides, so a zero stays zero — **unless** the evaluated scale is non-positive or non-finite, which replaces the row with `NaN` |
+| `apply_log_transform` — `log(DV) ~ additive(...)` / `DV ~ log_additive(...)` | `ln` of the internal floor, a large negative number |
+| `apply_frem_prediction_override` — FREM `FREMTYPE > 0` rows | replaced by `theta + eta` (from code reading; not measured) |
+
+Whether a clamped row ends up at `0.0` — or at `NaN` — is therefore a question about the values the model’s own expressions produce, not about its structure. Measured on `obs_scale = 1 - ETA_CL`: a crossing draw at η = 0.6 gives `[0, 0, 0]`, and at η = 2 the scale is −1 and the rows are `[NaN, NaN, NaN]`. Both are counted — the tally’s own finiteness guard reads the **PK parameters**, not the evaluated scale. Two Form-C readouts make the point: measured at ω²_(CL) = 0.09 / n_sim = 300 / seed 7, the same 27 clamped individuals give **27** zero rows under `y = central/V` and **0** under `y = central/V + 2.5`.
+
+So the warning does not say what the rows contain — it says nothing from the subject’s doses reaches them (they are *undosed*, not drug-free: the baseline in the second row of the table above is itself drug), and that **searching the output for a zero row will not reliably find them**. The count is the reliable channel. Measured on an `[initial_conditions]` fixture: 27 of 600 individuals clamped, and not one zero row between them.
+
+The count is of **timing-eligible crossers**: an individual is not counted unless its subject carries a dose of positive amount **strictly before one of its observations**: without that, no returned row could have carried the dose either way, so nothing was lost and an ODE rewrite would produce the same rows. The count’s denominator is those eligible individuals, and the warning says so rather than claiming every dosed individual is counted.
+
+Strictly before, not at or before: a transit or IG absorption contributes exactly zero central concentration at elapsed time zero, so a dose landing *on* an observation reaches it with nothing. Measured — with the dose moved to the last observation, the prediction is bit-identical to the same subject with `AMT = 0` at η = 0, on both the transit and the IG fixture; moving it `1e-9` earlier gives `1.67e-39`, small but not zero.
+
+Two designs that *are* still counted, because excluding them would need the predictor rather than the data: an absorption `lagtime` that pushes absorption past the last observation, and `f = 0`. Both are individual-parameter expressions, evaluated per individual. The warning stays accurate for them — it says nothing from their doses reaches those rows, which is true, and it names “because the dose never arrived” as the alternative cause rather than attributing those rows to the clamp. It also deliberately does not claim the clamp *moved* anything.
+
+### What it does to a VPC
+
+Those rows are **not** dropped, so every summary taken over them — a VPC band, a prediction interval, a mean — describes an undosed subject.
+
+How much that biases the result is **fixture-dependent**, and in the degenerate cases above (a `lagtime` past the last observation, `f = 0`) it does not bias it at all: those rows were already undosed, and an ODE rewrite would reproduce them. The count tells you how many individuals are in that state; whether it matters is a question about your model. On the fixture measured here it matters a great deal. Measured on the \#1823 fixture (a 1-cpt transit form at `ke = 0.125`, `KTR = 0.2`, ω²_(CL) = 0.09), 260 of 4000 simulated individuals were clamped — 6.5%, against the 5.9% that P(η ≥ ln 1.6) predicts for this boundary. On the matching `simulate_with_uncertainty()` run the 5th percentile of the first subject’s IPRED at t = 3 read **0.0000**, against 0.0322 on the same model with its twin.
+
+Rewrite the model as an explicit ODE `transit()` / `igd()` model: that reroutes per individual, so nothing is clamped. `simulate()` and `simulate_with_seed()` return rows only and so stay silent — use `simulate_with_options_diag()` or `simulate_with_uncertainty_diag()` when the count matters (a VPC, for example).
+
+## Result Types
+
+``` rust
+pub struct SimulationResult {
+    pub draw: usize,    // Uncertainty draw index (1-indexed; always 1 for simulate())
+    pub sim: usize,     // Replicate number within a draw (1-indexed)
+    pub id: String,     // Subject ID
+    pub time: f64,      // Observation time (TTE rows: the sampled event time)
+    pub cmt: usize,     // CMT of the observation row
+    pub ipred: f64,     // Individual prediction (no residual error)
+    pub outcome: SimOutcome,    // Simulated observation (with residual error)
+    pub mixnum: Option<usize>,  // Mixture class (1-based MIXNUM); None without [mixture]
+}
+
+pub struct PredictionResult {
+    pub id: String,
+    pub time: f64,
+    pub pred: f64,      // Population prediction (eta = 0)
+}
+```
+
+## Drawn parameters per subject
+
+Both `_diag` entry points, `simulate_with_options_diag()` and `simulate_with_uncertainty_diag()`, return the parameters each simulated subject was drawn with in `SimulationOutput::parameters` (#2505). There is one row per `(draw, sim, id)`, keyed like the observation rows that subject produced, and the column names are held once on the table:
+
+``` rust
+pub struct SimulatedParameters {
+    pub eta_names: Vec<String>,        // the model's η
+    pub individual_names: Vec<String>, // [individual_parameters], declaration order
+    pub derived_names: Vec<String>,    // [derived] / [output] columns (sdtab's set)
+    pub varying: Vec<String>,          // columns that changed within some subject
+    pub rows: Vec<SimulatedSubjectParameters>,
+}
+
+pub struct SimulatedSubjectParameters {
+    pub draw: usize,
+    pub sim: usize,
+    pub id: String,
+    pub mixnum: Option<usize>,  // class under [mixture], as on the rows
+    pub eta: Vec<f64>,          // drawn η, parallel to eta_names
+    pub kappas: Vec<Vec<f64>>,  // drawn κ, one vector per occasion group
+    pub individual: Vec<f64>,   // parallel to individual_names
+    pub derived: Vec<f64>,      // parallel to derived_names
+}
+```
+
+Every value is taken at the subject’s **first observation row**: its covariates, `TIME`, and the κ of that row’s occasion. This is NONMEM’s `$TABLE … FIRSTONLY` convention. If a time-varying covariate, a `TIME`-dependent expression or IOV makes a column differ across one subject’s rows, that column is named in `varying`, so you can tell which reported values are a first-row snapshot. For a per-row value, recompute it from the row’s covariates and the returned η. A subject with no Gaussian observation (a TTE- or binary-only one) reports its individual parameters at its baseline covariates and `TIME = 0`, with `NaN` for its `[derived]` values.
+
+`[derived]` / `[output]` values come from the same code that builds the fit’s sdtab columns. It runs on the simulated η, κ and class, the simulated IPRED, and the simulated observations as `DV`. `simulate_with_uncertainty_diag()` evaluates each row under its own draw’s θ.
+
+A steady-state exposure per subject is then `F·dose/CL` from `individual`. You no longer need to integrate the IPRED curve. The row-only `simulate()`, `simulate_with_seed()`, `simulate_with_options()` and `simulate_with_uncertainty()` do not build the table.
+
+## Simulation Process
+
+For each replicate and each subject:
+
+1.  Under a `[mixture]` model, draw the subject’s class $k$ from its mixing probabilities, evaluated at its own covariates, and run the steps below with `MIXNUM = k` and class $k$’s Ω and Σ. See [Mixture models: simulation](../estimation/mixture.llms.md#simulation-under-a-mixture).
+2.  Sample random effects: $\eta_i \sim N(0, \Omega)$ using the Cholesky factor $L$: $\eta = L \cdot z$, where $z \sim N(0, I)$
+3.  Generate predictions through the same time-varying-covariate-aware dispatcher used by estimation and `predict()` (`compute_predictions_with_tv`). PK parameters are recomputed per event from each row’s covariate snapshot, so a covariate that changes over a subject’s record (e.g. body weight) drives the prediction at each time — not just the baseline value. Subjects with no time-varying covariates stay on the single-evaluation fast path (`pk_param_fn(theta, eta, covariates)`), so their output is unchanged.
+4.  Add residual error: $DV = IPRED + \sqrt{V} \cdot \epsilon$, where $\epsilon \sim N(0, 1)$ and $V$ is the residual variance from the error model. FREM covariate pseudo-observations (`FREMTYPE > 0`) instead use the additive covariate error $V = \sigma_\text{EPSCOV}^2$, matching the FREM likelihood.
+
+The same per-event covariate snapshots drive the NPDE/NPD diagnostics and the NCA-based start-value sweep, so all simulation-backed surfaces agree.
+
+## Simulation with Uncertainty Process
+
+`simulate_with_uncertainty()` wraps the steps above in an outer loop over parameter draws:
+
+1.  **Outer loop** — for each of `n_uncertainty_draws`, draw a population parameter set $(\theta_k, \Omega_k, \Sigma_k)$ from the uncertainty distribution.
+    - **Asymptotic**: $x_k = \hat{x} + L_\text{cov} z$ in [packed log-space](../estimation/parameterization.llms.md) (theta, Cholesky-omega, sigma share one packed vector), then unpack — theta, Omega, and Sigma are perturbed coherently from a single MVN draw.
+    - **SIR**: pick a parameter vector at random from `FitResult.sir_resamples_packed` (the resampled pool retained from the SIR step). Draws that fall outside the parameter bounds or yield non-positive theta/omega/sigma are rejected and resampled (up to `10 × n_uncertainty_draws` attempts).
+2.  **Inner loop** — for the drawn $(\theta_k, \Omega_k, \Sigma_k)$, run `n_sim_per_draw` replicates of the standard simulation process above. Etas are drawn from $N(0, \Omega_k)$ and epsilons from the drawn $\Sigma_k$.
+
+The resulting `SimulationResult` rows are tagged with both `draw` and `sim` so downstream code can compute either marginal bands (over all draws and sims) or hierarchical bands (e.g. median across sims within each draw, then percentiles across draws).
+
+## What the uncertainty distribution is
+
+**There is no inverse-Wishart draw here.** Ω uncertainty is *not* sampled from a conjugate matrix distribution; the inverse-Wishart in ferx belongs to the [Bayesian MCMC estimator](../estimation/bayes.llms.md), which is a separate code path (`estimation/bayes.rs`) and is not used by `simulate_with_uncertainty()`.
+
+What actually happens, for `UncertaintyMethod::Asymptotic`:
+
+- The proposal is a plain multivariate normal, and it lives in the [**packed parameter space**](../estimation/parameterization.llms.md) — theta (log), the Omega Cholesky factor (log-diagonal), and sigma (log) in one vector. `FitResult.covariance_matrix` is the inverse covariance Hessian of the OFV *in that same space*, so it is the natural — and the only dimensionally consistent — place to draw. Its off-diagonal blocks are what makes each draw’s θ, Ω and Σ move together instead of independently.
+- Because the Omega segment is $\log L_{ii}$, the implied marginal on an Omega diagonal is roughly **log-normal on the standard-deviation scale**, and every draw yields a positive-definite Ω by construction — no rejection of non-PD matrices needed. Off-diagonal Cholesky entries are drawn on the identity scale.
+- **A probability-scale theta is drawn on the logit scale.** A theta used as `inv_logit(logit(THETA) + ETA)` (`theta_transform = LogitProbability`, e.g. a bioavailability declared on (0, 1)) is packed as $\log\theta$ like any other non-negative theta, and a normal draw there has no ceiling at 1. So that coordinate is moved to $y = \operatorname{logit}\hat\theta$ first, its row and column of the covariance scaled by $dy/dx = 1/(1-\hat\theta)$ (or $1/(\hat\theta(1-\hat\theta))$ when the theta is identity-packed because its lower bound is negative), and each draw is mapped back with $\theta = \operatorname{inv\_logit}(y)$. The draws are logit-normal with the delta-method SD, and never reach 1 whatever the declared upper bound ([\#1548](https://github.com/FeRx-NLME/ferx-core/issues/1548)). A FIX’d theta is pinned as usual. A free one whose estimate is not strictly inside (0, 1) (possible only with an upper bound above 1) has no logit, so the sampler, and SIR, returns an error asking for an upper bound below 1 rather than drawing values that `logit` would clamp. A logit draw above 34.5, the clamp `logit` itself applies, is rejected and redrawn like any other out-of-bounds draw: from about 36.7 on, $\operatorname{inv\_logit}$ rounds to exactly 1.
+- If `covariance_matrix` is not positive-definite, it is symmetrised and eigenvalue-floored before the Cholesky (`regularised_cholesky`). A draw from the regularised factor is slightly wider than the raw covariance in the corrected directions.
+- **FIX’d parameters carry no uncertainty**: any packed index flagged FIX is reset to its fitted value on every draw, so a FIX’d theta, omega, sigma or kappa is identical across all draws. (`compute_bounds()` pins fixed indices with `lower == upper`, so an unpinned continuous draw would otherwise be rejected for every model with a FIX.)
+- A draw that lands outside the packed bounds, or that unpacks to a non-finite theta or a non-positive sigma / Omega / kappa diagonal, is discarded and redrawn. A theta has no sign condition beyond its declared bounds, so a theta declared `(0, -5, 5)` draws from the full normal, not one truncated at 0 ([\#1701](https://github.com/FeRx-NLME/ferx-core/issues/1701)). Redrawing goes on up to `10 × n_uncertainty_draws` attempts in total; exhausting that budget is an `Err`, and usually means an ill-conditioned covariance matrix or an estimate sitting on a bound.
+- A *valid* draw that lands in the flip-flop regime of a twin-less transit / inverse-Gaussian closed form is skipped rather than aborting the whole run, so the returned set may contain fewer than `n_uncertainty_draws` distinct draws. All the skips of a run are reported in one `W_UNCERTAINTY_DRAWS_SKIPPED` warning; see [Draws in the flip-flop regime](#draws-in-the-flip-flop-regime). Any other error in a draw fails the run.
+
+`UncertaintyMethod::Sir` makes none of these distributional assumptions: it resamples whole parameter vectors from the SIR pool, so its shape is whatever the [SIR](../estimation/sir.llms.md) step found. Prefer it when the asymptotic normal approximation is suspect (parameters near a bound, a banana-shaped likelihood) — at the cost of running SIR with `sir_keep_samples = true` at fit time.
+
+Bootstrap (subject resampling + refit) is not implemented; the `UncertaintyMethod` enum is deliberately open for it.

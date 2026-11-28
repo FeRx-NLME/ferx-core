@@ -1,0 +1,100 @@
+# Stochastic Differential Equations (SDE)
+
+This example extends a one-compartment ODE model with a `[diffusion]` block that adds continuous process noise (SDE / EKF). The complete model file is [`examples/warfarin_sde.ferx`](https://github.com/FeRx-NLME/ferx-core/blob/main/examples/warfarin_sde.ferx).
+
+## When to use
+
+Add `[diffusion]` process noise when you want a number for how much unexplained variance accumulates along the trajectory: a `DIFF_<STATE>` large relative to sigma is evidence that the ODE structure is missing a mechanism, and that is worth estimating when the competing structural models are not identifiable from the design.
+
+Do **not** add it to absorb IWRES autocorrelation. ferx implements the covariance half of the Extended Kalman Filter (EKF): the state covariance is propagated and shrunk at each observation, but the state mean is never corrected by the observed values. The fit is therefore the deterministic ODE prediction with an inflated observation variance (`V_total = P[state] + σ²(PRED)`) — nothing is filtered, and the inflation depends on the parameters and the sampling times rather than on what the subject did. See [What the filter does not do](../model-file/diffusion.llms.md#what-the-filter-does-not-do) for the three consequences that follow.
+
+`DIFF_CENTRAL` is the diffusion variance on the central compartment state; it is estimated on the variance scale.
+
+## Dataset
+
+Same as the standard warfarin ODE example — `data/warfarin_sde.csv` uses the standard warfarin format:
+
+``` csv
+ID,TIME,DV,EVID,AMT,CMT,RATE,MDV
+1,0,.,1,100,1,0,1
+1,0.5,5.37,0,.,1,0,0
+...
+```
+
+## Model file
+
+This is the contents of [`examples/warfarin_sde.ferx`](https://github.com/FeRx-NLME/ferx-core/blob/main/examples/warfarin_sde.ferx):
+
+    [parameters]
+      theta TVCL(0.134, 0.001, 10.0)
+      theta TVV(8.1, 0.1, 500.0)
+      theta TVKA(1.0, 0.01, 50.0)
+
+      omega ETA_CL ~ 0.07
+      omega ETA_V  ~ 0.02
+      omega ETA_KA ~ 0.40
+
+      sigma PROP_ERR ~ 0.01 (sd)
+
+    [individual_parameters]
+      CL = TVCL * exp(ETA_CL)
+      V  = TVV  * exp(ETA_V)
+      KA = TVKA * exp(ETA_KA)
+
+    [structural_model]
+      ode(obs_cmt=central, states=[depot, central])
+
+    [odes]
+      d/dt(depot)   = -KA * depot
+      d/dt(central) =  KA * depot / V - (CL / V) * central
+
+    [diffusion]
+      central ~ 0.01
+
+    [error_model]
+      DV ~ proportional(PROP_ERR)
+
+    [fit_options]
+      method          = foce
+      maxiter         = 300
+      covariance      = true
+      gradient_method = fd
+
+The `[diffusion]` block declares `central ~ 0.01`, meaning the initial variance estimate for the diffusion coefficient on the `central` compartment is 0.01 (variance scale, not SD). The EKF propagates this uncertainty forward in time between observations.
+
+**Important**: SDE uses finite-difference gradients (`gradient_method = fd`); the analytic `Dual2` sensitivity path does not cover the EKF. This makes SDE fits slower than equivalent analytical models; the EKF evaluation itself is also more expensive than a plain ODE step.
+
+## Running the fit
+
+``` bash
+ferx examples/warfarin_sde.ferx --data data/warfarin_sde.csv
+```
+
+Or via the Rust API:
+
+``` rust
+let result = fit_from_files("examples/warfarin_sde.ferx", "data/warfarin_sde.csv")?;
+println!("DIFF_CENTRAL = {:.4}", result.diffusion["central"].estimate);
+```
+
+## Interpreting output
+
+The fit YAML gains a `diffusion:` section:
+
+``` yaml
+diffusion:
+  central:
+    estimate: 0.008432
+    se: 0.001102
+```
+
+A small `DIFF_CENTRAL` (near zero) indicates the process noise is negligible and the standard ODE model is adequate. A large value relative to the mean compartment level says the deterministic structure does not account for the data — it does not say the stochastic extension has accounted for it.
+
+Compare the *structural* estimates against the ODE fit rather than the residual diagnostics: with the state mean uncorrected, the inflation re-weights the fit, and on a misspecified model it can pull a structural parameter well away from the value the ODE fit recovered ([measured example](../model-file/diffusion.llms.md#when-to-use-sde-models)). The Durbin-Watson statistic and the residual plots from an SDE fit will not settle the comparison: `IWRES` is scaled by the residual error alone, so it reads over-dispersed on these fits.
+
+## Tips
+
+- **Compare OFV, but do not read it as justification**: fit the deterministic ODE first. The SDE model adds one parameter (`DIFF_CENTRAL`), and the usual thresholds are Δ OFV \> 3.84 (χ²₁ at 5%), or \> 2.71 because the parameter sits at a lower boundary (variance ≥ 0), making the asymptotic null a 50:50 mixture of χ²₀ and χ²₁. What those thresholds test is whether the extra variance parameter improves the likelihood — and with the state mean uncorrected, that improvement is re-weighting, not explanation: on the misspecified fixture in [When to use SDE models](../model-file/diffusion.llms.md#when-to-use-sde-models) Δ OFV is −669 for one parameter while CL moves 2.5× away from the truth the ODE fit had recovered. Treat a large Δ OFV as evidence that the deterministic structure is wrong, then fix the structure.
+- **Multiple diffusion states**: add one `state ~ init_variance` line per ODE state. In practice only the observed-compartment state benefits from diffusion; depot-compartment diffusion is rarely estimable from concentration data.
+- **Speed**: SDE fits are ~5–10× slower than equivalent analytical models. Use a release build (`cargo build --release`) and allow more outer iterations.
+- **SDE + ADDL**: steady-state dosing (`SS=1`) and `ADDL` are supported with the SDE solver. At an `SS=1` record the filter expands the pulse train until both its mean and its covariance stop moving, so the covariance at the record is the numerically equilibrated periodic (Riccati) value rather than a closed-form reset — see [Steady-state records are equilibrated](../model-file/diffusion.llms.md#sde-steady-state). An `SS=1` infusion longer than `II` (overlapping pulses) is equilibrated like any other.

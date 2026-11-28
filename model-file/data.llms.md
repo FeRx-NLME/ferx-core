@@ -1,0 +1,101 @@
+# Data
+
+> **Maturity: beta** — see [Feature Maturity](../maturity.llms.md) for what this means.
+
+The optional `[data]` block lets a model file name the dataset it should be fit against, so `ferx model.ferx` (no `--data`) and `ferx check model.ferx` (no `--data`) both work directly. It is the ferx equivalent of NONMEM’s `$DATA` record.
+
+## Syntax
+
+    [data]
+      path = <path-to-csv>
+      <new-name> = <actual-header>   # optional column renames
+
+A relative path is resolved **relative to the model file’s own directory** — not the current working directory of the process running `ferx` — so a model and its dataset can be moved together as a pair.
+
+    [data]
+      path = warfarin.csv
+
+`path` is optional. A model whose dataset is always supplied by the caller — `ferx model.ferx --data x.csv`, `ferx_fit(model, data = ...)`, `ferx_simulate(model, data = ...)` — can keep a `[data]` block for its [column maps](#column-mapping) alone:
+
+    [data]
+      TIME = TAFD
+      DV   = CONC
+
+Without a `path` nothing is resolved against the model’s directory, so such a model can be copied anywhere. When a `path` *is* written and the caller also passes data, the path is never opened either — the caller’s dataset wins (see [Precedence](#precedence-cli-r-overrides-the-model-file)).
+
+------------------------------------------------------------------------
+
+## Column mapping
+
+By default ferx recognises the canonical NONMEM columns (`ID`, `TIME`, `DV`, `EVID`, `AMT`, `CMT`, `RATE`, `MDV`, `II`, `SS`, `CENS`, `ADDL`) by name, case-insensitively. When a dataset stores a role under a different header — e.g. `TAFD` for time or `CONC` for the response — you can rename it in the `[data]` block instead of pre-editing the CSV. The direction is `new-name = actual-header`, the ferx equivalent of NONMEM’s `$INPUT TIME=TAFD`:
+
+    [data]
+      path = mydata.csv
+      TIME = TAFD
+      DV   = CONC
+
+The target need not be a canonical role: **any** column can be renamed to **any** new name, including covariates. Because renames are resolved against the original headers all at once, a column can be renamed *aside* to free its name for another — e.g. keep the raw `dv` under a new name while promoting a log-DV column into the `DV` role:
+
+    [data]
+      path = mydata.csv
+      ODV = dv         # keep the original DV under a new name
+      DV  = lndv       # promote the log-DV column into the DV role
+      WT  = weight     # rename an arbitrary covariate
+
+- The **actual header** is matched case-insensitively (`TIME = tafd` finds a `TAFD` column).
+- A target naming a canonical role is upper-cased to the standard spelling (`time = TAFD` → `TIME`); any other target keeps its exact case, since covariate lookups are case-sensitive.
+- A renamed header is treated **only** under its new name — the original header no longer leaks in under its old name (so `TIME = TAFD` stops `TAFD` from being auto-detected as a covariate).
+
+Validation is strict, so a typo fails loudly rather than silently reading the wrong column:
+
+- a mapped header that is **absent** from the dataset is an error;
+- renaming to the **same target twice**, or mapping **two targets to the same header**, is an error;
+- a rename whose target collides with a **surviving** (non-renamed) column is an error — e.g. `DV = lndv` while the dataset still has its own `dv` column is ambiguous and rejected (rename the old `dv` aside, as above).
+
+The IOV occasion column is *not* set here — keep using [`iov_column`](../model-file/iov.llms.md) in `[fit_options]`, and covariate columns keep their dataset names (declare them in [`[covariates]`](../model-file/covariates.llms.md) if needed).
+
+------------------------------------------------------------------------
+
+## Precedence: CLI / R overrides the model file
+
+An explicit dataset path always wins over the model’s `[data]` block:
+
+- CLI: `ferx model.ferx --data other.csv`
+- R: `ferx_fit(model, data = "other.csv")`
+
+If the model *also* declares a `[data]` block and the two paths differ, ferx fits (or checks) against the explicit path and records a warning rather than silently picking one — it appears in `FitResult$warnings` (and the console output) for a fit, or as a `W_DATA_PATH_OVERRIDE` diagnostic for `ferx check`.
+
+    $ ferx model.ferx --data other.csv
+    ...
+    Warning(s):
+      - dataset path overridden: using `other.csv` instead of the model's `[data] path = warfarin.csv`
+
+When the two paths are equal, or only one of the two is given, there is no warning.
+
+------------------------------------------------------------------------
+
+## When neither is given
+
+If a model has no `[data] path` (no `[data]` block, or one that only maps columns) and no dataset path is supplied externally, `ferx model.ferx` (without `--simulate`) and `fit_from_files`/`run_model_with_data*` without a path both fail with a clear error rather than a generic file-not-found:
+
+    Error: no dataset specified — pass a data path, or set `path = ...` in the model file's `[data]` block
+
+`ferx check model.ferx` treats the absence of any dataset as “skip data-dependent checks” (not an error) — the same as it always has when `--data` is omitted.
+
+------------------------------------------------------------------------
+
+## Limitations
+
+- One dataset per model — there is no support for multiple `[data]` blocks or multiple datasets.
+- `[data]` carries `path` and column mappings only; row-level filtering stays in [`[data_selection]`](../model-file/data-selection.llms.md) (the NONMEM `IGNORE=`/`ACCEPT=` analogue).
+
+------------------------------------------------------------------------
+
+## NONMEM equivalent
+
+| NONMEM                            | ferx                               |
+|-----------------------------------|------------------------------------|
+| `$DATA warfarin.csv`              | `[data] path = warfarin.csv`       |
+| `$INPUT ID TIME=TAFD DV=CONC ...` | `[data] TIME = TAFD` / `DV = CONC` |
+
+NONMEM has no override-with-warning concept — a `$DATA` record is the only source of the dataset path. ferx’s CLI `--data`/R `data =` argument taking precedence (with a warning on conflict) has no NONMEM analogue.

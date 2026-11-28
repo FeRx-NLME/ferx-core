@@ -1,0 +1,770 @@
+# Error Model
+
+> **Maturity: stable** — see [Feature Maturity](../maturity.llms.md) for what this means.
+
+The `[error_model]` block defines the residual error structure, specifying how observed data (DV) relates to model predictions.
+
+## Syntax
+
+    DV ~ ERROR_TYPE(SIGMA_PARAMS)
+
+Every line in the block must be consumed end to end by exactly one statement form, and a line matching none of them is a **parse error** quoting the offending line and listing the forms:
+
+    [error_model]
+      DV ~ proportional(PROP_ERR)
+      banana                        # rejected
+
+Trailing text counts — a statement must be the whole line, so `DV ~ additive(ADD) oops` is rejected rather than read as `DV ~ additive(ADD)`. `;` does not start a comment here either (only `#` and `//` do), and a line carrying one says so rather than reporting a missing argument list.
+
+Before 0.4.0 an unmatched line was dropped without a diagnostic: `ferx check` reported the file VALID, and the block then either fitted whichever *other* line it had or failed with “No error model found in \[error_model\] block”, neither of which named the line at fault. See [\#1390](https://github.com/FeRx-NLME/ferx-core/issues/1390).
+
+The accepted forms are `DV ~ additive(SIGMA)`, `DV ~ proportional(SIGMA)`, `DV ~ combined(SIGMA_PROP, SIGMA_ADD)`, [`DV ~ power(SIGMA, EXPONENT)`](#power), the log-transform-both-sides spellings `DV ~ log_additive(SIGMA)`, `log(DV) ~ additive(SIGMA)`, `DV ~ log_combined(SIGMA_PROP, SIGMA_ADD)` and `log(DV) ~ combined(SIGMA_PROP, SIGMA_ADD)`, a [`CMT=N:`](#multiple-endpoints-per-cmt-error-models) prefix on any of them, the [`weight = <expr>`](#residual-weighting-weight-...) modifier, [`iiv_on_ruv = ETA_NAME`](#iiv-on-residual-error-iiv_on_ruv) alongside a statement, and the [covariate-selected `if/else`](#covariate-selected-error-models-ifelse) form. Each is described below.
+
+## Available Error Models
+
+### Additive
+
+    DV ~ additive(SIGMA_NAME)
+
+The residual variance is constant across all predictions:
+
+$$\text{Var}(DV) = \sigma^2$$
+
+Use when measurement error is independent of concentration (e.g., assay with fixed precision).
+
+### Proportional
+
+    DV ~ proportional(SIGMA_NAME)
+
+The residual variance scales with the predicted value:
+
+$$\text{Var}(DV) = (\sigma \cdot f)^2$$
+
+where $f$ is the model prediction. Use when measurement error increases with concentration (most common in PK).
+
+The variance is scored as it is however small $f$ gets, so the objective does not depend on the units of `DV`: rescaling `DV` and the doses by $k$ shifts the OFV by exactly $2n\ln k$, as in NONMEM. Only a variance that cannot be scored — $f = 0$ exactly, which gives zero variance, or a `NaN` — is replaced by `1e-12`. Until \#2441 every variance was clamped at `1e-12`, which scored a prediction below about $10^{-6}/\sigma$ at the clamp rather than at its own variance; fits with such predictions (or with an additive $\sigma \le 10^{-6}$) change their OFV, toward NONMEM’s.
+
+> **WARNING:**
+>
+> **Observations with `DV = 0` cannot be scored by a proportional model.** At such a row the residual is $-f$, so $r^2/\text{Var} = 1/\sigma^2$ is constant while $\ln \text{Var}$ keeps falling as $f \to 0^+$, down to the subnormal guard (about $-708$ of $-2\log L$ per row). A fit can trade structural accuracy for those rows and stop at a wrong optimum that still reports converged: a one-subject, noise-free fixture with four pre-lag zeros stopped at OFV −389.78 with CL 5.2% off, where the true parameters score −1024.67. `fit()` and `ferx check` warn with `W_ZERO_DV_MAGNITUDE_ONLY` when any scored row has `DV = 0` under a variance that is zero at a zero prediction (this, a [`power`](#power) magnitude, or a `combined` model whose additive SD starts at 0). Add an additive component, remove the rows (pre-dose or pre-lag zeros), or code below-LLOQ rows as `CENS = 1` with `DV = LLOQ` under `bloq_method = m3`. `simulate()` does not warn: there `DV = 0` is a template placeholder.
+
+### Combined
+
+    DV ~ combined(SIGMA_PROP, SIGMA_ADD)
+
+Combines proportional and additive components:
+
+$$\text{Var}(DV) = (\sigma_1 \cdot f)^2 + \sigma_2^2$$
+
+Use when both proportional and additive error sources are present. Requires two sigma parameters defined in `[parameters]`. The first argument is the **proportional** sigma and the second the **additive** one — see [Sigma order](#sigma-order) below, which also explains why the argument order and the declaration order must agree.
+
+> **WARNING:**
+>
+> A combined error model has a competing local minimum in which the **additive** term collapses toward zero and the proportional term inflates to absorb the scatter. Starting the additive SD far below the scale of the observations can trap the fit in that worse basin: low-magnitude points then carry near-infinite `1/Var` weight, and the optimizer is happy to keep the additive term at zero. This is not a ferx-specific quirk — NONMEM shows the same trapping, and it is most damaging on multimodal / over-parameterised models.
+>
+> ferx emits a `W_ADDITIVE_INIT_SCALE` warning before fitting when the additive SD initial estimate is below **1% of the data scale** (median `|DV|`) on that endpoint. It never changes your value — it advises a larger start. As a rule of thumb, seed the additive SD at roughly **10%** of the typical observed concentration (`median(|DV|) / 10`) rather than an arbitrary small number.
+>
+> **Worked example (cyclophosphamide parent→metabolite).** Metabolite concentrations reach the hundreds/thousands of ng/mL. Seeding the additive *variance* at 0.5 (SD ≈ 0.7) traps both ferx and NONMEM at additive variance ≈ 0.94, ~50 OFV points worse than the global optimum (additive variance ≈ 1878, matching Pumas). Re-seeding the additive SD to a data-scaled value (tens of ng/mL) reaches the correct basin.
+
+### Power
+
+    DV ~ power(SIGMA_NAME, EXPONENT_THETA)
+
+The proportional loading raised to an estimated exponent — NONMEM’s `Y = F + EPS(1) * F**THETA(n)`, Pharmpy’s `set_power_on_ruv`:
+
+$$\text{Var}(DV) = \sigma^2 \cdot |f|^{2P}$$
+
+`P` is a **theta** declared in `[parameters]`, and `P = 1` is the proportional model exactly. Between additive (`P = 0`) and proportional (`P = 1`) the form lets the data say how the residual SD grows with the prediction, which is why [`ferx ruvsearch`](../tools/ruvsearch.llms.md) offers it as a candidate:
+
+    [parameters]
+      theta RUV_POW(1.0, 0.01, 10.0)
+      sigma PROP_ERR ~ 0.1 (sd)
+
+    [error_model]
+      DV ~ power(PROP_ERR, RUV_POW)
+
+The exponent may also be an expression of thetas, covariates, `TIME` and `TAD`, never a sigma or an η. The first argument follows the same rules as a proportional sigma argument, including a [magnitude expression](#time-varying-covariate-dependent-magnitude), so a time-varying power model is `power(PROP_ERR * (if (TAD < 12.0) RUV_TV else 1.0), RUV_POW)`. Not available with per-CMT or covariate-selected error models, with `log(DV)` / `log_additive`, or with `weight =` (which scales an additive loading the form does not have). An exponent that is zero or negative at the initial estimates is rejected (`E_RUV_MAGNITUDE_NONPOSITIVE`).
+
+Internally the exponent travels on the residual-magnitude channel — the same per-observation plumbing `weight =` and the magnitude expressions use — so every estimator, IWRES, CWRES and the simulated draw see it, and the analytic FOCE/FOCEI gradients carry `∂R/∂P` exactly (pinned against finite differences in `sens/ode_adjoint_tests.rs`, `custom_residual_magnitude_objective_and_gradients`). One consequence worth knowing: because the magnitude path assembles the variance as `((f·f)·σ)·σ` where the bare proportional path uses `(f·σ)·(f·σ)`, a `power(σ, 1)` fit agrees with the plain proportional one to about one ULP, not bit for bit.
+
+#### Comparison with NONMEM
+
+`Y = IPRED + IPRED**THETA(4)*EPS(1)` under `METHOD=COND INTERACTION` on the warfarin dataset (`tests/nonmem/warfarin_power*.ctl`, exercised by `tests/power_nonmem_anchor.rs`). The objective function is compared at two points — the initial estimates with `P = 1.3`, and NONMEM’s own optimum with `P = 1.11` and a σ two orders of magnitude smaller — so an error in how the exponent enters the variance could not cancel between them:
+
+| evaluation point                              | NONMEM 7.5.1 |        ferx |
+|-----------------------------------------------|-------------:|------------:|
+| initial estimates (`P = 1.3`, σ = 0.1)        |    94.381805 |   94.381805 |
+| NONMEM’s optimum (`P = 1.1124`, σ² = 7.31e-5) |  −286.758823 | −286.758823 |
+
+NONMEM’s own minimiser terminated on this model with `ROUNDING ERRORS (ERROR=134)`, as it commonly does where σ and the exponent trade off; the slow-gated fit in the same file asserts ferx reaches an objective no worse and an exponent within 0.05 of NONMEM’s 1.112 (SE 0.122).
+
+## Exactly one plain `DV ~ ...` line
+
+A single-endpoint block binds **one** statement. A second plain `DV ~ ...` line is an error:
+
+    [error_model]
+      DV ~ proportional(PROP_ERR)
+      DV ~ additive(ADD_ERR)          # rejected
+
+    [error_model] has more than one plain `DV ~ ...` line; a single-endpoint error
+    model takes exactly one (use `CMT=N:` prefixes for per-compartment models)
+
+Before [\#1022](https://github.com/FeRx-NLME/ferx-core/issues/1022) the **first** line bound and the rest were dropped without a warning, so a model edited in place — a replacement pasted above the line it replaces, an old line left behind — fitted against the error model it no longer appeared to describe. Both files above gave the same objective, and nothing in the output said which line had won.
+
+The restriction is on the plain form only. A block that genuinely carries several statements writes them with [`CMT=N:` prefixes](#multiple-endpoints-per-cmt-error-models) or as an [`if/else` selector](#covariate-selected-error-models-ifelse), both of which bind every line. `iiv_on_ruv = ETA` is not a statement line and may accompany any single-endpoint model or an `if/else` selector, but not `CMT=N:` lines.
+
+## Sigma order
+
+A single-endpoint `[error_model]` — one `DV ~ ...` line with no `CMT=` prefix and no `if/else` selector — consumes its sigmas **positionally**, from the order they are declared in `[parameters]`. The names written in the arguments are checked against the declared order and must match it:
+
+    [parameters]
+      sigma PROP_ERR ~ 0.04 (sd)     # slot 1 -> the proportional component
+      sigma ADD_ERR  ~ 0.1  (sd)     # slot 2 -> the additive component
+
+    [error_model]
+      DV ~ combined(PROP_ERR, ADD_ERR)
+
+Writing the arguments in any other order is an error (`E_SIGMA_ORDER_MISMATCH`):
+
+    [parameters]
+      sigma ADD_ERR  ~ 0.1  (sd)
+      sigma PROP_ERR ~ 0.04 (sd)
+
+    [error_model]
+      DV ~ combined(PROP_ERR, ADD_ERR)   # rejected: slot 1 holds ADD_ERR
+
+**Fix it by reordering the `sigma` declarations**, so that the declared order matches what the arguments say:
+
+    [parameters]
+      sigma PROP_ERR ~ 0.04 (sd)
+      sigma ADD_ERR  ~ 0.1  (sd)
+
+    [error_model]
+      DV ~ combined(PROP_ERR, ADD_ERR)   # accepted, and means what it reads as
+
+> **WARNING:**
+>
+> `combined(ADD_ERR, PROP_ERR)` also makes the two lists agree, and also parses — but it makes `ADD_ERR` the **proportional** coefficient and `PROP_ERR` the additive term. That is a different model, not a different spelling of the same one. It is honest (the file now says what it does), but it is almost certainly not what you meant, and the objective moves by the full 40×-sigma gap. Reorder the declarations.
+>
+> If the sigmas come from a `block_sigma`, reordering the names is **not enough on its own**: the lower triangle is positional too, so it must be permuted to match the new name order. Rewriting
+>
+>     block_sigma (PROP_ERR, ADD_ERR) = [0.04, 0.10, 1.00]
+>
+> as `block_sigma (ADD_ERR, PROP_ERR) = [0.04, 0.10, 1.00]` parses cleanly and silently swaps the two variances; the matching rewrite is `[1.00, 0.10, 0.04]`.
+
+> **IMPORTANT:**
+>
+> Before [\#1001](https://github.com/FeRx-NLME/ferx-core/issues/1001) the names were checked for existence and then discarded, so the second example above **fitted silently against `ADD_ERR`** as its proportional component. The model validated, the fit converged, and the reported standard errors and diagnostics were all internally consistent — there was nothing to notice. Two sigmas 40× apart shifted the objective by more than 100 units on a 24-observation dataset with no diagnostic at any level.
+>
+> The per-CMT and covariate-selected forms below bind strictly **by name**, so the same file meant two different things depending on which `[error_model]` form it used.
+>
+> Rejecting keeps one resolution rule for the whole positional path. It is a breaking change only for models that were already getting a different fit from the one they appeared to describe.
+
+A sigma declared *after* the ones the error model names is untouched by this rule — it simply occupies a later slot that the error model never loads. This is the shape used by, for example, FREM models, where a trailing sigma is consumed by machinery other than `[error_model]` (`[fit_options] frem_sigma`, which binds by name and does not care which slot it lands in).
+
+Such a sigma still earns the generic “declared in `[parameters]` but not referenced in `[error_model]`” warning. For a sigma that really is unused, that warning is right. For one consumed by another block — `frem_sigma` is the case in the tree today — the warning’s “it will not affect predictions” clause is wrong, and it can be ignored.
+
+Per-CMT (`CMT=N:`) and covariate-selected (`if/else`) error models resolve each endpoint’s sigmas **by name**, so declaration order does not constrain them. Note the corollary: the same two sigma declarations and the same `combined(...)` arguments are rejected as a single-endpoint model and accepted with a `CMT=` prefix or inside a selector, because those forms carry resolved indices and the single-endpoint form does not. Prefer fixing the declaration order over reaching for a per-CMT prefix to silence the error — the prefix changes how observations are dispatched, not just how the sigmas are bound.
+
+## Time-varying / covariate-dependent magnitude
+
+> **Maturity: experimental** ([\#484](https://github.com/FeRx-NLME/ferx-core/issues/484)).
+
+Any sigma argument may be written as an **expression** instead of a bare parameter name, letting the residual-error magnitude depend on `TIME`, covariates, and thetas. This reproduces the NONMEM `$ERROR` idiom of a time- or covariate-dependent error coefficient, e.g.
+
+``` nonmem
+PROP = THETA(2)
+IF(TIME.GT.24) PROP = THETA(2) * THETA(3)
+W = SQRT(THETA(3)**2 + PROP**2 * IPRED**2)
+```
+
+which in ferx becomes:
+
+    [parameters]
+      sigma PROP_ERR ~ 0.1  (sd)
+      sigma ADD_ERR  ~ 22.0 (sd)
+      theta RUV_LATE(1.5, 0.0, 10.0)   # late-phase RUV inflation
+
+    [error_model]
+      DV ~ combined(PROP_ERR * (if (TIME > 24.0) RUV_LATE else 1.0), ADD_ERR)
+
+The expression is a **per-observation multiplier on that sigma’s loading**, so the variance contribution becomes
+
+$$\text{Var}_i(DV) = \sum_k \big(\text{loading}_{k,i} \cdot m_k(\text{TIME}_i, \text{cov}_i, \theta) \cdot \sigma_k\big)^2$$
+
+A bare sigma name keeps the legacy behaviour exactly ($m_k \equiv 1$).
+
+**Rules and restrictions (current).**
+
+- An expression argument must reference **exactly one** declared sigma — the one whose magnitude it scales.
+- The magnitude may depend only on `TIME`, declared covariates, thetas, and the scaled sigma (and on η-free names assigned in `[individual_parameters]`, see [below](#magnitude-indiv-names)), and on the individual prediction `IPRED` ([below](#magnitude-ipred)). It may **not** depend on a random effect (η), on an η-dependent individual parameter, on `PRED` or on `DV`. `TAD` — the data-derived time after dose, steady-state aware, no lag time (#1182) — is available beside `TIME`; `TAFD` is not. `TAD` groups a dose and an observation at the same `TIME` as Pharmpy’s `add_time_after_dose` does: the observation belongs to the *previous* dose, so a trough drawn at the dosing time reads `TAD = II`, not `0` (an observation at an `SS` dose’s time, or at the first dose, stays with that dose). An observation **before the first dose** is Pharmpy’s dose group `0` and reads its offset from the subject’s first pre-dose record — `0` for a lone baseline sample, never a missing value. The sdtab `TAD` column keeps NONMEM’s record-order convention: `0` on the dosing-time row, empty before the first dose. Because `TAD` here is engine-computed, a dataset column of that name cannot reach the error model while every other block reads it; a model that declares a `TAD` covariate *and* reads `TAD` in an `[error_model]` expression is rejected at parse time.
+- The `TIME` fed to the expression is the raw data-file time (matching NONMEM’s `$ERROR`).
+- A magnitude that evaluates to zero, a negative number, or a non-finite value at the initial estimates is rejected (`E_RUV_MAGNITUDE_NONPOSITIVE`): the variance is proportional to its square, so a zero multiplier collapses that observation’s variance onto the internal floor.
+- **Supported by every estimator** (#1029). FOCE, FOCEI, Laplace/AGQ, SAEM, IMP, IMPMAP, Gauss-Newton, GN-hybrid and Bayes all score the same magnitude-aware likelihood, so switching method changes the algorithm, not the model. (Before \#1029 everything but FOCE/FOCEI was rejected up front, because those paths read the residual variance through call sites that never applied the multiplier.)
+- **Analytic gradient (#576/#486).** The inner EBE η-gradient and the outer θ/σ population gradient are both analytic for a magnitude-active model under **FOCE and FOCEI** — the magnitude is η-independent, so the inner loop just threads its per-observation multiplier into the variance/its `f`-derivative; the outer loop differentiates the magnitude program itself (a new *direct*-θ term in `∂R/∂θ`, since `mult(θ)` enters the residual variance independent of the prediction). For plain (non-interaction) **FOCE** the same magnitude enters the Sheiner–Beal marginal through its typical-value residual variance `R⁰` (value and direct-θ derivative), on both the non-IOV and IOV paths. Since \#2093 the outer gradient is exact under FOCE, FOCEI and Laplace with any number of θ. With a correlated residual (`block_sigma`, `correlation`) the inner EBE gradient is exact too: the dense-`R` kernel threads the same multiplier (#2209).
+- **The direct-θ channel and the other estimators.** When the magnitude expression names a θ, that θ moves the residual variance *directly* as well as through the prediction. SAEM’s M-step carries both (it differences the whole observation likelihood for a magnitude-active model rather than chaining `∂nll/∂f` alone). The **Gauss-Newton** closed forms have no direct-`∂R/∂θ` term, so a θ-dependent magnitude routes those subjects to GN’s finite-difference fallback — correct, just slower. A magnitude built only from covariates and `TIME` — including every `weight =` model — has no direct-θ channel at all, and keeps the fast closed forms everywhere.
+
+### Reading the prediction (`IPRED`)
+
+> **Maturity: experimental** ([\#3121](https://github.com/FeRx-NLME/ferx-core/issues/3121)).
+
+A magnitude may read `IPRED`, so the residual SD can be any function of the prediction, not only the built-in loadings (`proportional`, `combined`, [`power`](#power)). This is the usual residual for arm-level summary data in model-based meta-analysis, where the SD of an arm mean models the within-arm SD as a function of the response and divides it by √N. The NONMEM `$ERROR`
+
+``` nonmem
+W = THETA(8)*EXP(THETA(9)*IPRED)/SQRT(NIND)
+Y = IPRED + W*EPS(1)          ; $SIGMA 1 FIX
+```
+
+is, in ferx:
+
+    [parameters]
+      theta A(1.0, 0.01, 100.0)
+      theta B(0.1, -5.0, 5.0)
+      sigma EPS ~ 1.0 (variance) FIX
+
+    [error_model]
+      DV ~ additive(EPS * A * exp(B * IPRED) / sqrt(NIND))
+
+The magnitude `h(IPRED, TIME, covariates, θ)` multiplies its sigma’s loading, so the variance contribution is `(loading · h · σ)²`.
+
+- **Scale.** `IPRED` is the natural-scale prediction, as NONMEM’s `IPR`. Under log-transform-both-sides (`log(DV) ~ …`), where the residual is scored on the log prediction, `IPRED` reads its exponential (floored as the LTBS log is).
+- **Operators.** Around `IPRED` an expression may use `+ - * / ^`, `exp`, `log`, `sqrt`, `abs` and `inv_logit`; anything else (`floor`, an inline `if`, `min`, `max`, …) is refused by name. The parts that do not read `IPRED` are unrestricted.
+- **Where it is refused.** `weight =` stays a property of the datum, so it cannot read `IPRED`: write the factor into the magnitude, `additive(SIGMA * h(IPRED))`, which is the same model. A `power(...)` exponent cannot read it either. A name assigned on the prediction side (`[structural_model]`, `[scaling]`, an `[odes]` state) is refused with its own message: only the prediction itself is readable, as `IPRED`. A dataset column named `IPRED` declared in `[covariates]` is refused too, since the magnitude would read the prediction while the rest of the model reads the column: rename the column to read it, or drop it from `[covariates]` to read the prediction.
+- **Estimation.** Under FOCEI and in the EBE search the variance moves with η through `IPRED`. Plain FOCE holds it at the population prediction, as it does for `proportional`. The inner and outer gradients, and the covariance R-matrix, are analytic under FOCE, FOCEI, Laplace and AGQ. The Gauss-Newton closed forms assume a magnitude constant in the prediction, so those subjects take GN’s finite-difference fallback.
+- **Initial check.** `E_RUV_MAGNITUDE_NONPOSITIVE` evaluates the magnitude at the η = 0 prediction of the initial estimates, and names that `IPRED` (natural scale).
+
+#### Comparison with NONMEM
+
+NONMEM 7.6.0, natural-scale naproxen arm means (`nonmem_anchor/ipred_magnitude*.ctl`, `tests/ipred_magnitude_nonmem_anchor.rs`), SD `A·exp(B·IPRED)/sqrt(NIND)`:
+
+| quantity | NONMEM | \|ferx − NONMEM\| |
+|----|---:|---:|
+| FOCEI OFV, initial estimates | −143.048727 | 3.5e-8 |
+| FOCE (no `INTER`) OFV, initial estimates, `EMAX` log-normal | −71.564006 | 3.3e-8 |
+| FOCEI OFV at NONMEM’s optimum | −171.185236 | 5.6e-8 |
+| no random effects, OFV at NONMEM’s optimum | −36.321932 | 2.1e-14 |
+| POSTHOC η̂ / IPRED / IWRES / CWRES | — | 3.0e-7 / 2.2e-7 / 1.1e-6 / 1.9e-8 |
+| fitted OFV | −171.185236 | 3.7e-9 (ferx lower) |
+| fitted `A`, `B` | 4.47106, −0.170729 | ≤ 3e-5 relative on every θ |
+
+### Names assigned in `[individual_parameters]`
+
+A name assigned in `[individual_parameters]` reads its assigned value in a magnitude expression, as in every other block (#2915). The definition is substituted into the expression, so it is held to the same rules as text written inline. That works when the name is assigned **once, at top level, without a random effect** (directly or through an earlier name):
+
+    [individual_parameters]
+      ISPK = 1
+      WTN  = WT / 70
+      RUVF = RUV_K * WTN
+
+    [error_model]
+      DV ~ additive(S * ISPK * RUVF)
+
+A name that depends on η (an individual parameter such as `CL`), on `MIXNUM`, or on a neural-network output, or that is assigned more than once or inside an `if/else` branch, has no single η-free value to substitute and is rejected with that reason. A covariate the substituted definition reads must be declared in `[covariates]`, like one written in the expression itself. A name that is neither declared nor assigned is rejected too, since it would silently read `0`.
+
+This includes a θ that the block reassigns under its own name — `theta CL` with `CL = CL * exp(ETA_CL)`. In the error model `CL` means the assigned value, as in `[structural_model]`, not the raw θ: that one is rejected for its η, while an η-free `RUV_K = RUV_K * WT / 70` is substituted. To read the θ itself, give the individual parameter a different name (`theta TVCL`, `CL = TVCL * …`).
+
+Two more refusals keep the error model from reading a different value than the rest of the model: a name the block assigns that `[error_model]` would read as its own built-in (`TAD`, `MACHEPS`) or as the scaled sigma — rename the variable — and a definition that would grow past 10,000 expression nodes once every name in it is substituted (a deep chain of intermediates that each read the previous one twice).
+
+### With adaptive dosing
+
+Adaptive dosing (`simulate_adaptive*`) applies the residual-error magnitude to a `Dv` monitor’s assay draw, as `simulate()` applies it to an observation row ([\#2741](https://github.com/FeRx-NLME/ferx-core/issues/2741)). This covers a magnitude expression, a [`weight =`](#residual-weighting-weight-...), a [`power(...)`](#power) exponent and a magnitude on a `CMT=N:` line, with IIV on the residual error, `block_sigma`, FREM and `MIXNUM`. The magnitude is evaluated at the decision:
+
+- **Covariates**: the row in force at the decision.
+- **`TIME`**: the time as written, the same value the monitor reads.
+- **`TAD`**: the time after the last dose given *before* the reading, the base regimen plus the controller’s own earlier doses. A dose decided at the same decision comes after the reading. Before any dose, `TAD` is the time since the subject’s first record, so a first dose decided at 4 on a subject with a record at 0 reads `TAD = 4`.
+
+A magnitude that evaluates to zero, a negative number or a non-finite value at a decision stops the run with `E_RUV_MAGNITUDE_NONPOSITIVE`. The data check behind that code sees the observation rows only, at the initial θ. A decision can sit on a row it never evaluates, such as an `EVID=2` row, and the run can use a θ it never evaluated, such as a fitted one. A model without a magnitude draws exactly what it drew before.
+
+### On `CMT=N:` lines and in `if/else` branches
+
+A magnitude expression works on a [`CMT=N:`](#multiple-endpoints-per-cmt-error-models) line and inside a [covariate-selected `if/else`](#covariate-selected-error-models-ifelse) branch, under the same rules as a plain line ([\#2731](https://github.com/FeRx-NLME/ferx-core/issues/2731)). This is the usual joint model, a residual per endpoint with a factor on one of them:
+
+    [error_model]
+      CMT=1: DV ~ additive(S * (1.0 + (TPF - 1.0) * EARLY))
+      CMT=2: DV ~ additive(U)
+
+The NONMEM spelling of the same idea sets the factor on one endpoint only:
+
+``` fortran
+IF (CMT.EQ.2) THEN
+  IF (TAD.LT.3) PROP=THETA(6)*THETA(12)
+  IF (TAD.GE.3) PROP=THETA(6)
+ENDIF
+```
+
+The expression applies to the rows of its own endpoint, so two endpoints can share a sigma under different factors:
+
+    [error_model]
+      if (EARLY > 0.5) {
+        DV ~ additive(S * TPF)
+      } else {
+        DV ~ additive(S)
+      }
+
+Restrictions on these forms:
+
+- **One statement cannot use a sigma twice with a factor.** `combined(S * TPF, S)` is rejected, because a row holds one multiplier per sigma. Declare a second sigma.
+- **`weight =` and `power(...)` stay refused** on `CMT=N:` lines and in `if/else` branches. Write the factor as a magnitude expression instead of a `weight =`.
+- **Adaptive dosing** (`simulate_adaptive*`) applies a `CMT=N:` magnitude to the assay draw of a `Dv` monitor on that compartment, as it applies [every magnitude](#magnitude-adaptive). It refuses a covariate-selected error model in any case.
+
+#### Comparison with NONMEM
+
+FOCEI objective at fixed parameters against NONMEM 7.5.1 at `MAXEVAL=0`, on a simulated two-dose, two-endpoint dataset where `EARLY` changes within each subject (`nonmem_anchor/ruv_endpoint_magnitude_*.ctl`, exercised by `tests/ruv_endpoint_magnitude_nonmem_anchor.rs`):
+
+| model | NONMEM 7.5.1 | ferx |
+|----|---:|---:|
+| factor on `CMT=1`, own sigma on `CMT=2` | −354.349028 | −354.349028 |
+| the same model at a second point | −294.153412 | −294.153412 |
+| single-statement workaround of the first row | −354.349028 | −354.349028 |
+| `TAD` factor on the proportional half of a `combined` endpoint | −185.934433 | −185.934433 |
+| one sigma on both endpoints, factor on one | −282.091324 | −282.091324 |
+| `if/else` branches sharing a sigma, factor on one | −200.188323 | −200.188323 |
+
+The largest gap is 6.8e-8. In ferx the `CMT=N:` lines and the single-statement workaround give the same objective. The workaround is:
+
+    DV ~ additive(S * ((1.0 + (TPF - 1.0) * EARLY) * (1.0 - ISUR) + TRU * ISUR))
+
+It estimates the second endpoint’s SD as the ratio `TRU = sd2/sd1` and needs both endpoints to share one error type, which the `CMT=N:` form does not.
+
+## Residual weighting (`weight = ...`)
+
+> **Maturity: beta** ([\#1029](https://github.com/FeRx-NLME/ferx-core/issues/1029)).
+
+Meta-analysis data does not arrive one observation at a time. Each row is a *trial-arm summary* — a mean effect with its own reported standard error, or a responder proportion out of a known arm size — and rows differ enormously in how much they should count. Declaring that precision is what makes a model-based meta-analysis (MBMA) a meta-analysis rather than an unweighted curve fit. For how the other MBMA pieces fit around it, see [MBMA: start here](../model-file/mbma.llms.md).
+
+Add a `weight = <expr>` modifier to the error-model statement:
+
+    [parameters]
+      sigma ADD_ERR ~ 1.0 (variance) FIX
+
+    [error_model]
+      DV ~ additive(ADD_ERR) weight = WPSE
+
+    [covariates]
+      WPSE continuous     # reported standard error of this arm's mean
+
+`DV` stays on the **natural scale** in the data file, and so do `PRED`, `IPRED`, `CWRES`, `sdtab` and the VPC — there is no back-transformation step to remember before plotting.
+
+### What it means
+
+`weight = W` declares “score this row as if `DV` and the prediction were both divided by `W`”. Writing $y' = y/W$ and $f' = f/W$, the natural-scale residual variance is
+
+$$\text{Var}(y - f) \;=\; W^2 \cdot \text{Var}\!\left(f/W\right)$$
+
+so the **additive** loading picks up a factor of `W` while the **proportional** loading is untouched — $W \cdot (f/W) = f$, because a common scale factor cancels out of a constant-CV error. Concretely:
+
+| Error model | Unweighted variance | With `weight = W` |
+|----|----|----|
+| `additive(A)` | $\sigma_A^2$ | $W^2\sigma_A^2$ |
+| `proportional(P)` | $(f\sigma_P)^2$ | unchanged — **rejected**, see below |
+| `combined(P, A)` | $(f\sigma_P)^2 + \sigma_A^2$ | $(f\sigma_P)^2 + W^2\sigma_A^2$ |
+
+With `sigma ADD_ERR ~ 1.0 (variance) FIX` this is exactly inverse-variance weighting: each row contributes $1/W_i^2$ to the objective.
+
+### Replaces the hand-built three-site construction
+
+Without `weight =`, the same model has to be assembled in three places that must agree — the observation is divided in R (`DV = WP / WPSE`), the prediction is divided again in `[scaling]`, and the residual is pinned with a fixed sigma. Dividing in only two of the three still fits; it just answers a different question. `weight =` collapses all three into one declaration and leaves the data and the diagnostics alone.
+
+### Is sigma fixed?
+
+That stays your call, because both conventions are real:
+
+- **Continuous endpoint, known SE** (the naproxen-style analysis): fix it — `sigma ADD_ERR ~ 1.0 (variance) FIX`. The weight already carries the whole precision, so a free sigma would double-count the scale.
+- **Weighted logit of a responder proportion** (the canakinumab-style analysis, `DV = logit(p)` with `weight = 1/sqrt(N)`): **estimate** it. The $p(1-p)$ factor was never divided out, and sigma absorbs it — $1/\sqrt{p(1-p)} \approx 2.04$ at $p \approx 0.4$, which is most of a published σ of 2.466. That analysis (Bracis et al. 2026, Case Study 2) is an anchor: `tests/mbma_canakinumab_case_study.rs` reproduces its published objective and NONMEM’s FOCE-I fit of the same model. Its data may not be redistributed, so the nightly slow-test job downloads them; to run it locally, fetch them with `python3 tools/mbma_canakinumab_fetch.py`.
+
+`weight =` does not silently fix or free sigma; it just makes the weighting explicit so the two cases are distinguishable in the model file.
+
+### Objective-function value
+
+ferx scores on the natural scale, so the reported OFV differs from a hand-built (`DV/W`, `PRED/W`) NONMEM or Monolix run by the Jacobian of that change of variable:
+
+$$\text{OFV}_{\text{ferx}} \;=\; \text{OFV}_{\text{hand-built}} \;+\; \sum_j 2\ln W_j$$
+
+That term depends only on the data, so it is identical for every model fitted to the same rows with the same weight column and cancels out of every ΔOFV, likelihood-ratio test, and AIC comparison. Only the absolute number differs from a published figure.
+
+### OFV conventions across tools
+
+Two constants separate one tool’s objective from another’s: the `N·log 2π` term (`N` = number of observations), and the Jacobian of a weighting written as a change of variable. ferx reports `−2 log L` **without** `N·log 2π`, the NONMEM convention, on the **natural scale** of `DV`. `W` is the `weight =` expression: a **standard-deviation** factor, so a row’s residual variance is $W^2\sigma^2$. A precision weight $w = 1/W^2$ (what `DV·√w` uses) carries the same information.
+
+To turn another tool’s figure into ferx’s `weight = W` OFV, add:
+
+| Run | Its reported figure | Add |
+|----|----|----|
+| ferx, `DV ~ additive(S) weight = W` | `ofv` | 0 |
+| NONMEM, natural scale, `Y = F + W*EPS(1)` | `OBJECTIVE FUNCTION VALUE WITHOUT CONSTANT` (`#OBJV`) | 0 |
+| NONMEM, same model | `... WITH CONSTANT` | $-N\log 2\pi$ |
+| ferx / NONMEM hand-built: `DV/W` in the data, prediction `/W`, the same σ as the `weight =` fit | OFV without constant | $+\sum_j 2\ln W_j$ |
+| nlmixr2 FOCEi hand-built with a precision weight: `DV·√w`, prediction `·√w`, `add()` sd the same as the `weight =` fit’s σ | `fit$objf` (any `adjLik`) | $-\sum_j \ln w_j \;=\; +\sum_j 2\ln W_j$ |
+| nlmixr2, same fit | $-2\,$`logLik(fit)` | $-N\log 2\pi - \sum_j \ln w_j$ |
+
+Measured on one dataset (6 subjects, 18 rows, `W` from 0.3 to 2.5, a model linear in its only η so FOCE is the exact marginal), every run at the same initial estimates (`maxiter = 0` / `MAXEVAL=0` / `est = "posthoc"`), against the exact Gaussian marginal computed outside all three tools:
+
+|                                         | Natural scale | Hand-built    |
+|-----------------------------------------|---------------|---------------|
+| exact marginal, no `N·log 2π`           | 44.0745525243 | 41.1483038026 |
+| ferx (`weight = W` / `y = E0/W`)        | 44.0745525243 | 41.1483038026 |
+| NONMEM 7.6.0 `#OBJV`                    | 44.0745525243 | 41.1483038026 |
+| nlmixr2 7.0.1 (nlmixr2est 7.1.0) `objf` | —             | 41.1483038026 |
+
+The difference between the columns is $\sum_j 2\ln W_j = 2.9262487217$ for this data, and $N\log 2\pi = 33.0817871954$ is what nlmixr2’s `−2·logLik` adds. In nlmixr2’s FOCEi `objf` the `adjLik` switch changes nothing: it gave the same figure set to `TRUE` and `FALSE`.
+
+Both constants depend only on the data, so they cancel from every ΔOFV between models fitted to the same rows with the same weights. They matter only when an absolute objective is compared across tools, or against a published figure.
+
+### Rules and restrictions (current)
+
+- The weight expression may reference declared covariates, `TIME`, and thetas — the same scope as a [magnitude expression](#time-varying-covariate-dependent-magnitude). It may **not** depend on a random effect (η), an individual parameter, or the prediction: a weight is a property of the datum, not of the individual.
+- `weight =` is **rejected on a purely proportional error model**. Weighting divides both `DV` and the prediction, and a common scale factor cancels out of a constant-CV error — so the modifier would silently do nothing. Use `additive(...)` or `combined(...)`.
+- Not supported with per-CMT (multi-endpoint) error models or inside a covariate-selected `if/else` block.
+- The modifier composes with a magnitude expression on the same slot: `additive(ADD_ERR * TIME) weight = WPSE` multiplies both.
+- A weighted model is still a single-endpoint one, so [Sigma order](#sigma-order) applies unchanged: `additive(ADD_ERR) weight = WPSE` requires `ADD_ERR` to be the **first** declared sigma, and `combined(PROP_ERR, ADD_ERR) weight = WPSE` requires that declaration order. The weight expression itself must not name a sigma — the argument would then reference two, which no positional slot can express.
+- A weight that evaluates to **zero, a negative number, or a non-finite value** at the initial estimates is rejected (`E_RUV_MAGNITUDE_NONPOSITIVE`). A zero weight — the usual cause is an arm with no reported standard error — would collapse that row’s variance onto the internal floor and let a single observation own the whole objective.
+- **Every estimator applies the weight.** FOCE, FOCEI, Laplace/AGQ, SAEM, IMP, IMPMAP, Gauss-Newton, GN-hybrid and Bayes score the same weighted likelihood, so `method =` picks the algorithm, not the model. A weight is a per-observation constant (covariates and `TIME` only), so the inner η-gradient and the outer θ/σ gradient stay analytic throughout.
+
+### The random-effect sibling
+
+The same modifier rides an IOV `kappa` declaration, where it weights the *random effect* rather than the residual: `kappa KAPPA_EMAX ~ 2.0 (sd) weight = NARM` declares `κ ~ N(0, Ω_IOV / N)` — the arm-level random effect of a longitudinal MBMA. See [Sample-size-weighted IOV](../model-file/iov.llms.md#sample-size-weighted-iov-weight-...).
+
+The visits of one arm can also be given correlated residuals — `correlation cs(RHO) by ARM` or `ar1(RHO)`, with the weights on both sides of the correlation. See [Within-group residual correlation](../model-file/residual-correlation.llms.md).
+
+### Simulating an arm that is not in the data
+
+The weight is a data column. `fit()` always has one — the arm exists, and its reported standard error is a column — but a simulated trial frequently does not, because the point of simulating one is to propose arms that are not in the data. So a `[simulation]` design must state the weight with `covariate WPSE = [...]`, and one that omits it is refused rather than defaulted: the modifier scales the *additive* loading, so a weight silently read as zero does not blow up — it removes the arm’s residual noise entirely and the simulated observation equals its own prediction. See [Covariates in simulation](../model-file/simulation.llms.md#sim-covariates-required).
+
+## Log-transform-both-sides (LTBS)
+
+For data whose residual error is *multiplicative* (a constant CV across the concentration range), an alternative to the proportional model is to fit on the **log scale**: both the observation and the prediction are log-transformed and an **additive** error is applied on the log scale. This matches NONMEM’s `Y = LOG(F) + EPS(1)` convention and is the natural choice when importing a model or dataset from NONMEM.
+
+There are two ways to declare it, depending on the scale of the `DV` column in your dataset:
+
+### `log(DV) ~ additive(SIGMA)` — DV on the natural scale
+
+    [parameters]
+      sigma ADD_LOG ~ 0.1     # additive SD on the LOG scale
+
+    [error_model]
+      log(DV) ~ additive(ADD_LOG)
+
+The engine log-transforms the `DV` column itself (once, at load), and compares it to `log(prediction)`. Use this when your data holds concentrations on the natural scale.
+
+### `DV ~ log_additive(SIGMA)` — DV already log-transformed
+
+    [error_model]
+      DV ~ log_additive(ADD_LOG)
+
+Use this when the `DV` column is *already* log-transformed in the dataset (e.g. exported from a NONMEM workflow that pre-logged the data). The engine takes `DV` as-is and log-transforms only the prediction. `log_additive` is additive error on the log scale.
+
+### Output scale
+
+Under LTBS, **everything is reported on the log scale**, matching NONMEM: `IPRED`/`PRED`, `IWRES`/`CWRES`, and simulated `DV` are all on the log scale. Back-transform with `exp()` if you need natural-scale values.
+
+The likelihood term is the additive form on the log scale:
+
+$$\text{Var}(\log DV) = \sigma^2, \qquad \text{IWRES} = \frac{\log DV - \log f}{\sigma}$$
+
+### Combined proportional + additive error on the log scale
+
+    [parameters]
+      sigma PROP ~ 0.1 (sd)    # log scale (unitless), ≈ the CV
+      sigma ADD  ~ 0.05 (sd)   # natural DV units
+
+    [error_model]
+      log(DV) ~ combined(PROP, ADD)     # DV on the natural scale
+      # or: DV ~ log_combined(PROP, ADD) # DV already log-transformed
+
+On the log scale a proportional error is a constant, and a natural-scale additive error `a` becomes `a/f` (the delta method), so the variance is
+
+$$\text{Var}(\log DV) = \text{PROP}^2 + \frac{\text{ADD}^2}{f^2},$$
+
+NONMEM’s `Y = LOG(IPR) + W*EPS(1)` with `W = SQRT(PROP**2 + ADD**2/IPR**2)`. **`ADD` is in natural `DV` units**, unlike every other LTBS σ, which is on the log scale; `PROP` is on the log scale. `f` is the natural-scale prediction, before the log.
+
+The variance grows without bound as `f → 0`. ferx floors the prediction at `1e-12` before taking its log — the same floor every LTBS model uses — and the floored value is the `f` that divides `ADD`. A NONMEM control stream reproduces it with `IF (IPR.LT.1E-12) IPR=1E-12` ahead of both `LOG(IPR)` and `W`. A model that floors `IPR` at a larger value by hand (`IF (IPR.LT.0.01) IPR=0.01`) is a different model below that value.
+
+A magnitude expression applies per argument, so a factor on the proportional part only is written on that argument: `log(DV) ~ combined(PROP * (if (TIME < 3) FAC else 1), ADD)`. `weight = W` scales the additive argument, as for `combined`: dividing `DV` and `f` by `W` leaves the log residual unchanged and turns `ADD/f` into `ADD·W/f`.
+
+The variance depends on the prediction, so the FOCEI interaction term is live, and FOCE reads the variance at the population prediction. All estimators, IWRES/CWRES, `iiv_on_ruv` and simulation (drawn on the log scale) go through the same variance. `ADD → 0` reduces to `log(DV) ~ additive(PROP)`.
+
+#### Comparison with NONMEM
+
+A one-compartment oral fixture whose concentrations fall from ~9 to ~0.06, so both terms are live, with one observation per subject at `t = 0` that sits on the floor (`tests/nonmem/ltbs_combined*.ctl`, `tests/ltbs_combined_nonmem_anchor.rs`). NONMEM 7.6.0 at `MAXEVAL=0`; both ferx spellings give the same objective to the printed digit:
+
+| evaluation point                | NONMEM 7.6.0 |        ferx |
+|---------------------------------|-------------:|------------:|
+| FOCEI, initial estimates        |   482.533241 |  482.533241 |
+| FOCE, initial estimates         |  1464.351396 | 1464.351396 |
+| FOCEI, NONMEM’s final estimates |   417.230486 |  417.230486 |
+
+### Restrictions
+
+- **Additive or combined only.** LTBS pairs with additive error on the log scale or the combined form above; `log(DV) ~ proportional(...)` / `power(...)` are rejected at parse time.
+
+- **Per-endpoint: every endpoint or none.** `CMT=N:` lines may be LTBS — the issue’s case is plasma and urine, each with its own `PROP` and `ADD`:
+
+      [error_model]
+        CMT=2: log(DV) ~ combined(PROP_P, ADD_P)   # plasma, mg/L
+        CMT=3: log(DV) ~ combined(PROP_U, ADD_U)   # cumulative urine, mg
+
+  The log transform is model-wide (every prediction and, under `log(DV)`, every `DV` is logged), so a block mixing log-scale and natural-scale lines, or `log(DV) ~ ...` with `DV ~ log_...(...)`, is refused. An argument may carry a [magnitude](#endpoint-magnitude) here too, so the motivating model’s early-time factor on the plasma `PROP` alone is `CMT=2: log(DV) ~ combined(PROP_P * (if (TAD < 3) FAC else 1), ADD_P)`. Matched to NONMEM 7.6.0 at `MAXEVAL=0` on a seeded plasma + urine fixture (`tests/ltbs_combined_cmt_nonmem_anchor.rs`): FOCEI 1236.250155, FOCE 1279.711094, 1020.297559 at NONMEM’s final estimates, and 1265.165067 with the factor, within 1e-7 (the ODE solvers’ tolerance). Covariate-selected (`if/else`) error models stay single-scale.
+
+- **No SDE.** Not supported with a `[diffusion]` (SDE/EKF) model.
+
+- **BLOQ/M3 is supported** — the LLOQ is log-transformed alongside `DV`.
+
+- A non-positive `DV` under `log(DV) ~ additive(...)` cannot be log-transformed; it is floored to `log(1e-12)` and a warning is emitted (check your data scale, or use `DV ~ log_additive(...)` if the data is already log-transformed).
+
+## Multiple endpoints (per-CMT error models)
+
+For simultaneous PK/PD (and other multi-analyte) models, a single observed compartment is not enough: plasma concentrations and a PD effect typically need *different* residual error models in the *same* joint likelihood. Prefix each error line with `CMT=N:` to assign a distinct error model to each observed compartment, dispatched by the dataset’s `CMT` column:
+
+    [error_model]
+      CMT=2: DV ~ proportional(PROP_ERR_PK)   # plasma concentration (central)
+      CMT=3: DV ~ additive(ADD_ERR_PD)        # PD effect (effect compartment)
+
+Every observation row is matched to the endpoint whose `CMT=N` equals its `CMT` value, and its residual variance is computed from that endpoint’s error model and sigma(s). All endpoints contribute to one FOCEI objective, so PK and PD parameters — and their uncertainty — are estimated jointly. This is the gold-standard alternative to the sequential workaround (fit PK, freeze IPRED, then fit PD), which underestimates uncertainty.
+
+Each endpoint’s sigma parameters are declared once in `[parameters]`, as usual:
+
+    [parameters]
+      sigma PROP_ERR_PK ~ 0.10 (sd)
+      sigma ADD_ERR_PD  ~ 1.00 (sd)
+
+Rules and restrictions:
+
+- **ODE models only.** Per-CMT dispatch lives in the finite-difference likelihood path used by ODE models. An analytical PK model with `CMT=N:` lines is rejected at parse time.
+- **No mixing styles.** An `[error_model]` block is either a single plain `DV ~ ...` line *or* all `CMT=N:` lines — not both.
+- **Coverage is checked at fit time.** Every observed `CMT` in the dataset must have a matching `CMT=N:` entry, or `fit()` errors and names the missing compartments. Duplicate `CMT=N` entries are rejected at parse time.
+- **A `CMT=N:` line no observation matches is a warning**, not an error (since [\#1405](https://github.com/FeRx-NLME/ferx-core/issues/1405)). It is inert — nothing dispatches to it — so `fit()` and `ferx check --data` report `W_PER_CMT_UNMATCHED` naming the dead compartments rather than refusing the model. Measured on a one-state `[odes]` model declaring both `CMT=1: proportional` and `CMT=2: additive`, with the observations on compartment 2 and nothing else changed: OFV **13.3243** with the `CMT` column present against **7.7329** with it dropped, because every row then takes the `CMT=1:` error model instead. See [the check-report page](../file-formats/check-report.llms.md#codes-scaling-output-and-derived) for what the warning covers and when it stays silent.
+- **Estimation method.** Supported with FOCE/FOCEI, the Gauss-Newton optimizers, and SAEM (optionally followed by `imp`).
+- **Magnitude expressions** are accepted on a `CMT=N:` line ([details](#endpoint-magnitude)).
+
+A complete worked model lives in [`examples/emax_pkpd.ferx`](https://github.com/FeRx-NLME/ferx-core/blob/main/examples/emax_pkpd.ferx) — an oral 1-compartment PK model with an effect-compartment Emax PD readout, proportional error on the plasma endpoint and additive error on the PD endpoint. The per-CMT *readout* (which compartment/expression each `CMT` maps to) is configured in the [`[scaling]`](../model-file/scaling.llms.md) block.
+
+## Covariate-selected error models (`if/else`)
+
+Per-CMT dispatch keys on the dataset’s `CMT` column. When two endpoints share the *same* compartment/readout but need different residual error — e.g. a **free-vs-total** assay, where both measurements are the same concentration readout but carry different proportional error — select the error model with an arbitrary covariate `if/else` instead, exactly as the [`[scaling]`](../model-file/scaling.llms.md) block selects a readout (Form C):
+
+    [error_model]
+      if (FREE == 0) {
+        DV ~ proportional(PROP_ERR_TOTAL)
+      } else {
+        DV ~ proportional(PROP_ERR_UNBOUND)
+      }
+
+Each observation’s residual error model is chosen by evaluating the conditions top-to-bottom against that row’s covariate snapshot and taking the first match; the mandatory final `else` catches every remaining row. `else if` chains any number of branches:
+
+    [error_model]
+      if (ASSAY == 1) {
+        DV ~ proportional(PROP_LCMS)
+      } else if (ASSAY == 2) {
+        DV ~ combined(PROP_ELISA, ADD_ELISA)
+      } else {
+        DV ~ additive(ADD_OTHER)
+      }
+
+This mirrors an analytic Form C readout that switches on the same per-row flag, so a model can express both the readout **and** its residual error against one covariate without recoding the flag into a synthetic `CMT` column:
+
+    [scaling]
+      y = if (FREE == 0) central/V1 + BMAX*(central/V1)/(KD + central/V1) else central/V1
+
+    [error_model]
+      if (FREE == 0) { DV ~ proportional(PROP_ERR_TOTAL) }
+      else           { DV ~ proportional(PROP_ERR_UNBOUND) }
+
+Rules and restrictions:
+
+- **Analytical *and* ODE models.** Unlike per-CMT error (ODE-only), covariate selection works on closed-form analytical PK models too — the selection is a per-observation constant, so the analytic FOCE/FOCEI σ-gradient applies once the endpoint is chosen.
+- **A final `else` is required** so every observation maps to a declared error model (no silent fall-through).
+- **The selector covariate is a required data column.** A covariate named in a condition must be present in the data, or `fit()` fails with `E_MISSING_COVARIATE` (never read as 0). So do `predict_survival()` and `predict_categorical()`, which never read it ([why](../warnings.llms.md#entry-point-covariates)). Declaring it in [`[covariates]`](../model-file/covariates.llms.md) is recommended.
+- **Estimation method.** Supported with FOCE/FOCEI, the Gauss-Newton optimizers, SAEM, and importance sampling — every likelihood/gradient path dispatches on the selected endpoint.
+- **`block_sigma` correlated residuals are supported** together with a covariate-selected error model (#669). Each row loads its branch’s sigmas, and rows sharing a subject time and occasion get the `block_sigma` cross covariance in the dense residual `R`, as per-CMT endpoints do. Two co-temporal rows resolving to *different* branches (e.g. a total `FREE=0` and an unbound `FREE=1` measurement of the same sample) get the honest cross-branch covariance `ρ·σ_i·σ_j` from each row’s own loadings. The method restrictions on `block_sigma` (see the [Sigma scale](#sigma-scale) section) apply unchanged.
+- **Pairing rows into one correlated unit — the `L2` data item.** Which rows a `block_sigma` correlates is controlled by the dataset’s optional [`L2` column](../data-format.llms.md) (NONMEM’s level-2 grouping item): observation rows sharing an `L2` value within a subject form one correlated observation unit and are correlated **all-to-all** within the group; rows with different `L2` ids do not, even at the same time. This lets you pair the total and unbound rows of one blood draw explicitly — and generalizes to a block of **3+ distinct endpoints** (e.g. parent + two metabolites, each pair correlated): every complementary pair in the group keeps its cross covariance, so a jointly positive-definite block is fitted in full rather than losing terms. When a subject has **two samples at the same time** (replicate assays), give each sample its own `L2` id so the pairs stay separate; grouping true replicates into one `L2` unit makes the dense `R` indefinite and fails the Cholesky loudly — the fit telling you the grouping is wrong. `L2` ids may be written as integers or float-formatted integers (`10` or `10.0`, as pandas exports a column that also carries blanks).
+- **No `L2` column?** ferx falls back to grouping co-temporal rows by `(time, occasion)` and pairs them **one-to-one in row order** (first total with first unbound, and so on), so `R` still stays block-diagonal and positive-definite even for replicate samples the fallback cannot tell apart. This reproduces `L2` grouping for the standard NONMEM layout where a sample’s rows are written contiguously; add an explicit `L2` column when your row order does not follow that convention, or when a group holds more than two correlated endpoints. When a co-temporal group *could* pair more than one way and no `L2` column is present, ferx warns (`W_BLOCK_SIGMA_L2_ORDER`) that the fit depends on row order — add an `L2` column to remove the ambiguity.
+- **Note:** `L2` is a reserved data item and is never read as a covariate. If the dataset carries an `L2` column but the model declares no `block_sigma` correlation, ferx warns (`W_L2_UNUSED`) that the column is inert — rename it if you meant it as a covariate.
+- **LTBS** (`log(DV) ~ ...` / `log_additive`) is not supported inside a branch.
+- **SDE / `[diffusion]` models are not supported.** The EKF measurement-noise path uses a single error model and cannot switch per observation, so the combination is rejected at parse time. Use a single-endpoint error model.
+- **Adaptive dosing** (`simulate_adaptive*`) is not supported: the assay keys residual error by the monitored compartment, whereas a selected error model keys endpoints by covariate branch — the combination is rejected.
+- **`simulate()` validates the selector covariate** the same way `fit()` does: a selector covariate absent from the data is a hard `E_MISSING_COVARIATE` error, never silently read as 0.
+
+### Magnitude expressions in a branch
+
+A sigma argument in a branch may be a magnitude expression, and two branches may share a sigma under different factors. See [the rules](#endpoint-magnitude).
+
+### Comparison with NONMEM
+
+The equivalent NONMEM `$ERROR` block selects the residual error with `IF`:
+
+``` fortran
+IF (FREE.EQ.0) THEN
+   Y = IPRED*(1 + EPS(1))     ; total: PROP_ERR_TOTAL = SD of EPS(1)
+ELSE
+   Y = IPRED*(1 + EPS(2))     ; unbound: PROP_ERR_UNBOUND = SD of EPS(2)
+ENDIF
+```
+
+ferx’s `if (FREE == 0) { DV ~ proportional(PROP_ERR_TOTAL) } else { DV ~ proportional(PROP_ERR_UNBOUND) }` produces the same per-row residual variance `(IPRED·σ)²` with `σ` selected by `FREE`, and the same joint FOCEI objective — no synthetic `CMT` recoding required on either side.
+
+## Sigma scale
+
+**All sigma parameters are estimated and reported on the standard-deviation scale**, not the variance scale. This is true for both proportional and additive components, and for both elements of a combined error model.
+
+In particular:
+
+| Error model | Initial value `sigma = X` means … |
+|----|----|
+| `proportional` | The residual SD scales as `X · f`, i.e. **CV% = `X · 100`** |
+| `additive` | The residual SD is `X` in the units of `DV` (no CV interpretation) |
+| `combined` | First sigma is proportional (CV-style), second is additive (units of `DV`) |
+
+So `sigma PROP_ERR ~ 0.1` for a proportional model is a **10% CV** initial value, not 1%. Likewise, the SE on a proportional sigma is on the SD scale — multiply by 100 for an SE in CV-percentage points.
+
+The fitted YAML emits both the SD (`estimate`) and the variance (`variance: estimate²`); for proportional components it also emits `cv_pct = estimate · 100` so downstream tooling does not have to re-derive it.
+
+## Examples
+
+Proportional error (most common):
+
+    [parameters]
+      sigma PROP_ERR ~ 0.01
+
+    [error_model]
+      DV ~ proportional(PROP_ERR)
+
+Additive error:
+
+    [parameters]
+      sigma ADD_ERR ~ 1.0
+
+    [error_model]
+      DV ~ additive(ADD_ERR)
+
+Combined error:
+
+    [parameters]
+      sigma PROP_ERR ~ 0.1
+      sigma ADD_ERR  ~ 0.5
+
+    [error_model]
+      DV ~ combined(PROP_ERR, ADD_ERR)
+
+Correlated combined error (here with the whole block held fixed — drop `FIX` to estimate the correlation, see [Fixed vs. estimated `block_sigma`](#fixed-vs-estimated-block-sigma)):
+
+    [parameters]
+      block_sigma (PROP_ERR, ADD_ERR) = [0.04, 0.10, 1.00] FIX
+
+    [error_model]
+      DV ~ combined(PROP_ERR, ADD_ERR)
+
+`block_sigma` uses NONMEM-style lower-triangle covariance values: `[Var(PROP_ERR), Cov(PROP_ERR, ADD_ERR), Var(ADD_ERR)]`. Diagonal entries initialize the named sigma SDs (`sqrt(variance)`) and the off-diagonal entries define fixed residual correlations. For the example above, `PROP_ERR = 0.2`, `ADD_ERR = 1.0`, and `Corr(PROP_ERR, ADD_ERR) = 0.5`, so the residual variance for a combined-error observation is:
+
+$$V = (f \sigma_\mathrm{prop})^2 + \sigma_\mathrm{add}^2
+    + 2 f \rho \sigma_\mathrm{prop}\sigma_\mathrm{add}$$
+
+Like `block_omega`, a `block_sigma` is **variance-only**: a scale tag (`(sd)`, `(variance)` or `(var)`) on the declaration is rejected with `E_BLOCK_VARIANCE_ONLY`, since the lower triangle mixes variances and covariances and one tag cannot say which entry is on which scale. The diagonal entries are variances however you write them — ferx takes their square roots to initialize the sigma SDs. Before 0.4.0 the tag was accepted and then dropped in silence.
+
+### Fixed vs. estimated `block_sigma`
+
+A plain `block_sigma (...) = [...]` **estimates** both the diagonal sigma SDs and the off-diagonal correlation, matching NONMEM `$SIGMA BLOCK(n)`. Appending `FIX` holds the whole block — SDs and correlation alike — at its declared value:
+
+    [parameters]
+      # rho is estimated (NONMEM $SIGMA BLOCK semantics)
+      block_sigma (PROP_ERR, ADD_ERR) = [0.04, 0.10, 1.00]
+
+      # rho is held at 0.5, and both SDs at 0.2 / 1.0
+      block_sigma (PROP_ERR, ADD_ERR) = [0.04, 0.10, 1.00] FIX
+
+An estimated correlation is optimized as its Fisher-z transform `z = atanh(rho)`, bounded at `|z| <= 3`, i.e. `|rho| <= 0.995`. Strict positive-definiteness is not a strong enough bound: a paired residual block’s determinant carries a factor `1 - rho^2`, so a rho merely *inside* `(-1, 1)` can still leave `R` numerically singular and let the likelihood chase `log|R|` downwards. At `|rho| = 0.995` that factor is about `0.01`, which keeps `R` invertible in floating point. A fit that reports rho sitting on this rail is telling you the two endpoints are carrying the same noise — treat it as a diagnostic, not an estimate.
+
+**The rail applies to an estimate, not to a declaration.** A `FIX`ed correlation is held exactly, at every `|rho| < 1` the parser accepts — right up to the unit boundary, where `atanh` stops being finite — and is never moved onto the `0.995` rail. That is the whole difference between the two spellings: a rail is an argument about what the optimizer may *search*, and `FIX` is not a search. An initial estimate for a **free** rho that is itself past the rail is clamped onto it before the first objective evaluation, and ferx says so (`W_INIT_NOT_REPRESENTABLE`); if the value you wrote is an assertion rather than a starting point, write `FIX`.
+
+> **WARNING:**
+>
+> Before this change the rail was applied to a `FIX`ed correlation too, so every declared `|rho|` above `0.995055` silently collapsed onto that one number and the fit scored a covariance the model file never wrote. Nothing reported it: the optimizer box for a `FIX`ed coordinate is pinned to the value the packer produced, so the start read as perfectly in-box. Measured on the `$SIGMA BLOCK(2) FIX` anchor `nonmem_anchor/correlated_residual_rho999.ctl` (everything fixed, `rho = -0.999`): NONMEM 442.272, ferx 442.138 now, and 301.451 before — a 140.8 OFV error. If you have a fitted model with a `FIX`ed `block_sigma` above `|rho| = 0.995`, its old objective and estimates were computed at `0.995055` and need re-running.
+
+The reported standard error is on the natural `rho` scale, via the delta method: `SE(rho) = SE(z) * (1 - rho^2)`.
+
+A zero off-diagonal in a non-`FIX` block still declares an estimated correlation, so `block_sigma (A, B) = [0.04, 0.0, 1.0]` — the natural translation of a NONMEM `$SIGMA BLOCK(2)` with a zero covariance init — starts at `rho = 0` and is free to move. Adding `FIX` to a zero off-diagonal drops it, since a fixed zero correlation is the same object as no correlation.
+
+> **WARNING:**
+>
+> Before this change every `block_sigma` off-diagonal was held fixed regardless of `FIX`, while the diagonal SDs were estimated. That combination is no longer expressible — NONMEM has no form for it either, and it is exactly the mismatch this change removes. Adding `FIX` to an existing bare `block_sigma` reproduces the old *correlation*, but it also pins the SDs the old form estimated, so it is not a drop-in way to reproduce an old fit’s numbers. Re-run and compare instead.
+
+### Which sigmas a `block_sigma` may correlate
+
+A nonzero `block_sigma` covariance can connect sigmas that co-load on the same `combined(...)` endpoint, or sigmas used by different endpoints measured at the same subject time and occasion — whether those endpoints are selected by the CMT column (per-CMT) or by a covariate `if/else` selector (#669). In the cross-endpoint case ferx builds a subject-level residual covariance matrix, so paired rows such as total/unbound assays receive the NONMEM-style covariance term `f_total * f_unbound * Cov(EPS_total, EPS_unbound)`.
+
+### Estimator and feature scope
+
+Current scope: `block_sigma` is supported for the Gaussian `method = foce`, `method = focei`, `method = saem`, and `method = imp` fits. The Gauss-Newton optimizers (`gn` / `gn_hybrid`), M3 censored-observation likelihoods, FREM covariate pseudo-observations and TTE endpoints reject correlated residual sigma blocks until their residual-error derivative code is extended beyond diagonal RUV.
+
+**With `iiv_on_ruv`**, the random effect scales the subject’s whole `R`, so the correlation is unchanged. See [IIV on residual error](#iiv-on-residual-error-iiv_on_ruv).
+
+**With IOV** (`kappa`), `block_sigma` is fitted by `method = foce` and `method = focei` (single node, `n_agq = 1`) only (#979). The IOV marginal linearizes over the stacked `[η, κ]` system, `R̃ = H Σ_b Hᵀ + R`, with `R` the dense residual covariance at the correlation the outer loop is proposing, and each subject’s EBE search scores the same dense `R`. Both loops keep their exact analytic gradients. The other estimators’ IOV objectives score each row on its own, so `saem`, `imp`, `laplace`, `vi` and `n_agq > 1` refuse the combination with `E_BLOCK_SIGMA_IOV_UNSUPPORTED`. A two-endpoint total/unbound model with a κ on CL matches NONMEM’s FOCEI objective to 5e-8 and its η̂/κ̂ to 2e-7 (`nonmem_anchor/block_sigma_iov.*`).
+
+SDE/EKF process-noise models carry the correlation under `method = foce` / `method = focei` (the EKF variance is added to the dense `R`) but are rejected under `method = saem`, whose M-step data term does not yet include the process-noise inflation.
+
+Under `method = laplace` (and `focei` with `n_agq > 1`) the AGQ score covers every block, an estimated ρ included, so the exact outer gradient is kept.
+
+An **estimated** correlation additionally restricts method *chains*. Only `foce`, `focei` and `laplace` move the off-diagonal; the other supported estimators read it from the model declaration. Because each chain stage starts from the previous stage’s estimates, a chain that runs `foce`/`focei` **before** a non-estimating stage would leave that stage scoring the declared correlation while the fit reported the estimated one, so it is rejected with `E_BLOCK_SIGMA_CHAIN_UNSUPPORTED`. `method = [saem, focei]` is fine (the correlation has not moved when SAEM runs); `method = [focei, imp]` and `method = [laplace, imp]` are not, unless the block carries `FIX`.
+
+`simulate()` draws the full residual vector for each subject’s paired observations (same subject time and occasion) from the dense covariance `R` built by `compute_r_matrix_with_correlations` — the same matrix FOCE/FOCEI/SAEM/ `imp` evaluate the likelihood against — so a fixed `block_sigma` off-diagonal is reproduced in simulated total/unbound (or cross-branch, for a covariate-selected model) rows, and a VPC or posterior-predictive check of the correlated endpoints recovers the specified correlation (#672). FREM covariate pseudo-observations are excluded from the correlated draw (mirroring the identical exclusion in the likelihood) and stay independent.
+
+### Reporting a fitted `block_sigma`
+
+The fitted correlations are carried on `FitResult.residual_correlations`, their `FIX` flags on `FitResult.residual_correlation_fixed`, and their standard errors on `FitResult.se_residual_correlations`, so the residual covariance a fit actually used remains available without re-reading the model source. The human-readable fit YAML also emits a `block_sigma` section with each named pair’s covariance, correlation, and correlation SE:
+
+``` yaml
+block_sigma:
+  ADD_ERR__PROP_ERR:
+    covariance: 0.186600
+    covariance_fixed: false
+    correlation: 0.933000
+    correlation_fixed: false
+    correlation_se: 0.021400
+```
+
+`covariance` is the **sigma-scale** covariance `rho * sigma_i * sigma_j`, the same quantity NONMEM prints for a `$SIGMA BLOCK` — not an entry of a subject’s residual covariance matrix `R`. Each observation applies its own sigma loadings first, so the `R` term is `c_j * c_k * rho * sigma_i * sigma_j` with `c = 1` for an additive component and `c = f` (the individual prediction) for a proportional one — the `f_total * f_unbound * Cov(EPS_total, EPS_unbound)` form above. `correlation_fixed` is `true` only for a `FIX`ed block; `covariance_fixed` is `true` only when the correlation **and** both sigma SDs in the pair are fixed, since a free value in any of the three factors moves the covariance during estimation. `correlation_se` is `~` for a fixed correlation and for a fit whose covariance step did not run.
+
+### The interaction correction under a correlated `R`
+
+Under `method = focei` the off-diagonal covariance enters the interaction correction as well as the data term: the Almquist 2015 conditional Hessian becomes `H̃ = HᵀR⁻¹H + ½·B + Ω⁻¹` with `B_{kl} = tr(R⁻¹ ∂R/∂η_k R⁻¹ ∂R/∂η_l)` over the full dense residual covariance `R` (it reduces to the diagonal FOCEI `a'diag(1/R)a + ½c̃'c̃` when the correlation is zero). Under `method = imp` the importance weights already use the dense `R`; the Student-t proposal precision is also built from `R⁻¹` so the correlated posterior shape is sampled efficiently.
+
+Both loops of a `foce` / `focei` correlated fit run **exact analytic gradients** (no finite differences): the within-observation cross term is carried through the same dense-`R` derivative kernels the objective uses (`compute_dr_df_matrices`, `compute_d2r_df2_matrices`), so the inner EBE η-gradient and the outer θ/Ω/σ gradient are noise-free and the `auto` optimizer resolves to a gradient-based method. The OFV is unchanged (Eval 1 on the anchor below is still 18.722087). When the correlation couples the σ-loadings *within* one observation, `R` stays diagonal and the dense assembly reduces to the scalar contractions fed correlation-aware `(R, ∂R/∂f, ∂²R/∂f²)`; a cross-endpoint off-diagonal `R` (a per-CMT / Form-C readout) takes the dense kernel and is exact as well — a two-endpoint `[odes]` fit with a `block_sigma` across the endpoints reports `gradient: analytic` and no finite-difference subject.
+
+Validation: `examples/correlated_residual_combined.ferx` and `nonmem_anchor/correlated_residual_combined.ctl` run the same fixed-parameter one-compartment IV model with `$SIGMA BLOCK(2) FIX`. On `data/correlated_residual_combined.csv`, NONMEM 7.5.1 (`METHOD=1 MAXEVAL=0`) reports OFV 18.715849 and ferx FOCE reports OFV 18.727365 (difference 0.0115). Adding `INTER` to that control file (`METHOD=1 INTER MAXEVAL=0`) reports OFV 18.722087, and ferx `method = focei` reports OFV 18.722087 — agreement to better than 1e-5, since the FOCEI Laplace marginal evaluates `R` at the conditional mode η̂ exactly as NONMEM’s INTER does (no Sheiner–Beal linearization point to disagree on).
+
+The SAEM path reuses the same dense residual-covariance likelihood (`dense_residual_data_term`) for its E-step Metropolis acceptance and its theta/sigma M-step objective. Its reported OFV (the FOCE-approximation `2·pop_nll` used for AIC/BIC comparability) now follows the `interaction` flag exactly like FOCE/FOCEI: with interaction on (the default) it reports the dense **interaction** marginal — ferx SAEM OFV 18.7221, matching ferx FOCEI and NONMEM `METHOD=1 INTER` — and with `interaction = false` it reports the non-interaction marginal (18.7274, matching ferx FOCE). Previously SAEM always fell back to the non-interaction marginal for correlated models regardless of the flag; the correlation itself was, and is, carried in both cases. As a marginal-likelihood sanity check, NONMEM’s importance-sampling −2LL at these reference parameters (`METHOD=IMP EONLY=1`, 30 000 samples) is 18.68; dropping the off-diagonal covariance (a diagonal `$SIGMA`) lowers all engines to ≈14.62, so the ≈4-OFV gap is the cross-endpoint correlation being correctly accounted for.
+
+## IIV on residual error (`iiv_on_ruv`)
+
+NONMEM models often place an **inter-individual random scaling on the residual error** — each subject gets a log-normally scaled residual SD:
+
+    Y = IPRED + EPS(1) * EXP(ETA(4))     ; $OMEGA <var>   ; IIV on RUV
+
+ferx supports this with an `iiv_on_ruv` line in `[error_model]`. Declare the random effect as an ordinary `omega` (it is **not** referenced by any individual parameter), then name it:
+
+    [parameters]
+      ...
+      omega ETA_RUV ~ 0.05      # IIV on residual error
+
+      sigma PROP_ERR ~ 0.1 (sd)
+
+    [error_model]
+      DV ~ proportional(PROP_ERR)
+      iiv_on_ruv = ETA_RUV
+
+The per-subject residual **variance** of every observation is multiplied by `exp(2 · ETA_RUV_i)` — equivalently, the residual SD is scaled by `exp(ETA_RUV_i)`. This applies uniformly to additive, proportional, and combined error (it scales the whole variance), matching `EPS * EXP(ETA)` for the common single-EPS case. The extra random effect is reported like any other omega (`ETA_RUV` appears in the omega matrix and eta names).
+
+Notes and constraints:
+
+- **Requires an interaction or Monte-Carlo method**: use `method = focei`, `imp`, `impmap`, or `saem`. `Y = IPRED + EPS*EXP(ETA)` makes the residual variance η-dependent, so non-interaction FOCE cannot represent it — ferx rejects that combination with a clear error.
+- The named eta must be a dedicated `omega` not shared with a structural individual parameter.
+- Not supported with per-CMT (multi-endpoint) error models. An `if/else` [selected error model](#covariate-selected-error-models-ifelse) takes it: the line sits after the closing `}` and scales every branch. Inside a branch it is refused, since one branch cannot be scaled on its own.
+- **With a correlated residual.** `iiv_on_ruv` composes with `block_sigma` and with a [`correlation` line](../model-file/residual-correlation.llms.md#with-iiv-on-the-residual). The random effect scales the subject’s whole `R`, so the correlation is unchanged: `R_i(η) = exp(2·ETA_RUV_i)·R_i(η = 0)`. Each correlation keeps its own estimators, less any non-interaction stage: `block_sigma` under `focei`, `saem`, `imp`, `laplace` and `vi`, and a `correlation` line under `focei`. The objective, the EBEs and CWRES match NONMEM at `MAXEVAL=0` (`nonmem_anchor/iiv_ruv_dense/`).
+- **Exact analytic FOCE/FOCEI gradient.** For analytical 1-/2-/3-cpt, **ODE (`[odes]`)**, and **LTBS (`log_additive`)** models, `iiv_on_ruv` fits use the exact outer θ/Ω/σ gradient — the residual-eta enters through the variance scale `exp(2·ETA_RUV)`, contributing the Almquist interaction column to `H̃` and the matching `∂NLL/∂η_ruv = Σ(1−ε²/v)` data term. The inner EBE gradient is analytic too, LTBS included. Since \#2093 IOV and M3-BLOQ `iiv_on_ruv` models are exact too: the adjoint serves their outer gradient, and their inner gradient is the analytic stacked one (pinned against FD, M3 × IOV × `iiv_on_ruv` included).
+
+**Identifiability.** A residual-error random effect is a *variance-of-variance* term and is only weakly identified when the data carry little per-subject residual-scale signal (few observations per subject, or a small true variance). In that regime the marginal correctly shrinks the estimate toward zero. Strong or well-sampled signals are recovered well. When the FOCEI estimate looks collapsed, prefer the Monte-Carlo estimators (`imp` / `impmap` / `saem`), which do not rely on the Laplace approximation.
+
+See `examples/iiv_on_ruv.ferx`.
+
+## Impact on Estimation
+
+The error model affects: - **Individual weighted residuals (IWRES)**: `(DV - IPRED) / sqrt(Var)` — with `iiv_on_ruv`, `Var` includes the per-subject `exp(2·ETA_RUV)` scale at the EBE. - **Conditional weighted residuals (CWRES)**: Accounts for uncertainty in random effect estimates - **Objective function value (OFV)**: The likelihood includes `log(Var)` terms, so the error model structure directly influences parameter estimates

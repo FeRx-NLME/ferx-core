@@ -1,0 +1,138 @@
+# FREM (Full Random Effects Model)
+
+FREM (Karlsson 2012) is a covariate analysis method that treats covariates as additional dependent variables, estimating covariate-parameter relationships through an extended omega matrix rather than explicit covariate models.
+
+## Specifying covariates
+
+The covariates folded into the FREM model — and whether each is **continuous** or **categorical** — are taken from the model’s [`[covariates]`](../model-file/covariates.llms.md) block. That block is the single source of truth and is **required**: the transformation uses every covariate it declares.
+
+``` text
+[covariates]
+  WT  continuous
+  AGE continuous
+  SEX categorical
+```
+
+If you don’t want *every* declared covariate in the FREM model, pass a **subset filter** (the `covariates` argument): only the named covariates are included, and each must be declared in the block. The filter never introduces covariates the model hasn’t declared, nor changes their kind.
+
+## How it works
+
+1.  **Data augmentation**: For each subject, pseudo-observation rows are added with `DV` set to the subject’s covariate value and a `FREMTYPE` column distinguishing covariate rows from PK observations.
+
+2.  **Model extension**: The base omega is expanded to a full block covering both PK random effects and covariate random effects. Covariate thetas are fixed at the population mean, and a small covariate sigma (`EPSCOV`) is added.
+
+3.  **Estimation**: The model is fit normally (FOCEI or SAEM). The off-diagonal blocks of the extended omega capture PK-covariate correlations.
+
+## Usage (Rust API)
+
+``` rust
+use ferx_core::prepare_frem;
+
+let result = prepare_frem(
+    &base_model_path,
+    &data_path,
+    &[],   // empty filter → use every covariate from the model's [covariates] block
+    None,  // categorical override (None → kinds come from the [covariates] block)
+    None,  // default output model path
+    None,  // default output data path
+    None,  // missing value indicator (default: -99)
+    None,  // no prior fit: keep the base model's declared inits
+)?;
+
+// Pass e.g. &["WT".into()] instead of &[] to FREM only a subset of the
+// declared covariates.
+
+// result.model_path  — generated FREM .ferx file
+// result.data_path   — augmented CSV with FREMTYPE column
+// result.n_total_etas — base etas + covariate etas
+```
+
+## Usage (R)
+
+``` r
+library(ferx)
+
+# Covariates (and their continuous/categorical kind) come from the model's
+# [covariates] block; omit `covariates` to use all of them.
+frem <- ferx_model_to_frem(
+  model      = "warfarin.ferx",
+  data       = "warfarin_cov.csv",
+  output_dir = file.path(tempdir(), "frem")  # default: next to the model file
+)
+# `output_dir` needs ferx-r from `main` (after 0.3.0). Release 0.3.0 creates the
+# directory and then writes next to the model anyway, unless `output_model` and
+# `output_data` are both given.
+
+# Or filter to a subset of the declared covariates:
+# frem <- ferx_model_to_frem("warfarin.ferx", "warfarin_cov.csv",
+#                            covariates = "WT",
+#                            output_dir = file.path(tempdir(), "frem"))
+
+fit <- ferx_fit(frem, method = "saem")   # frem is a ferx_model
+```
+
+## Interpreting results
+
+- **Covariate omega diagonals** should approximate the sample variance of each covariate (since the covariate thetas are fixed at the sample mean).
+- **Off-diagonal elements** (or correlations) between PK etas and covariate etas reveal covariate-parameter associations.
+- A positive correlation between ETA_CL and ETA_WT, for example, indicates that subjects with higher weight tend to have higher clearance.
+
+## Estimation method choice
+
+- **SAEM** is recommended for FREM models with many covariates, as the large block omega can cause convergence difficulties with gradient-based methods.
+- **IMPMAP** with `impmap_mceta` is a strong alternative to SAEM for FREM. The multi-start MAP (`impmap_mceta = 3`) helps the per-subject mode search escape local optima in the high-dimensional random-effect space. On larger FREM models (many covariates / ETAs) where the MAP surface has multiple modes, MCETA can dramatically improve importance-sampling efficiency and OFV.
+- **FOCEI** works well for smaller FREM models (2-3 covariates) but can struggle with large block omegas.
+
+### Warfarin FREM comparison (5 ETAs: 3 PK + WT + AGE, 10 subjects)
+
+All methods use default tuning (SAEM: 500+800 iters; IMPMAP: 200 iters, K=300). Covariate omega diagonals should approximate sample variances (WT: 111.6, AGE: 99.4). OFV is the FOCE-Laplace objective.
+
+| Parameter |  FOCEI |   SAEM | IMPMAP | IMPMAP+MCETA3 |
+|-----------|-------:|-------:|-------:|--------------:|
+| OFV       | -177.3 | -220.7 | -220.3 |        -220.7 |
+| TVCL      |  0.133 |  0.133 |  0.133 |         0.133 |
+| TVV       |   7.73 |   7.74 |   7.74 |          7.74 |
+| TVKA      |  0.791 |  0.811 |  0.811 |         0.811 |
+| ω²(CL)    |  0.026 |  0.029 |  0.029 |         0.029 |
+| ω²(V)     |  0.012 |  0.010 |  0.010 |         0.010 |
+| ω²(KA)    |  0.351 |  0.336 |  0.336 |         0.336 |
+| ω²(WT)    |  135.1 |  106.8 |  106.8 |         106.8 |
+| ω²(AGE)   |   95.1 |   93.8 |   93.8 |          93.8 |
+| σ (PROP)  | 0.0106 | 0.0105 | 0.0111 |        0.0106 |
+
+FOCEI is ~43 OFV units worse and overestimates the covariate variances, while SAEM, IMPMAP, and IMPMAP+MCETA3 all agree closely. On this small model (5 ETAs) the MCETA benefit is modest (~0.4 OFV); on larger FREM models with many covariates the improvement can be dramatic.
+
+> **NOTE:**
+>
+> Two fixes landed on the FOCEI arm of this fixture. Its Nelder–Mead inner-loop restart used to reset a FREM covariate eta to zero, tens of units from where its pseudo-observation pins it, and the reported OFV used to be read off a **cold** EBE re-solve rather than the one the optimizer minimised ([\#1349](https://github.com/FeRx-NLME/ferx-core/issues/1349), [\#833](https://github.com/FeRx-NLME/ferx-core/issues/833)). Re-measured 2026-09-13 on the fix, the Linux arm reaches **OFV −220.7** — the same value SAEM and IMPMAP reach above — while the macOS arm lands at **−174.9** in a different basin, with ω²(V) and ω²(KA) inflated. That remaining platform split is [\#990](https://github.com/FeRx-NLME/ferx-core/issues/990); the FOCEI row above predates both fixes and is kept as the historical measurement rather than half-updated.
+
+## IIV on residual error (`iiv_on_ruv`)
+
+### The residual-error eta stays out of the covariate block
+
+An `iiv_on_ruv` eta scales the residual SD. It is not a structural parameter, so covariates do not explain it. `prepare_frem()` therefore emits it as its own diagonal `omega` outside the FREM `block_omega`. It keeps a `FIX` and a prior fit’s value. This is the structure NONMEM / PsN FREM use (a separate `$OMEGA` for the IIV-on-RUV eta). Before [\#904](https://github.com/FeRx-NLME/ferx-core/issues/904) the generator put it inside the block, with a nonzero starting covariance to every covariate eta. If the base model declares it in a block with a PK eta (`block_omega (ETA_CL, ETA_RUV)`), it stays in the block so that covariance stays estimable, but it starts with no covariate cross-terms. That rule follows the declaration, not the number: a block covariance initialised (or fitted) at exactly 0 still keeps the eta in the block.
+
+On the 475-subject, 8-covariate workshop reprex of \#904, the old layout is a superset model. It has 11 extra covariances, which estimate to small values (\|ρ\| ≤ 0.22). Under SAEM it scores 6851.2 ± 0.8 importance-sampled −2 log L, against 6866.6 ± 1.2 for the split layout. A 15-unit drop for 11 parameters is not significant (χ²₁₁, p ≈ 0.17). The change is a structural match to NONMEM, not a fix for the σ × ω_RUV runaway; that fix is [η_RUV re-centring](../estimation/saem.llms.md#iiv-on-residual-error-iiv_on_ruv-σ-ω_ruv-ridge).
+
+### Which estimator
+
+Measured on the \#904 reprex (split layout, σ started 5.5× low at 0.032), Linux, 2026-10-16. In the two FOCEI rows the zero covariate–covariate covariances are 1e-4 in both engines, because NONMEM refuses a zero inside a non-band `BLOCK`.
+
+| Estimator | ω_RUV | σ | objective |
+|----|---:|---:|----|
+| ferx SAEM (`n_exploration = n_convergence = 1000`, `n_mh_steps = 50`) | 0.269 | 0.174 | IS −2 log L 6866.6 ± 1.2 (K = 20000) |
+| NONMEM 7.6 IMP `EONLY=1` at the ferx SAEM estimates (`ISAMPLE=20000`) | 0.269 | 0.174 | 6869.7 (mean of iterations 2–6, sd 1.2) |
+| NONMEM IMP, as reported in \#904 (`run6_imp`) | 0.279 | 0.177 | 6852 |
+| ferx FOCEI | 0.298 | 0.032 | 12039.4523, never leaves the start |
+| NONMEM 7.6 FOCEI, same start | 0.298 | 0.032 | 12039.4523, `MINIMIZATION TERMINATED` at the start |
+
+Scored at the same point, the two engines’ importance-sampled objectives agree to about 3 units. ferx integrates the FREM covariate etas out analytically (`frem_rao_blackwell`) and NONMEM samples them, so the two estimators are not identical.
+
+Use **SAEM** (or IMPMAP), and compare fits by the importance-sampled objective (`imp_eval_only = true`, `imp_samples = 20000`). The FOCE objective is not a reliable ranking tool for `iiv_on_ruv` (see [SAEM](../estimation/saem.llms.md#the-focei-objective-cannot-rank-iiv_on_ruv-fits)). **FOCEI** fails on this model in NONMEM too: both engines report the same objective at the start to every printed digit, and neither moves from it. On the same data without the covariate rows, FOCEI estimates ω_RUV = 0.058 in ferx and 0.062 in NONMEM, against ≈ 0.28 from SAEM / IMP. At the start the two objectives agree to every printed digit (549.7913), and ferx’s optimum is 23 units lower than NONMEM’s. Both engines underestimate ω_RUV, so that is a property of the FOCE approximation, not of ferx. Standalone `method = imp` on large FREM models is tracked in [\#1365](https://github.com/FeRx-NLME/ferx-core/issues/1365).
+
+## Limitations
+
+- Categorical covariates are binarized (one-hot encoded) before the FREM transformation.
+- FREM is defined for Gaussian endpoints only. A model with a non-Gaussian endpoint (`[event_model]`, `[binary_model]`, a Markov block) is refused by `prepare_frem()` / `transform_dataset_for_frem()` with `E_FREM_NON_GAUSSIAN_ENDPOINT`: the transformed dataset is written from the Gaussian rows only, so the endpoint’s rows would be lost. Run the FREM step on the PK model without that block ([\#1199](https://github.com/FeRx-NLME/ferx-core/issues/1199)).
+- The `prepare_frem()` API handles the full transformation; manual FREM model construction is not recommended.
+- **Simulation.** A FREM model links its covariates to the PK only through the correlations in Ω; no individual parameter reads them. `simulate()` and its variants, `simulate_with_uncertainty()` and an adaptive simulation without supplied η all draw each subject’s whole η from Ω, covariate η included. So each simulated subject’s PK follows a drawn covariate value, not the one in its data rows, and its `FREMTYPE` rows report that drawn value. The population marginals are right; the association between a subject’s covariates and its PK is not. The `_diag` entry points and adaptive results report this as `W_FREM_DRAWN_ETA` ([\#2245](https://github.com/FeRx-NLME/ferx-core/issues/2245)). Two routes keep the association: supply the FREM fit’s EBEs as `SuppliedEtas` to an adaptive simulation (exact, for the fitted subjects only; see [Supplied individual values](../model-file/adaptive-dosing.llms.md#supplied-individual-values)), or set `SimulateOptions::match_method` on `simulate_with_options()`, which reassigns the drawn η by matching them to each subject’s posthoc η (approximate). A draw conditional on each subject’s covariate values is not implemented yet.

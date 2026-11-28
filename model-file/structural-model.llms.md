@@ -1,0 +1,215 @@
+# Structural Model
+
+> **Maturity: stable** — see [Feature Maturity](../maturity.llms.md) for what this means.
+
+The `[structural_model]` block specifies the pharmacokinetic model used to generate predictions.
+
+## Analytical PK Models
+
+For standard compartmental models, use the `pk` keyword with a model function:
+
+    pk MODEL_NAME(param=VALUE, param=VALUE, ...)
+
+Each `VALUE` is either a parameter defined in `[individual_parameters]`, a numeric constant (e.g. `ka=1.0` fixes absorption at 1.0), or the event-time built-in `TIME`/`time`. Referencing any other undefined name is a parse error — ferx does not silently default the slot to 0.0 (which previously produced a “converged” but structurally broken fit, \#261). An unrecognized `param` key (e.g. the typo `clx=`) is likewise rejected.
+
+### Available Models
+
+| Model Function | Compartments | Route | Required Parameters |
+|----|----|----|----|
+| `one_cpt_iv` | 1 | IV (bolus and/or infusion) | `cl`, `v` |
+| `one_cpt_oral` | 1 | Oral | `cl`, `v`, `ka` |
+| `one_cpt_transit` | 1 | Oral (Savic transit, analytic closed form) | `cl`, `v`, `n`, `mtt` |
+| `one_cpt_ig` | 1 | Oral (inverse-Gaussian, analytic closed form) | `cl`, `v`, `mat`, `cv2` |
+| `two_cpt_iv` | 2 | IV (bolus and/or infusion) | `cl`, `v1`, `q`, `v2` |
+| `two_cpt_oral` | 2 | Oral | `cl`, `v1`, `q`, `v2`, `ka` |
+| `two_cpt_transit` | 2 | Oral (Savic transit, analytic closed form) | `cl`, `v1`, `q`, `v2`, `n`, `mtt` |
+| `two_cpt_ig` | 2 | Oral (inverse-Gaussian, analytic closed form) | `cl`, `v1`, `q`, `v2`, `mat`, `cv2` |
+| `three_cpt_iv` | 3 | IV (bolus and/or infusion) | `cl`, `v1`, `q2`, `v2`, `q3`, `v3` |
+| `three_cpt_oral` | 3 | Oral | `cl`, `v1`, `q2`, `v2`, `q3`, `v3`, `ka` |
+
+Each model has a `*_compartment_*` long-form alias (e.g. `three_compartment_iv`); the short and long names are interchangeable.
+
+Every parameter in the **Required Parameters** column must be mapped on the `pk(...)` line. Omitting one is a parse error (issue \#309) — ferx will **not** silently default the missing slot to `0.0`, which would otherwise yield a structurally broken fit (e.g. a missing `ka` means no absorption, so every prediction floors to the log constant). Bioavailability `f` and `lagtime` (alias `alag`) are optional and default to `1.0` and `0.0` respectively.
+
+Three role keys are pairs of spellings for one slot: `v`/`v1` (central volume), `q`/`q2` (inter-compartmental clearance), and `lagtime`/`alag` (absorption lag). Mapping **both** spellings to different values — `pk one_cpt_iv(cl=CL, v=VA, v1=VB)` — is a parse error (issue \#1048): only one of the two would ever reach the engine, and the model would fit and return a prediction off by the ratio of the two values with no warning. Both spellings bound to the same value is redundant but accepted.
+
+The converse — one variable mapped to two **different** roles, `pk one_cpt_oral(cl=CL, v=V, ka=KA, f=X, lagtime=X)` — is also a parse error (issue \#1359), and it applies to **every** pair of roles, not only `f`/`lagtime`: `pk three_cpt_iv(..., q=Q, q3=Q)` or `v2=VP, v3=VP` is rejected the same way. Both slots are written, but the model’s per-parameter slot table can hold only one role per variable, so which one it recorded depended on hash order — for `f`/`lagtime` that chose the lag-aware or lag-free code path differently between two runs of the same file, and for any pair the second role was invisible to everything that reads the table (including the closed-form η-derivative fallback). Give each role its own variable (`F = X` and `LAGTIME = X` in `[individual_parameters]`, then `f=F, lagtime=LAGTIME`; `Q3 = Q`, then `q3=Q3`).
+
+Conversely, mapping a parameter the chosen model does **not** use — e.g. `ka` on an IV model (no absorption), or `q`/`v2` on a one-compartment model — is accepted but emits a parse warning, since the mapping has no effect. `lagtime` and `f` (bioavailability) are never flagged: every model applies both to the dose — `lagtime` shifts the dose time, and `f` scales the bioavailable amount for IV bolus, infusion, and oral routes alike (#327).
+
+In the other direction, an individual parameter that is **declared but never used** — neither mapped into the `pk(...)` line nor referenced in any other block — is also flagged, since it is computed but has no effect. The common case is declaring `F` to estimate bioavailability but forgetting to add `f=F` to the `pk(...)` line: analytical models bind `F` (and `lagtime`) only through an explicit `f=`/`lagtime=` mapping. Such a declaration is inert in every respect: it is not applied to the dose, and it does not move the model onto the lag-aware or bioavailability-aware code paths either (#1359).
+
+There is no separate bolus or infusion variant: every IV model selects the closed form per dose from the `RATE` column (`RATE=0` ⇒ bolus, `RATE>0` ⇒ infusion). A single subject can mix the two. This matches NONMEM, nlmixr2, and Monolix.
+
+The earlier `*_iv_bolus` and `*_infusion` model names were retired in \#176. The parser now rejects them with a migration message pointing at the unified `*_iv` name.
+
+### Examples
+
+One-compartment oral:
+
+    [structural_model]
+      pk one_cpt_oral(cl=CL, v=V, ka=KA)
+
+Two-compartment IV (bolus, infusion, or a mix — driven by RATE):
+
+    [structural_model]
+      pk two_cpt_iv(cl=CL, v1=V1, q=Q, v2=V2)
+
+Two-compartment oral:
+
+    [structural_model]
+      pk two_cpt_oral(cl=CL, v1=V1, q=Q, v2=V2, ka=KA)
+
+Three-compartment IV (note that `q2`/`q3` and `v2`/`v3` distinguish the two peripheral compartments):
+
+    [structural_model]
+      pk three_cpt_iv(cl=CL, v1=V1, q2=Q2, v2=V2, q3=Q3, v3=V3)
+
+Direct event-time mappings are accepted when the `pk(...)` grammar only needs a single value:
+
+    [structural_model]
+      pk one_cpt_iv(cl=CL, v=time)
+
+For more complex time-dependent relationships, define the expression in `[individual_parameters]` and map the resulting parameter name here.
+
+### Bioavailability
+
+Bioavailability (F) defaults to 1.0. To estimate it, define an `F` parameter in `[individual_parameters]` and map it on the `pk(...)` line with `f=F`. It scales the bioavailable amount on **every** route — oral depot absorption, IV bolus (`F · AMT`), and infusion (`F · RATE`, with the duration preserved) — matching NONMEM’s `F1`. Before \#327 the analytical path applied `F` only to oral depot doses, silently dropping it on IV bolus and infusion; it now applies on all routes.
+
+This applies to [ODE models](../model-file/ode-models.llms.md) too: an `F` parameter is applied when the dose enters the compartment (`F · AMT`), matching NONMEM and the analytical PK functions. Do not also multiply by `F` in the ODE right-hand side.
+
+### Lagtime
+
+All `pk` models accept an optional `lagtime=` parameter (or its NONMEM-style alias `alag=`) that delays the effective start of every dose record by the parameter’s value. Defaults to `0.0` when omitted, so existing models behave identically. See [Lagtime](../model-file/lagtime.llms.md) for semantics, examples, and limitations.
+
+### Dose Handling
+
+Analytical IV models support: - **Bolus doses**: Instantaneous input (when `RATE=0` in data) - **Infusions**: Zero-order input (when `RATE>0` in data) - **Mixed**: A single subject may receive both bolus and infusion doses; the route is read per event from `RATE` - **Steady-state**: Pre-computed steady-state concentrations (when `SS=1` and `II>0` in data) - **Dose superposition**: Multiple doses are handled by summing contributions from each dose event
+
+### Numerical Stability
+
+The analytical solutions include special handling for: - **Near-equal rate constants**: Where absorption meets a disposition rate (KA ~ k, or KA ~ α, β, γ) the Bateman term `(e^{−k·t} − e^{−KA·t})/(KA − k)` is evaluated as `t·e^{−k·t}·(1 − e^{−x})/x` with `x = (KA − k)·t`, one smooth function through `KA = k` — no switch, no loss of digits next to it, exact parameter derivatives of every order. Infusion and steady-state factors (`1 − e^{−k·t}`, `1/(1 − e^{−k·II})`) are written the same way, so a slow elimination loses no digits either - **Eigenvalues**: Vieta’s formula gives the slower 2-cpt rate `β = k10·k21/α`; the 3-cpt rates start from the trigonometric solution and are refined on the cubic itself, so their derivatives never pass through `acos`
+
+## ODE Models
+
+For non-standard kinetics (e.g., saturable elimination), use the ODE specification:
+
+    [structural_model]
+      ode(obs_cmt=COMPARTMENT_NAME, states=[state1, state2, ...])
+
+When the observable is a derived quantity (e.g. amount / V), use the amount-only ODE form and supply `[scaling] y = <expr>`:
+
+    [structural_model]
+      ode(states=[depot, central])
+
+    [scaling]
+      y = central / V
+
+As with analytical models, an individual parameter that is **declared but never used** — never referenced in the `[odes]` right-hand side (nor in `[scaling]`/`[derived]`/`[output]`) — is flagged with a parse warning, since it is computed but has no effect (issue \#315). The exceptions are the engine-applied `F` (bioavailability) and `lagtime` (alias `alag`): they act on the dose without appearing in the RHS (see [Bioavailability](#bioavailability) above), so they are never flagged.
+
+### Generating a standard disposition — `ode_template`
+
+To get the explicit ODE form of a **standard** PK model without writing out the states and equations by hand, use `ode_template NAME(...)`:
+
+    [structural_model]
+      ode_template two_cpt_oral(cl=CL, v1=V1, q=Q, v2=V2, ka=KA)
+
+ferx generates the same disposition ODE (states, micro-constant RHS, and `obs_scale`) that the analytical `pk two_cpt_oral(...)` solves in closed form, using the **same parameters**. You can then re-declare any `d/dt(X)` in `[odes]` to override that compartment — the standard way to attach a built-in absorption input such as `transit(...)`. See [Built-in Absorption Models](../model-file/absorption.llms.md) for `ode_template`, override semantics, and the rule that an ODE-only absorption function on an analytical `pk` model is an error.
+
+See [ODE Models](../model-file/ode-models.llms.md) for full ODE syntax and [Scaling](../model-file/scaling.llms.md) for the `[scaling]` block.
+
+## Compartment-Free Models (the `$PRED` equivalent)
+
+> **Maturity: beta** ([\#811](https://github.com/FeRx-NLME/ferx-core/issues/811)).
+
+Not every structural model is a compartment system. A dose-response curve, a response time-course, or a published meta-regression equation is just an equation: given the parameters and the row’s data, compute the prediction. That is what NONMEM’s `$PRED` block does, and ferx writes it the same way — as the equation itself, with no `pk` or `ode` line:
+
+    [structural_model]
+      EFF = EMAX * TIME / (ET50 + TIME)
+      y   = E0 - EFF
+
+A `[structural_model]` block with **no `pk` / `ode` / `ode_template` line** and at least one `NAME = <expr>` line is a compartment-free model. There is no keyword to remember: the equation is the declaration.
+
+The grammar is the same one `[scaling]` uses for its Form C readout, so everything that works there works here:
+
+- **`y = <expr>`** is the prediction. Required — a block of intermediates with no `y` is a model that predicts nothing, and is rejected.
+- **Named intermediates.** Any line whose key is not `y` declares a local binding the lines below it can use, following the same define-above-use-below rule as `[individual_parameters]`. This is what keeps a long bounded-endpoint equation readable instead of repeating a sub-expression four times.
+- **Continuation lines.** Start a continued line with an operator, or end the previous line with one.
+- **`y[CMT=N] = <expr>`** gives a per-compartment-code readout for a multi-endpoint dataset, exactly as in `[scaling]`.
+
+Inside the equation you may reference individual parameters, thetas, etas, the `TIME` built-in, `if`/`else`, and **any data column**. A name the model does not define is a covariate: that is how a model reaches the per-row data it regresses on (dose, arm size, a study-level flag), and the column then becomes required.
+
+### What a compartment-free model does not have
+
+There are no compartments, so there is nothing to dose and nothing to integrate. The dataset needs no `AMT` column and normally has no dose records at all; if it carries some anyway (a `$PRED` dataset that kept its `EVID=1` rows, say), they are not applied — whatever their `AMT`, `RATE`, `SS` or `CMT` — and the model/data check says so once, with the dose-event and subject counts (`W_COMPARTMENT_FREE_DOSES`); no dose-level error is raised for them. The following are rejected by name rather than silently ignored:
+
+|  | Why |
+|----|----|
+| `[odes]` | declares derivatives of compartment states |
+| `[initial_conditions]` | seeds compartment amounts |
+| `[diffusion]` | adds SDE diffusion to compartment states |
+| `[adaptive_dosing]` | emits doses into compartments |
+| `[scaling]` | this block already declares the prediction — fold any conversion into `y` |
+| `obs_scale = ...` | there is no built-in prediction to divide |
+| `central` / `depot` / `peripheral` in the equation | no compartment exists to read |
+
+`[error_model]`, `[fit_options]`, `[covariates]`, `[derived]` and `[output]` all work unchanged. The `[error_model]` is a single `DV ~ ...`: there is one prediction and no compartment to key a `CMT=N:` error model on. A parameter declared in `[individual_parameters]` that the equations never read draws the same “computed but never used” warning every other model class gets.
+
+Because nothing is dosed, the compartment-indexed dose-attribute names a `pk(...)` or `[odes]` model reserves — `F1`, `ALAG1`, `D2`, `R1` — carry no meaning here and are ordinary parameter names (a fraction, a factor level, a slope): they are neither bound to a dose route nor rejected for lacking one (#1358). The bare `F` / `LAGTIME` / `ALAG` still take their reserved parameter slots, as in an ODE model, so a compartment-free `LAGTIME` can still draw the negative-lag-time warning; prefer another name for a parameter that is not a lag.
+
+### Worked example
+
+An Emax time-course with between-subject variability on the baseline — the shape of a model-based meta-analysis structural model:
+
+    [parameters]
+      theta TVE0(10.0, 0.1, 100.0)
+      theta TVEMAX(6.0, 0.1, 100.0)
+      theta TVET50(2.0, 0.01, 100.0)
+
+      omega ETA_E0 ~ 0.09
+
+      sigma ADD ~ 0.5 (sd)
+
+    [individual_parameters]
+      E0   = TVE0 * exp(ETA_E0)
+      EMAX = TVEMAX
+      ET50 = TVET50
+
+    [structural_model]
+      EFF = EMAX * TIME / (ET50 + TIME)
+      y   = E0 - EFF
+
+    [error_model]
+      DV ~ additive(ADD)
+
+The equivalent NONMEM control is a direct translation:
+
+    $PRED
+    E0   = THETA(1)*EXP(ETA(1))
+    EMAX = THETA(2)
+    ET50 = THETA(3)
+    Y    = E0 - EMAX*TIME/(ET50 + TIME) + EPS(1)
+
+Fitted to the same 30-subject dataset from the same starting estimates, the two agree to ~1e-4 relative on every estimate and to 5 decimal places on the objective (`nonmem_anchor/algebraic_emax.*`, exercised by `tests/algebraic_pred_nonmem_anchor.rs`):
+
+|          | ferx      | NONMEM 7.5.1 |
+|----------|-----------|--------------|
+| OFV      | 62.5385   | 62.5384884   |
+| TVE0     | 10.203867 | 10.2040      |
+| TVEMAX   | 5.917646  | 5.91754      |
+| TVET50   | 2.099437  | 2.09949      |
+| ω²(E0)   | 0.092357  | 0.0924622    |
+| σ (SD)   | 0.480452  | 0.480452     |
+| SE(TVE0) | 0.572367  | 0.572542     |
+
+SEs are compared against `$COVARIANCE MATRIX=R`, which is what ferx’s covariance step computes (a pure `R⁻¹`); NONMEM’s default sandwich is a different estimator and would not be comparable.
+
+### Gradients
+
+Compartment-free models take the **analytic** `Dual2` gradient on both loops: with no state to integrate, the sensitivity is the chain rule `∂y/∂θ = (∂y/∂p)·(∂p/∂θ)` over the individual-parameter program, evaluated once per observation.
+
+Inter-occasion variability is analytic too. Because such a model has no concentration to carry a per-occasion effect, `kappa` reaches the prediction only through the individual parameters the equation reads — so the equation is evaluated **per occasion**, and the gradient is seeded on that occasion’s `kappa` axes. This is what makes a between-treatment-arm variance component (BTAV, the arm-level random effect of an MBMA model) estimable here rather than frozen at its initial value. A [sample-size-weighted `kappa`](../model-file/parameters.llms.md) — `kappa K ~ γ² weight = NARM`, the usual BTAV declaration — is served on the same path: the weight is applied by rewriting the reference as `K / sqrt(NARM)`, which reaches the equation as an ordinary individual parameter.
+
+There is no width cap: the gradient is analytic at any number of random effects for a subject, counting the stacked `(η, kappa₁…kappa_K)` across its occasions under IOV. The number of θ does not count either.
+
+See [Scaling](../model-file/scaling.llms.md) for the Form C readout on top of a *compartment* model, which shares this grammar.

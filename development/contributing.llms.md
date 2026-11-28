@@ -1,0 +1,74 @@
+# Contributing to FeRx development
+
+You don’t need to be on the core team to move FeRx forward. There are three ways to contribute, in increasing order of involvement — pick whichever fits your time and expertise. **All three start or end as a GitHub Issue or PR**, so the work stays visible to everyone (see [Communication](../development/sdlc.llms.md#communication)).
+
+For the full process behind any of this, see the [Development Lifecycle (SDLC)](../development/sdlc.llms.md).
+
+## Test it and tell us what breaks
+
+The single most valuable thing most users can do is **run FeRx on real models and data and report where it disagrees** with NONMEM / Monolix / nlmixr2 — or where it is slow, unclear, or crashes. Parity with established tools is our top priority (see [Gold-standard validation](../development/sdlc.llms.md#gold-standard-validation)), so a concrete, reproducible mismatch is gold.
+
+- Install per the [Installation](../installation.llms.md) page, then run your model via the CLI or the R package (`ferx_fit()`).
+- Compare the key outputs — **OFV, theta, omega, sigma, ETAs, CWRES/IWRES** — against your reference tool.
+- If something is off, capture the two output sets and the versions, and open an Issue (next section). Even “it ran but the OFV is 30 points off NONMEM” is a useful report.
+
+## Open an Issue
+
+Issues are where all work starts (see [the development workflow](../development/sdlc.llms.md#the-development-workflow-with-ai)): bug reports, parity gaps, feature requests, and docs problems all belong here.
+
+How to write a good one:
+
+- **Search existing issues first** to avoid duplicates.
+- **Bug:** a minimal `.ferx` model + a small data subset that reproduces it, what you expected vs. what you got, and the ferx-core / ferx-r versions.
+- **Parity gap:** attach the NONMEM (or other tool) output and the ferx output side by side, plus the model and data.
+- **Feature:** state **Why, How, and the design choices**, and who benefits. Expect push-back or deferral if it serves a niche of one — see the “Christmas tree” guardrail in [Philosophy and quality bar](../development/sdlc.llms.md#philosophy-and-quality-bar).
+- Add it to the GitHub **Project view** so the team has visibility and can triage it.
+
+You don’t have to fix what you file — a well-described Issue is a complete contribution on its own.
+
+## Open a Pull Request
+
+Ready to write code or docs? The full process is in the [SDLC](../development/sdlc.llms.md#the-development-workflow-with-ai); the short version for a contributor:
+
+1.  **Claim the work.** Comment on the Issue you want to take (or open one first) so effort isn’t duplicated.
+2.  **Branch off the latest `main`** (trunk-based — see [Git workflow](../development/sdlc.llms.md#git-workflow)); keep it focused on one issue.
+3.  **Test it.** Add a test at the right tier (see the [testing pyramid](../development/sdlc.llms.md#cicd-and-quality-gates)); for anything numerical add a NONMEM comparison ([Gold-standard validation](../development/sdlc.llms.md#gold-standard-validation)). Every feature needs a test; every bug fix needs a regression test that fails without it.
+4.  **Keep both sides in sync.** ferx-core ↔︎ ferx-r ([Cross-repo synchronization](../development/sdlc.llms.md#cross-repo-synchronization)) and docs updated; on the R side, regenerate `man/` and keep `R/*.R` ASCII-only (see [Pull requests](../development/sdlc.llms.md#pull-requests)).
+5.  **Fill every section of the PR template**, including the cross-repo table.
+6.  **Expect review.** Run `/code-review` on large/numerical PRs; anything touching design, the DSL, or estimation also gets a human core-team review.
+7.  **Finish the [Definition-of-done checklist](../development/sdlc.llms.md#definition-of-done)** before marking it ready.
+
+### If the `Public API baseline` job goes red
+
+The repo is a cargo workspace — the `ferx-core` library at the root, with `ferx-tools` (multi-fit tooling), `ferx-search` (model-space search) and `ferx-cli` (the `ferx` binary) on top — and `api/ferx-core-public-api.txt` is a committed snapshot of everything `ferx-core` exposes. CI diffs it, so *any* new `pub` item fails that job until the baseline is updated in the same PR. That is deliberate: it makes each widening one reviewable line instead of something buried in a large change.
+
+If the change is intended:
+
+``` bash
+tools/update-public-api.sh   # regenerate, then commit the result
+```
+
+and say in the PR description which caller needs each added item and why the existing surface does not suffice. Do not reach for `#[doc(hidden)]` — it hides the item from the baseline, so a test rejects it outright. See [SDLC §8.7](../development/sdlc.llms.md#the-public-api-gate).
+
+## Writing a docs page
+
+These pages are read by people and retrieved a section at a time by anything else — the site’s own anchor links, and agents that pull one chunk rather than a whole page. [R1](../development/docs-lint.llms.md#r1-section-size) enforces the size of such a chunk; this section is the convention that makes staying under it easy, and makes the result worth retrieving.
+
+### Keep rationale and validation in their own subsection
+
+Most oversized sections are a usage explanation and its justification welded together, so a heading that reads like a how-to serves background instead — implementation reasoning, NONMEM comparisons, benchmark tables. Give the justification its own subheading. Nothing moves off the page; it just becomes separately addressable, so a reader who wants the answer can skip it and one who wants the reasoning can link straight to it.
+
+**Use the standard names.** `### Rationale` for why a design or a default is what it is, `### Validation` (or `### Validation against NONMEM`) for the parity evidence required by [Gold-standard validation](../development/sdlc.llms.md#gold-standard-validation). Skipping and finding both work by matching the heading, so *Background*, *Notes*, *Design* and *History* defeat the point.
+
+**Leave the verdict behind.** Rationale is sometimes the answer — a reader deciding whether to override a default needs the outcome even if they skip the derivation. Keep the conclusion and any scope caveats in the usage section, and link down for the reasoning:
+
+> Analytic for the combinations listed below; everything else falls back to FD. See `[Rationale](#rationale-gradient-route)`.
+
+**A rationale subsection is not exempt from R1.** Split it when it grows, the same as anything else — otherwise the wall of prose has only been relocated under a heading nobody trims.
+
+### Two things the linter cannot see
+
+- **`toc-depth` is 3** (`docs/_quarto.yml`). A subsection added under an `###` lands at `####` and drops out of the on-page TOC, which loses half the benefit of splitting. Promote the parent to `##`, or raise `toc-depth` for that page.
+- **Whether the split is by concern.** Six subheadings that each mean something (“Covariance / standard errors”, “ODE solver”) make a page navigable; six that say “Part 1 … Part 6” satisfy R1 and help nobody.
+
+**Good first contributions:** add a NONMEM-comparison test for a model we don’t cover yet, improve a docs page, or fix a reproducible bug with a regression test. Small, well-tested PRs are the easiest to merge. Large or experimental features should be discussed in an Issue first and developed on a long-lived feature branch rather than merged in half-working.

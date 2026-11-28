@@ -1,0 +1,365 @@
+# Mixture Models
+
+> **Maturity: experimental** — see [Feature Maturity](../maturity.llms.md) for what this means.
+
+A **mixture model** treats each subject as belonging to one of $K$ unobserved subpopulations (“classes”). Class $k$ has its own set of class-specific typical values (and, optionally, its own $\Omega$ / $\Sigma$), and a subject is assigned to a class only probabilistically, through covariate-dependent **mixing probabilities**. This is the ferx analogue of NONMEM’s `$MIXTURE`.
+
+## Model file
+
+Declare the number of classes and the mixing rule in a `[mixture]` block, and select class-specific typical values with the reserved read-only `MIXNUM` index (`1..=K`) inside `[individual_parameters]`:
+
+``` toml
+[parameters]
+  theta TVCL1(1.0)                      # class-specific clearance
+  theta TVCL2(3.0)
+  theta TVV(10.0)
+  theta MIXL(0.0)                       # mixing logit intercept
+  omega ETA_CL ~ 0.09
+  sigma EPS ~ 0.04
+
+[mixture]
+  nsub = 2
+  logit(1) = MIXL                       # p(1) = σ(logit);  p(2) = 1 − p(1)
+  # omega(2) ETA_CL ~ 0.15              # optional per-class Ω override
+  # sigma(2) EPS ~ 0.05                 # optional per-class Σ override
+
+[individual_parameters]
+  CL = if (MIXNUM == 1) TVCL1 * exp(ETA_CL) else TVCL2 * exp(ETA_CL)
+  V  = TVV
+
+[structural_model]
+  pk one_cpt_iv(cl=CL, v=V)
+
+[error_model]
+  DV ~ proportional(EPS)
+```
+
+The mixing rule may be given as a **logit** (`logit(k) = …`) or a **probability** (`p(k) = …`) expression over thetas and covariates; the remaining class’s probability is the complement. Mixing expressions must not depend on any $\eta$.
+
+The two forms differ only in how $p_{ik}$ is formed: `logit(k)` is passed through a softmax (reference class $K$ has logit 0), while `p(k)` is used as the probability directly and the class weights are renormalised to sum to one. A constant `p(1) = 0.3` is therefore identical to `logit(1) = \ln(0.3/0.7)`. The outer gradient is analytic for both forms: the softmax (`logit`) or clamp-and-renormalise (`p(k)`) map is differentiated exactly when the analytic mixture gradient runs.
+
+## Objective
+
+Each subject’s marginal likelihood is the covariate-weighted mixture of its class-conditional likelihoods, and the population objective is the numerically stable log-sum-exp of the per-class FOCE/FOCEI negative log-likelihoods:
+
+$$p_{ik} = \operatorname{softmax}_k\big(g_k(\theta,\, \text{cov}_i)\big),
+\qquad
+L_i = \sum_{k=1}^{K} p_{ik}\, L_{ik},$$
+
+$$\text{OFV} = -2 \sum_{i=1}^{N} \log \sum_{k=1}^{K} p_{ik}\, \exp(-\text{nll}_{ik}).$$
+
+`nll_ik` is the ordinary per-subject FOCE/FOCEI negative log-likelihood evaluated with class-$k$ parameters and a **separate empirical Bayes solve per (subject × class)**. The mixing-logit coefficients are ordinary thetas and any per-class $\Omega$/$\Sigma$ are estimated jointly. Estimation defaults to NLopt L-BFGS on the analytic posterior-weighted outer gradient — exact also under IOV and with a block (correlated) $\Omega$ — like a single population; an explicit `bobyqa` or another NLopt optimizer (SLSQP / MMA) is honoured. A subject outside analytic scope is salvaged on its own: the other subjects keep their exact gradient, and only that subject’s per-class terms are finite-differenced, re-solving its class modes at each probe. Such a subject is named in the “could not be given the exact analytic outer gradient” warning, as for a single population (#2906). `MIXNUM`-branched typical values are in scope.
+
+### Laplace and AGQ
+
+`method = laplace`, and `method = focei` with `n_agq > 1`, fit a mixture too. The class objective $\mathrm{nll}_{ik}$ is then the single-population quadrature objective ([Laplace and AGQ](../estimation/agq.llms.md)) evaluated with class-$k$ parameters at the class’s own mode and on the class’s own grid (the Hessian that scales the grid is class $k$’s, exact for Laplace and Gauss-Newton for FOCEI quadrature), instead of the FOCE/FOCEI marginal; the log-sum-exp over classes is unchanged. Under IOV the class mode is the stacked $[\hat\eta, \hat\kappa]$, as for a single population. The outer gradient, the covariance R-matrix and the score cross-product $S$ have exact routes for the same objective. For the outer gradient, a (subject $\times$ class) term the adjoint declines at run time uses a reconverged finite difference, as for FOCE/FOCEI. A mixture of identical classes reproduces the single-population Laplace/AGQ fit. The FOCE and FOCEI mixture objectives are unchanged; their default optimizer is not (below).
+
+`optimizer = auto` resolves for a mixture exactly as for a single population: NLopt L-BFGS on the exact mixture gradient for supported FOCE, FOCEI, Laplace, and AGQ fits. Laplace keeps L-BFGS with `gradient = fd` and supplies a finite-difference gradient. An explicit `optimizer = bobyqa` is honoured. `agq_eval_only = true` is refused on a mixture (`E_MIXTURE_METHOD`): the evaluation-only quadrature stage scores a single population and would replace the mixture objective with a one-class value; an estimating `laplace` stage already reports the mixture objective.
+
+Cross-checked against NONMEM 7.5.1 (`$MIX NSPOP=2`, `$EST METHOD=COND LAPLACIAN INTER`, `$COV MATRIX=R`; `nonmem_anchor/mixture_laplace.ctl` and the Tier-2 `tests/mixture_laplace_nonmem_anchor.rs`) on the two-class clearance fixture of [Validation against NONMEM](#validation-against-nonmem):
+
+| Quantity | NONMEM | ferx |
+|----|----|----|
+| OFV (without constant) | 301.772953 | 301.772952 (at NONMEM’s estimate: −3.8e-7) |
+| `TVCL1` (SE) | 0.949834 (0.1039) | 0.949848 (0.1042) |
+| `TVCL2` (SE) | 2.81952 (0.2533) | 2.81959 (0.2515) |
+| `V` (SE) | 10.0110 (0.1868) | 10.0110 (0.1867) |
+| `p(1)` (SE, delta-method) | 0.470531 (0.1021) | 0.470538 (0.1021) |
+
+The SEs are ferx’s exact R and NONMEM’s finite-difference R, evaluated at NONMEM’s estimate; they agree to \< 1 %, with `TVCL2` the largest gap, as under FOCEI below.
+
+## Output
+
+For a mixture fit, `sdtab` gains two per-subject diagnostics, matching the NONMEM reserved variables:
+
+- **`MIXEST`** — the most-probable class $\operatorname{argmax}_k \text{PMIX}_{ik}$ (1-based).
+- **`PMIX_1 … PMIX_K`** — the posterior class-membership probabilities $\text{PMIX}_{ik} \propto p_{ik}\exp(-\text{nll}_{ik})$, normalised over $k$.
+
+A `ferx model.ferx --simulate` run adds a third: **`MIXNUM`**, the class each subject was *simulated* under (1-based), written before `MIXEST`. It is the generating class, so on a simulated dataset it is the truth `MIXEST` can be checked against. Data read from a file has no `MIXNUM` column unless `[output]` asks for one.
+
+Listing `MIXNUM` in `[output]` writes the class, as NONMEM’s `$TABLE MIXNUM` does and as `MIXNUM` means in every expression: the simulated class where the data were drawn under one, the fitted `MIXEST` otherwise, on every row of the subject — binary and time-to-event rows included. It is never a data column that happens to be called `MIXNUM` (no expression can read such a column either); with one present, `fit()` and `ferx check` warn `W_OUTPUT_MIXNUM_IS_CLASS`, so rename the column to table it. On a simulated dataset the requested column replaces the generating-class column rather than sitting beside it under the same name (#2784).
+
+Every other per-subject diagnostic is evaluated **in that subject’s `MIXEST` class**: the reported $\hat\eta$ are the winning class’s EBEs, and `IPRED`, `PRED`, `IWRES`, `CWRES`, `EBE_OFV`, and any `[derived]` / `[output]` column that branches on `MIXNUM` are all computed with `MIXNUM` set to that class. So a subject the fit assigns to class 2 gets class-2 typical values throughout its sdtab row, not the class-1 default.
+
+### Merged or empty classes
+
+A mixture objective has local optima where fewer than `nsub` classes are in use. Two classes can end up describing the same subpopulation, or one class can end up holding nobody. After every mixture fit, ferx checks the final evaluation for both and warns `W_MIXTURE_MERGED_CLASSES`, naming each pair or class it finds (#2907):
+
+- **Merged pair.** Both classes carry posterior mass, and no subject’s data favours one over the other by more than 1 log-likelihood unit: $\max_i |\text{nll}_{ia} - \text{nll}_{ib}| < 1$. That is how far each subject’s posterior class odds moved from its prior odds, $\ln(\text{PMIX}_{ia}/\text{PMIX}_{ib}) - \ln(p_{ia}/p_{ib})$. It is computed from the class objectives, not rebuilt from $\text{PMIX}$, so a subject that a third class dominates so strongly that both posteriors underflow to 0 still counts. The test is on the objective, not on the parameters, so it also catches classes that are equal but written two different ways.
+- **Empty class.** No subject’s posterior probability of the class reaches 0.01.
+
+The thresholds were measured on `tests/nonmem/mixture_iv.csv` with Ω and Σ estimated. Started from the near-symmetric clearances 1.70 / 1.701, FOCEI with L-BFGS ends in a collapsed optimum (OFV 310.02, class clearances 1.73 / 1.74, ω_CL 0.35, which absorbs the bimodality). There the largest factor is 0.009. At the two-class optimum (OFV 299.86) it is 15.05, and at the NONMEM-matching optima of the Ω/Σ-fixed fixture and of `mixture_iv_iov.csv` (301.58, 470.81) it is 11.45 and 19.29. A mixing logit held at −9 leaves class 1 with a largest posterior of 3e-4, which is reported empty.
+
+The warning does not change the fit. A start with near-identical classes is a near-symmetric point of the objective, where the gradient barely separates the classes and the fit can settle on a saddle (at the collapsed optimum above the exact R-matrix has one negative eigenvalue, $-0.04$ against a largest of $5.5\times10^{3}$, while at the two-class optimum it is positive definite). With exactly symmetric starts in exchangeable classes, the derivative in the direction that separates the classes is zero. Give the classes distinct starting values to keep using L-BFGS. If the warning fires, move the class starts further apart and compare the objectives: on the fixture above, a start of 1.2 / 2.5 reaches 299.86 under the default L-BFGS. Since its verification leg leaves the collapsed saddle (#2837), the default L-BFGS reaches 299.86 under FOCEI from nine starts with class clearances 0.005 to 0.20 apart (1.705 / 1.71 to 1.60 / 1.80), and 300.16 under `n_agq = 3` from 1.70 / 1.71. From 1.70 / 1.701, 0.001 apart, it still collapses, under FOCEI (310.02) and under `n_agq = 3` (310.73). `optimizer = bobyqa` reached the two-class optimum from every start probed, 1.70 / 1.701 included (299.86 under FOCEI, 300.16 under `n_agq = 3`), so it is a second check once the warning fires. A few starts on one dataset do not make it a guarantee, so compare the objectives either way.
+
+## Validation against NONMEM
+
+A two-class clearance mixture (`tests/nonmem/mixture_iv.ctl` and the slow-gated `tests/mixture_nonmem.rs`) was fit by both engines on the same 30-subject IV dataset — two subpopulations with `CL ≈ 1` and `CL ≈ 3`, a constant mixing fraction, and $\Omega$/$\Sigma$ fixed at the data-generating values (`METHOD=1 INTER` in NONMEM; FOCEI in ferx). NONMEM’s minimization was successful.
+
+| Quantity                | NONMEM 7.5.1 | ferx                       |
+|-------------------------|--------------|----------------------------|
+| OFV (without constant)  | 301.582      | 301.600                    |
+| `TVCL1` (class 1)       | 0.981        | ≈ 0.98                     |
+| `TVCL2` (class 2)       | 2.842        | ≈ 2.84                     |
+| `V`                     | 9.979        | ≈ 9.98                     |
+| mixing fraction `p(1)`  | 0.472        | ≈ 0.47                     |
+| `MIXEST` classification | —            | **30 / 30 subjects agree** |
+
+The objectives agree to ~0.02 units and the per-subject `MIXEST` class assignment is identical for every subject.
+
+### Standard errors
+
+A mixture fit runs the covariance step like any other fit: the Hessian is built on the **mixture** objective (the K-fold log-sum-exp above) — an exact analytic R matrix under FOCE, FOCEI, Laplace and AGQ — and the standard errors are $\sqrt{\operatorname{diag}(R^{-1})}$. The mixing-fraction SE is reported on the scale the mixing form is written in — the coefficients of a `logit(k) = …` form carry a logit-scale SE, a `p(k) = …` probability an SE directly on the probability scale — because those coefficients are ordinary thetas.
+
+Cross-checked against `$COVARIANCE MATRIX=R` on the same model (`tests/nonmem/mixture_iv_cov.ctl`); `MATRIX=R` is the pure Hessian-inverse estimator ferx computes (NONMEM’s default sandwich $R^{-1}SR^{-1}$ differs by the usual 10–25 % between the two estimators):
+
+| SE                    | NONMEM (`MATRIX=R`) | ferx   |
+|-----------------------|---------------------|--------|
+| `TVCL1`               | 0.1056              | 0.1067 |
+| `TVCL2`               | 0.2543              | 0.2559 |
+| `V`                   | 0.1861              | 0.1860 |
+| `p(1)` (delta-method) | 0.1026              | 0.1030 |
+
+All four agree to **\< 1 %**. The `p(1)` row compares NONMEM’s direct $P(1)=\theta_4$ SE to ferx’s logit-scale SE mapped through $\operatorname{SE}(p) = p(1-p)\operatorname{SE}(\text{logit})$.
+
+#### Per-class overrides
+
+An `omega(k)` / `sigma(k)` override is an estimated coordinate like any other, and since \#2833 it is reported with its estimate, SE and %RSE in the console, the fit YAML’s `mixture_overrides:` section and `parameter_table`, named `<base>_MIX<k>` (see [Mixture per-class overrides](../output.llms.md#mixture-overrides)). Each override packs the log of its class SD, so its SE is put on the reported scale by the delta method: $\operatorname{SE}(\omega^2_k) = 2\,\omega^2_k\,\operatorname{SE}(\ln \omega_k)$ for an Ω override (exact because an Ω override is accepted on a diagonal base only) and $\operatorname{SE}(\sigma_k) = \sigma_k\,\operatorname{SE}(\ln \sigma_k)$ for a σ override.
+
+Cross-checked against NONMEM at ferx’s FOCEI estimate on a 2-class, 80-subject population with both overrides interior (`nonmem_anchor/mix_override_se.ctl`: each override is a second `ETA` / `EPS` used only for `MIXNUM.EQ.2`, `$EST MAXEVAL=0`, `$COV MATRIX=R SIGL=8`). OFVs agree to 9e-8; NONMEM’s σ SEs are converted from the variance by $\operatorname{SE}(\sigma^2)/2\sigma$:
+
+| SE                | NONMEM (`SIGL=8`) | ferx (analytic R) | relative gap |
+|-------------------|-------------------|-------------------|--------------|
+| `TVCL1`           | 0.0536804         | 0.0536807         | 6.2e-6       |
+| `TVCL2`           | 0.246881          | 0.246863          | 7.2e-5       |
+| `TVV`             | 0.0772119         | 0.0772116         | 4.2e-6       |
+| `MIXL`            | 0.263654          | 0.263651          | 9.8e-6       |
+| `ETA_CL`          | 0.0168770         | 0.0168769         | 1.1e-6       |
+| `EPS`             | 0.00583841        | 0.00583828        | 2.2e-5       |
+| **`ETA_CL_MIX2`** | 0.0649761         | 0.0649758         | 3.8e-6       |
+| **`EPS_MIX2`**    | 0.0106680         | 0.0106675         | 4.1e-5       |
+
+`SIGL=8` matters here. At `SIGL=12` NONMEM’s own finite-difference step moves `TVCL2` by 1 % and `EPS_MIX2` by 0.66 %, at `SIGL=14` `TVCL2` by 9 %, while ferx’s analytic and finite-difference R agree with each other and with `SIGL=8`. `tests/mixture_override_se_nonmem_anchor.rs` pins each SE against its own bound.
+
+#### The `s` and `rsr` estimators
+
+`covariance_method = s` (`S⁻¹`) and `rsr` (`R⁻¹SR⁻¹`) need a per-subject score $g_i = \partial(-\log L_i)/\partial x$, and under a mixture that is the score of the **mixture marginal** $L_i = \sum_k p_{ik} L_{ik}$:
+
+$$g_i = \sum_k w_{ik}\left(\frac{\partial\, \mathrm{nll}_{ik}}{\partial x} - \frac{\partial \ln p_{ik}}{\partial x}\right),
+\qquad w_{ik} = \frac{p_{ik} L_{ik}}{\sum_j p_{ij} L_{ij}},$$
+
+where $w_{ik}$ is the subject’s posterior class probability (the `PMIX` column) and each class’s $\partial\,\mathrm{nll}_{ik}/\partial x$ is the ordinary FOCE/FOCEI subject score taken under that class — its typical values, its Ω/Σ overrides, and its own η̂ (and κ̂ under IOV). As for a single-population fit, it is the total derivative of the class objective, η̂ re-estimated at every parameter value ([\#2974](https://github.com/FeRx-NLME/ferx-core/issues/2974)), so every class-specific θ and every mixing coefficient gets its own non-zero score column.
+
+Before \#1956 the mixture score was taken from the single-population objective under class 1 only. The class-2 θ and the mixing-fraction columns of `S` were then exactly zero, so `s` was refused as singular and `rsr` reported wrong SEs for every parameter.
+
+##### Against NONMEM
+
+At the NONMEM finals of `tests/nonmem/mixture_iv_cov.ctl` (evaluation-only, `MAXEVAL=0`, `tests/nonmem/mixture_iv_cov_{s,rsr,r0}.ctl`, NONMEM 7.5.1):
+
+| SE      | NONMEM `MATRIX=S` | ferx `s` | ferx `s` before \#2974 |
+|---------|-------------------|----------|------------------------|
+| `TVCL1` | 0.13238           | 0.13237  | 0.13403                |
+| `TVCL2` | 0.29366           | 0.29366  | 0.25211                |
+| `V`     | 0.21364           | 0.21364  | 0.21193                |
+| `p(1)`  | 0.10881           | 0.10881  | 0.12260                |
+
+`tests/nonmem/mixture_iv_cov_score_oracle.py` computes each subject’s FOCEI $-2\log L_i$ in closed form, outside both engines (it reproduces NONMEM’s objective, 301.582018, to 4e-8), and forms $S$ from central differences with η̂ re-estimated at every point, NONMEM’s convention and ferx’s. Before \#2974 ferx held η̂ and its prediction Jacobian at the estimates. That score is biased: at the MLE the total score sums to zero over subjects and the held one does not (on `TVCL2`, $3\times10^{-4}$ against 16.2), so the gap, 14 % on `s` and 36 % on `rsr`, did not shrink with more subjects. The one-population twin of this model (`tests/nonmem/single_iv_cov_{s,rsr,r0}`) shows the same. `tests/mixture_cov_s_nonmem.rs` pins ferx’s `s` and `rsr` against NONMEM and the oracle for the mixture and its twin: `s` agrees with NONMEM’s `MATRIX=S` to 3.9e-6 (NONMEM prints six figures) and with the oracle to 1.3e-8.
+
+## Inter-occasion variability under a mixture
+
+A mixture may carry inter-occasion variability (a `kappa` on a structural parameter) — the two features compose (#985). Each class’s per-subject inner solve estimates the per-occasion κ̂ under that class’s typical values, and the FOCE/FOCEI marginal `L_ik` is the κ-augmented occasion likelihood, so the same `L_i = Σ_k p_ik L_ik` mixture is formed over IOV-aware class likelihoods. The IOV Ω is shared across classes (it sits in the base parameter block, ahead of any per-class Ω/Σ override), matching NONMEM’s `$OMEGA BLOCK(1) … SAME` occasion structure. The analytic outer gradient carries the κ-slot derivatives, so an IOV mixture optimises against the exact outer gradient; the covariance step runs as usual on the K-fold mixture objective.
+
+The postfit outputs use the most-probable (`MIXEST`) class’s κ̂: IPRED, IWRES, CWRES, the per-subject OFV, κ shrinkage and the `.fitrx` `ebe_kappas`. This holds after a fit and also for an evaluation-only run (`maxiter = 0`, \#1932), so both report the same diagnostics at the same parameters.
+
+### NONMEM cross-check (`tests/nonmem/mixture_iv_iov.ctl`)
+
+Two-class bimodal-CL model with a per-occasion κ on CL (30 subjects × 2 occasions), IIV/IOV Ω and Σ FIXed at the data-generating values in both engines, `METHOD=1 INTER`:
+
+| Quantity                | NONMEM 7.5.1 | ferx                       |
+|-------------------------|--------------|----------------------------|
+| OFV (without constant)  | 470.814      | 470.930                    |
+| `TVCL1` (class 1)       | 1.057        | 1.069                      |
+| `TVCL2` (class 2)       | 3.330        | 3.275                      |
+| `V`                     | 10.259       | 10.253                     |
+| mixing fraction `p(1)`  | 0.526        | 0.506                      |
+| `MIXEST` classification | —            | **30 / 30 subjects agree** |
+
+The objectives agree to ~0.12 units and every subject’s most-probable class matches. Standard errors are **not** cross-checked for this model: NONMEM’s covariance step terminates with rounding errors and substitutes the R matrix (`R MATRIX SUBSTITUTED: YES`, no printable SE block) — a known NONMEM fragility for mixture + IOV covariance — whereas ferx’s covariance step completes. The mixture SE machinery itself is anchored to `$COVARIANCE MATRIX=R` in the non-IOV [standard-errors](#standard-errors) comparison above.
+
+### Evaluation-only cross-check (`tests/nonmem/mixture_iv_iov_eval.ctl`)
+
+The same model and data, evaluated once at NONMEM’s final estimates (`MAXEVAL=0 POSTHOC` against ferx’s `maxiter = 0`, \#1932). NONMEM tables its `MIXEST` class’s ETAs, so this compares ferx’s postfit row by row. The figures are the largest absolute difference over all 30 subjects (κ̂ over both occasions, IPRED and IWRES over all 240 observations):
+
+| Quantity             | ferx vs NONMEM 7.5.1 | before \#1932          |
+|----------------------|----------------------|------------------------|
+| OFV                  | 2.1e-7               | 2.1e-7                 |
+| η̂ and per-occasion κ̂ | 1.8e-7               | 0.17 (κ̂ reported as 0) |
+| IPRED                | 6.8e-7               | 0.59                   |
+| IWRES                | 5.3e-7               | 1.29                   |
+| `MIXEST`             | 30 / 30 agree        | 30 / 30 agree          |
+
+CWRES agrees to 1.1e-7 and is asserted too. Like NONMEM, ferx linearizes it over every ETA, the `MIXEST` class’s occasion κs included (#1948). Before that fix ferx linearized over η alone, and the gap was 0.41. This was an IOV effect, not a mixture effect: an IOV model with no mixture showed the same gap. Recomputing CWRES outside both engines from NONMEM’s own ETAs over \[η, κ₁, κ₂\] reproduces NONMEM’s column to 2.1e-10.
+
+## SAEM under a mixture
+
+Mixtures can also be estimated with **SAEM** (`method = saem`, \#985). Where FOCE/FOCEI marginalise the latent class analytically (the log-sum-exp above), SAEM *samples* it: each E-step draws the class indicator $z_i \sim \operatorname{Categorical}(\mathrm{PMIX}_i)$ from the current per-subject posterior $\mathrm{PMIX}_{ik} \propto p_{ik}\,e^{-\mathrm{nll}_{ik}}$, then an **orbit move** that lets the class change without changing the individual parameters (below), then the usual η-MCMC *within the drawn class* (its Ω/Σ and its `MIXNUM` branch). The M-step partitions the sufficient statistics by sampled class:
+
+- **Mu-referenced typical values**, class-switched (`if MIXNUM == k … TVCL_k * exp(ETA_CL)`) and class-shared (`V = TVV * exp(ETA_V)`) alike, take the closed-form shift $\log\theta_k \mathrel{+}= \gamma\,\operatorname{mean}_{i:c_i=k}(\eta_i)$ (#996, \#2458). For a class-shared θ it is the pooled shift of a single-population SAEM fit. Under **IOV** the class-switched ones stay on the numerical M-step; see [Mu-referencing under a mixture](#mu-referencing-under-a-mixture) below.
+- **Other class-switched typical values** are estimated from each class’s own members: the ordinary θ/σ M-step run under each subject’s class gives $\partial\text{pred}/\partial\text{TVCL}_2 = 0$ for a class-1 subject.
+- **Per-class Ω overrides** (`omega(k)`) use per-class stochastic-approximation diagonal statistics.
+- **Mixing coefficients** are updated from a small optimisation of the SA-averaged expected complete-data mixing log-likelihood $\sum_i \sum_k \bar r_{ik}\,\ln p_{ik}(\theta_\text{mix})$, where $\bar r_{ik}$ is the Robbins–Monro average of the sampled class indicators. This is exact for constant mixing (it recovers $p_k = \operatorname{mean}_i \bar r_{ik}$) and for covariate-dependent logit mixing (a weighted logistic fit) alike.
+
+The reported OFV, per-subject `MIXEST`/`PMIX`, and standard errors are computed from the K-fold mixture marginal at the SAEM optimum, exactly as for FOCEI. Per-class **σ** overrides (`sigma(k)`) are the one piece not yet re-estimated under SAEM — they are held at their initial values (with a warning), and every class-`k` subject is *scored* under that held σ, so the free base σ is estimated only from the classes that actually share it. Being held, the overrides are reported as fixed, as `FIX`ed parameters are: `[FIX]` with SE `---` in the console and the parameter table, `fixed: true` in the YAML (#2833). Route the model to FOCEI if they must be fit. HMC and the conditional-distribution pass are disabled for a mixture (they are class-unaware); the MH E-step is used.
+
+Two further SAEM-specific rules follow from the separated M-step:
+
+- A mixing theta marked `FIX` is honoured — it is excluded from the mixing M-step and stays at its declared value, so a known mixture fraction can be pinned.
+- A theta that drives **both** the mixing expression and a structural typical value is rejected with an error rather than silently double-owned (SAEM estimates the mixing coefficients and the structural thetas in separate M-steps). Split it into two thetas, or fit with FOCE/FOCEI, whose joint marginal handles the shared parameter.
+
+### Mu-referencing under a mixture
+
+A `MIXNUM`-switched typical value pairs one η with *K* class thetas, so the classical pooled mu-referencing move $\log\theta \mathrel{+}= \gamma\,\operatorname{mean}_i(\eta_i)$ (one theta per η) does not apply to it directly. ferx detects the class-aware form at parse time — a chain of `MIXNUM == k` branches whose arms are all `THETA_k * exp(ETA)` (or `exp(log(THETA_k) + ETA)`) on the **same** ETA — and resolves one anchor theta per class. Anything else (mixed anchors, a different ETA per arm, an additive arm, a non-`MIXNUM` condition, an out-of-range class) falls back to the numerical M-step, and the parser says so in a warning rather than degrading silently. The warning is only raised for expressions that actually carry an ETA: a class-switched typical value written without IIV (`V = if (MIXNUM == 1) TVV1 else TVV2`) or an intermediate `MIXNUM` flag variable is not a missed mu-reference and is left alone.
+
+Each anchor theta belongs to **one** η. If two η are written against the same typical value, only the first keeps the closed-form shift — applying both would move that θ twice per iteration — and the other η’s θ go to the numerical / weighted M-step.
+
+Both links are eligible. A **class-shared** anchor may be lognormal (`V = TVV * exp(ETA_V)`) or logit-scale (`F = inv_logit(LOGIT_F + ETA_F)`, with `LOGIT_F` declared on the logit scale): the shift is link-independent, and what it requires is that the *packed* theta is the mu scale — log-packed for the lognormal form, identity-packed for the logit one, exactly as in a single-population fit (#918). A mismatch is reported in the same advisory the single-population path emits. A **`MIXNUM`-switched** anchor is lognormal only: the parser recognises no switched logit chain, so such a typical value is not mu-referenced at all and goes through the numerical / weighted M-step.
+
+What each estimator does with that anchor set differs, and the difference is empirical:
+
+| Estimator | Class-shared θ | Class-switched θ |
+|----|----|----|
+| SAEM | closed-form pooled shift | closed-form per-class shift (numerical M-step under IOV) |
+| IMP / IMPMAP (estimating) | closed-form shift | responsibility-weighted closed-form shift |
+
+#### Why SAEM needs the orbit move
+
+The class draw $z_i \mid \eta_i$ alone barely moves: with `CL = TVCL_k · exp(ETA_CL)`, the η a subject carries was drawn inside its current class, and at that η every other class predicts a different clearance. On the two-class anchor below the classes changed 7 times in 300 000 convergence-phase draws (10 seeds), so the mixing fraction stayed at the start’s share (16/30) and `TVCL2` ended at 3.14 against NONMEM’s 2.82 (#2458).
+
+So after the class draw, SAEM proposes the class from the subject’s **orbit**: for every class $k$, $\eta_k = \eta + \ln\theta_{c} - \ln\theta_k$ on each switched η, which leaves `CL` unchanged, and $k$ is drawn with probability $\propto p_k\,e^{-\mathrm{nll}_k(\eta_k)}$. The move is a translation, so it leaves the joint posterior of class and η unchanged. The class draw has to come first: from SAEM’s start (every subject in class 1), the orbit alone keeps the subjects there, since every member predicts the same and only the prior decides, and the classes collapse before swapping labels (17 of 40 seeds).
+
+With the classes moving, the hard-class mean $\operatorname{mean}_{i:c_i=k}(\eta_i)$ is the right SA statistic, and the switched θ take the closed form. The same closed form on the frozen chain lands at `TVCL2 = 3.04`, which is what \#996 measured when it kept these θ numerical.
+
+Three cases get no orbit move: **IOV** (not yet derived with κ), `mu_referencing = false` (below), and a class theta with a negative lower bound (identity-packed, so not log-mu-referenced). In each, the switched θ stay on the numerical M-step, and the fit warns that the classes may stay near where they started, naming the cause and what to do about it.
+
+#### Switching the shift off
+
+Setting `mu_referencing = false` disables the class-aware shift under both estimators and restores the pre-#996 behaviour (every θ through the numerical / weighted M-step). Note that for a **single-population** IMP/IMPMAP fit the closed-form shift is EM-mandatory and stays on regardless of that option; only the mixture path is switchable. Under SAEM it also switches off the [orbit move](#saem-mixture-orbit-move), so a class-switched typical value’s class chain is the barely-moving z \| η one again, with the bias that section measures, and the fit warns. Prefer leaving `mu_referencing` on for a SAEM mixture fit.
+
+Two further conditions turn an individual θ’s shift off, on either path, each with a warning naming the parameter:
+
+- **A θ declared with a negative lower bound** is packed on the identity scale, so `log θ += mean(η)` would apply `θ += mean(η)` where the closed form means `θ *= exp(mean(η))`. Give the parameter a non-negative lower bound to keep the closed-form update.
+- **A class that receives no responsibility mass** in an iteration has no per-class η mean to shift with. Its θ is handed back to the weighted M-step for that iteration rather than held fixed, and the fit warns at the end; a class that collapses this way usually means the mixture is over-specified.
+
+When the class-aware shift is off for a class θ — by any of these routes, or by `mu_referencing = false` — that θ is estimated by the importance-weighted M-step alone, which is biased for weakly-identified parameters ([\#406](https://github.com/FeRx-NLME/ferx-core/issues/406)). IMP/IMPMAP fits say so in a warning; cross-check such a fit against FOCEI.
+
+Under **IOV**, the per-occasion κ is sampled inside each subject’s drawn class — under that class’s `MIXNUM` branch and its Ω/Σ — so a class-switched typical value is never absorbed into κ.
+
+### NONMEM cross-check (`tests/nonmem/mixture_iv_saem.ctl`)
+
+The two-class constant-mixing model above, estimated with `$EST METHOD=SAEM` (`NBURN=1000 NITER=1000 ISAMPLE=2`) followed by a `METHOD=IMP EONLY=1` objective-evaluation pass, Ω/Σ FIXed:
+
+| Quantity | NONMEM SAEM (one run) | NONMEM IMPMAP (exact MLE) | ferx SAEM (10-seed mean) |
+|----|----|----|----|
+| `TVCL1` (class 1) | 1.002 | 0.9491 | 0.9483 |
+| `TVCL2` (class 2) | 2.735 | 2.8193 | 2.8235 |
+| `V` | 9.993 | 10.0095 | 9.950 |
+| mixing fraction `p(1)` | 0.4712 | 0.4734 | 0.4717 |
+| `MIXEST` vs NONMEM SAEM | — | — | **30 / 30** on every seed |
+
+One SAEM run is one chain’s draw, so ferx is anchored on the mean over ten seeds, compared with NONMEM’s exact-likelihood IMPMAP estimate. The mean agrees to 0.6 % on `V` and 0.15 % on the clearances, and the 40-seed spread is 0.7 % (`TVCL1`), 0.45 % (`TVCL2`) and 0.9 % (`V`) per run. With `saem_ofv = focei` ferx reports the FOCEI-type mixture marginal as the SAEM OFV: 301.90 against NONMEM’s FOCEI minimum of 301.58, which it sits above because the estimate is the exact-likelihood MLE. A mixture has no NONMEM-anchored SAEM objective, so by default (`saem_ofv = saem` falls back to `imp` here with a warning, as does an explicit `saem_ofv = imp` without one) the SAEM `ofv` is the class-marginal importance-sampled `−2 log L`, the number NONMEM’s `METHOD=IMP EONLY=1` pass reports (300.87 on this model; ferx’s chained `[saem, imp]` evaluation is pinned to it in `tests/mixture_nonmem.rs::imp_mixture_marginal_matches_nonmem`), and the FOCEI value is kept as `saem_objective.foce_ofv`. Covariate-dependent mixing under SAEM is exercised end-to-end in `tests/mixture_nonmem.rs`.
+
+## Bayesian estimation under a mixture
+
+Mixtures can also be fit with full-MCMC Bayesian estimation (`method = bayes`, \#985). The latent class is handled **Rao-Blackwellised** — marginalised out rather than sampled — so the sampler still sees a smooth continuous target: each subject’s likelihood contribution is the K-class marginal $-\log \sum_k p_{ik}\,\exp(-\mathrm{nll}_{ik})$. Because every Gibbs block evaluates the per-subject likelihood through this one marginal, the whole Gibbs-within-MH sampler becomes mixture-aware in one place:
+
+- the **η block** samples $\eta_i$ against the class-marginal posterior (a `chol(Ω)`-preconditioned random walk; HMC is disabled for mixtures because its analytic gradient is single-class);
+- the **(θ, σ) block** — which also carries the mixing thetas — samples them against the marginal, so the mixing coefficients (constant *or* covariate-dependent logit mixing) are sampled with no extra machinery;
+- the **Ω block** draws the (class-shared) Ω from its conjugate full conditional;
+- the **κ block** (inter-occasion variability, \#985) samples the per-occasion $\kappa_{ik}$ against the same marginal, so κ targets the class-marginal posterior rather than class 1’s.
+
+Ω/Σ are shared across classes (the classes differ only through the `MIXNUM`-switched typical values); per-class Ω/Σ overrides (`omega(k)`/`sigma(k)`) are rejected with a clear error — fit those with FOCE/FOCEI. The reported OFV, per-subject `MIXEST`/`PMIX`, and EBEs are the K-fold marginal values at the posterior mean.
+
+### Priors, label switching, and the reported OFV
+
+The population priors are weakly informative normals, $\mathcal{N}(u_0, 10^2)$ on the unconstrained scale (log θ where θ is positive, log σ), centred on the *initial estimates* $u_0$ from the model file. Any `[parameters]` bounds you declare are **not** enforced as a uniform prior inside the (θ, σ) Metropolis block — only the mu-referenced conjugate θ move clamps to them — so a mixing logit is kept in range by the prior, not by its declared bounds.
+
+Because the classes are identified only through those priors, a chain can **swap labels** (class 1 ↔︎ class 2) and the pooled posterior mean would then average across two modes and estimate neither class. The signature is a high split-R̂ on the class-switched θ; ferx emits a warning naming label switching when R̂ exceeds its convergence threshold on a mixture. Separating the classes in the initial estimates is the practical fix.
+
+The OFV reported for a Bayes *mixture* run is the Laplace K-fold marginal at the posterior mean (not the posterior-mean joint NLL ×2 that a non-mixture Bayes run reports), and — like every mixture marginal — it is the FOCE or FOCEI form depending on `interaction`. In a method chain (`method = [saem, bayes]`) that flag follows the chain’s last estimator, so compare mixture OFVs only across runs with the same interaction setting.
+
+Under diffuse priors the Bayes posterior mean concentrates at the maximum- likelihood optimum, so it recovers the same estimates the FOCEI/SAEM anchors pin (observed on `tests/nonmem/mixture_iv.csv`: posterior mean `TVCL1 ≈ 0.94`, `TVCL2 ≈ 2.78`, `V ≈ 10.0`, `p(1) ≈ 0.47`, marginal OFV ≈ 301.8, vs the FOCEI optimum 0.98 / 2.84 / 9.98 / 0.472 / 301.58; the two class means sit slightly inside the MLE pair, the direction partial label mixing pulls them). That shared optimum — already NONMEM-anchored by the FOCEI run above — is the Bayes cross-check: a direct NONMEM `METHOD=BAYES` reference is not used because NONMEM’s BAYES sampler aborts in burn-in on this model (it insists on Gibbs-sampling Ω, which is FIXed here), a known NONMEM `$MIX`+BAYES fragility. The same mixture-marginal machinery is anchored directly against NONMEM SAEM above.
+
+## IMP objective evaluation under a mixture
+
+Importance sampling evaluates the **class-marginal** likelihood for a mixture (`method = imp` with `imp_eval_only`, NONMEM `METHOD=IMP EONLY=1`, \#985). For each subject and each class it runs the class-`k` MAP inner solve (under the `MIXNUM` guard), importance-samples the class-conditional marginal $L_{ik}$, and combines them exactly as FOCEI does:
+
+$$-2\log L = -2\sum_i \log \sum_k p_{ik}\,L_{ik}.$$
+
+This is the Monte-Carlo marginal likelihood — the number to compare against NONMEM’s `#OBJV` for `IMP EONLY` — and it is what a chained fit reports on `FitResult.importance_sampling`. The reported per-subject ESS is the worst ESS among the classes that subject actually loads on (classes with $\mathrm{PMIX}_{ik}\approx 0$ are excluded, since a poor proposal there barely enters the marginal), so `imp_low_ess_threshold` flags mixture subjects the same way it does single-population ones. The usual workflow is to estimate with SAEM (or FOCE/FOCEI) and append an evaluation stage:
+
+``` toml
+[fit_options]
+  method = [saem, imp]
+  imp_eval_only = true
+```
+
+On `tests/nonmem/mixture_iv.csv` this recovers the NONMEM `IMP EONLY` objective to well under a Monte-Carlo standard error: ferx `−2 log L = 300.82 ± 0.06` vs NONMEM `300.87` (`mixture_iv_saem.ctl`’s second `$EST`), with `ess_min/K = 0.82` and `ess_med/K = 0.91`.
+
+### Estimating IMP / IMPMAP
+
+Importance sampling also **estimates** a mixture (`method = imp` / `impmap` without `imp_eval_only`) via a class-partitioned MCEM. Each iteration importance- samples every subject’s η *within each class* (under the `MIXNUM` guard), forms the deterministic class responsibilities $\mathrm{PMIX}_{ik} \propto p_{ik}L_{ik}$, then runs responsibility-weighted M-steps: the mixing coefficients from the responsibilities, the class-shared Ω from $\sum_i\sum_k \mathrm{PMIX}_{ik}\,\widehat{\eta\eta^{\top}}_{ik}/N$, and the class-switched typical values from a responsibility- and importance-weighted observation M-step (each class’s samples scored under its own `MIXNUM`). Ω/σ are class-shared (per-class overrides are rejected); IOV / FREM / SDE are not supported (as for the single-population MCEM).
+
+The class-switched typical values are **mu-referenced per class** (#996). Because the MCEM importance-samples η within every class, a per-class posterior mean $\bar\eta_{ic}$ exists directly, and the EM move is the responsibility-weighted
+
+$$\log\theta_k \mathrel{+}= \frac{\sum_i r_{ic}\,\bar\eta_{ic}}{\sum_i r_{ic}},
+\qquad r_{ic} = \mathrm{PMIX}_{ic}$$
+
+summed over the classes $\theta_k$ serves. Those θ are pinned out of the weighted M-step, which then fits only σ and the remaining θ. A class-*shared* typical value repeats the same theta in every class slot, so it collapses to the pooled single-population shift. See [Mu-referencing under a mixture](#mu-referencing-under-a-mixture) for the detection rules and for why SAEM does not do the same.
+
+This is what closes the old gap: on the two-class anchor, estimating IMPMAP now recovers `TVCL1 = 0.952`, `TVCL2 = 2.821`, `V = 10.008`, `p(1) = 0.472`, against `0.949 / 2.819 / 10.010 / 0.473` from NONMEM IMPMAP with `MU_1` assigned inside the `MIXNUM` branch (`tests/nonmem/mixture_iv_impmap_mu.ctl`, NM 7.6.0) — better than 0.5 % on every coordinate. With `mu_referencing = false` the same run falls back to the weighted M-step alone and returns `TVCL1 = 0.998`, `TVCL2 = 2.597`, which is the pre-#996 behaviour and shows how much of the accuracy the shift buys. Note that the EM estimators settle slightly below the FOCEI optimum (0.98 / 2.84) on `TVCL1`/`TVCL2`; NONMEM’s mu-referenced IMPMAP does the same.
+
+A θ whose paired ω is negligible (`ω < 1e-3`) carries no mean-shift information, so it is routed to the weighted M-step with a warning, as in the single-population MCEM; so is a θ declared with a negative lower bound (identity-packed, so the additive log-scale shift is not its EM optimum). The fit also names any estimated θ that no mu-reference shift moves — split, as in the single-population MCEM, into those with no ETA at all and those whose ETA is there in a form the shift cannot use (#1715). The mixing thetas are excluded, since they are owned by the mixing M-step.
+
+The per-subject proposal machinery is the same as the single-population MCEM: each class’s draws get their own ISCALE pilot search (the guard against importance-weight collapse), and `impmap_mceta` runs its multi-start MAP within every class. Two IMPMAP options are **not** wired for mixtures and warn when set: `impmap_trace` (no iteration trace is produced) and `impmap_auto` / `imp_auto` (the sample count stays fixed).
+
+## Simulation under a mixture
+
+Every simulation path draws a class for each subject, then simulates that subject as that class: `MIXNUM` is the drawn class, and η and ε come from that class’s Ω and Σ (its `omega(k)` / `sigma(k)` overrides, or the base values where it has none). This is what NONMEM’s `$SIMULATION` does with a `$MIX` model. The paths are `simulate()`, `simulate_with_seed()`, `simulate_with_options()`, `simulate_with_uncertainty()`, the adaptive-dosing simulator, and the reference simulation behind NPDE and NPD.
+
+- **The draw.** Class $k$ is chosen with the probability $p_{ik}$ that the `[mixture]` block gives at subject $i$’s own covariates and the simulated θ. A class with $p_{ik} = 0$ is never chosen.
+
+- **Per replicate.** The class is drawn again for every replicate, and for every uncertainty draw, so a subject’s class varies across a VPC the way it would across trials. Over replicates, its share of class $k$ is $p_{ik}$. The draw does not use the posterior `PMIX` of a fitted subject: a simulation is a new trial, not a replay of the data.
+
+- **Reproducibility.** The class draw uses its own random stream, keyed by the seed, the subject ID, the draw and the replicate. The η and ε draws are exactly those of the single-population model with the same seed. If every subject is certain to be in class $k$, the run equals, row for row, the run of class $k$’s single-population model. Without a seed, as with `simulate()`, the class stream takes its seed from entropy, like the η stream.
+
+- **Zero variances.** An η declared `~ 0.0` draws exactly 0 in every class that inherits it from the base, as it does in a single-population model. The same holds for an `omega(k) ETA ~ 0.0` override in class $k$. After a fit, where such an η is held at `1e-8`, it is read back as 0 only if it is `FIX`. The flag that counts is the class’s own, so a `FIX` on the base does not carry over to an estimated `omega(k)` override.
+
+- **The class on each row.** Every simulated row carries the class its subject ran under in that replicate, as `SimulationResult::mixnum` (`Some(k)`, 1-based like `MIXNUM`; `None` on a model without `[mixture]`), on the `simulate*` paths, `simulate_with_uncertainty()` and the adaptive trajectories. It is NONMEM’s `$TABLE MIXNUM` under `$SIMULATION`: split a VPC by class with it, or check the realised class shares against the mixing probabilities (#2372). A `ferx --simulate` run keeps it on the simulated population (`Subject::simulated_mixnum`) and writes it to the sdtab as `MIXNUM`.
+
+Before \#2163, every subject was simulated as class 1 with the base Ω and Σ, whatever the mixing probabilities were.
+
+Three inputs are refused for a mixture model, because they would require a fitted subject’s η to belong to one class:
+
+- **Propensity-score matching** (`simulate_with_options()` with `match_method`) fails with `E_PROPENSITY_INPUT`, because the posthoc η would be estimated under class 1.
+- **Supplied η** for adaptive dosing fail with `E_SUPPLIED_ETAS`.
+- **Supplied η** for an individual survival curve (`predict_survival_at_etas_diag`) fail with `E_SUPPLIED_ETAS`: η̂ was estimated under the subject’s class, and the entry has no class to evaluate it under.
+
+`SimulationResult` does not yet report which class each row was simulated in.
+
+### NONMEM cross-check (`nonmem_anchor/mixture_sim_class.ctl`)
+
+This check simulates two classes:
+
+- class 2 clears 4× faster than class 1;
+- class 2 has a wider Ω and Σ;
+- the class-1 probability depends on WT, and runs from 0.14 to 0.76 over 20,000 subjects.
+
+The model is simulated under NONMEM 7.5.1 `$SIMULATION ONLYSIM` and under `simulate_with_seed()`. The two engines use different random generators, so the comparison is between distributions, not rows. In each WT tercile, at each time, and for both IPRED and DV, the share of ferx samples that fall below each NONMEM quantile (10th to 90th percentile) is that quantile’s level. The worst of the 150 comparisons is 2.4 standard deviations. NONMEM’s own class-1 share in each tercile matches the mean P(1) of that tercile. If every subject is simulated as class 1, as before the fix, the worst comparison is 93 standard deviations. The test is `tests/mixture_simulate_nonmem_anchor.rs`.
+
+## Not yet supported
+
+The following error clearly rather than silently mis-fitting:
+
+- Per-class σ overrides (`sigma(k)`) under SAEM (held at their initial values, with a warning), and per-class Ω/σ overrides under Bayes and estimating IMP/IMPMAP (rejected) — use FOCE/FOCEI to fit those.
+- IOV / FREM / SDE under the mixture IMP paths (objective evaluation and estimation) — use FOCE/FOCEI.
+- A theta shared between the `[mixture]` mixing expression and a structural typical value, under SAEM and under estimating IMP/IMPMAP. Both run the mixing M-step separately from the θ/σ M-step, so a shared theta would be double-owned; FOCE/FOCEI’s joint marginal handles it.

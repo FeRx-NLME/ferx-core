@@ -1,0 +1,439 @@
+# Data Format
+
+ferx-core reads data in NONMEM-compatible CSV format. This is the standard format used across population PK tools.
+
+## Required Columns
+
+| Column | Type           | Description                                 |
+|--------|----------------|---------------------------------------------|
+| `ID`   | string/numeric | Subject identifier                          |
+| `TIME` | numeric        | Observation/event time on the data clock    |
+| `DV`   | numeric        | Dependent variable (observed concentration) |
+
+> **`TIME` need not start at zero.** A subject’s `TIME` column may begin at any value (e.g. a calendar/clock time). Integration starts at each subject’s first record — matching NONMEM — so an off-zero start is **not** integrated over a phantom `[0, first record]` window. A record is any row the reader keeps: a dose, an observation of any endpoint, a reset, an `EVID=2` row, or an `EVID=0` row with `MDV=1`, which includes one skipped for a missing `DV` (`W_MISSING_DV`, below). So on an `[odes]` model whose state moves before the first observation (a production term, `TIME` in the right-hand side, an `init()` that is not an equilibrium), a leading covariate-marker row is where the clock starts. Before [\#1809](https://github.com/FeRx-NLME/ferx-core/issues/1809) such a row was dropped on a subject whose covariates were all constant, and an `MDV=1` row on every subject, and integration started at the first observation or dose. Before [\#2368](https://github.com/FeRx-NLME/ferx-core/issues/2368) a time-to-event, count or discrete-state row, and a row skipped for a missing `DV`, were not records of the PK model either. An endpoint row ahead of every other record still is not one, so a subject with only endpoint rows integrates from 0. `TIME` is used exactly as written everywhere it is visible: the model `TIME`/`T` builtin, `[derived]` columns, the survival left-truncation `TENTRY`, and the sdtab / `predict()` / `simulate()` output. ferx does not re-base `TIME` onto a per-subject elapsed clock (the one exception is stacked reset occasions — see [System Resets](#system-resets-evid3-evid4)).
+
+## Optional Standard Columns
+
+| Column | Type | Default | Description |
+|----|----|----|----|
+| `EVID` | integer | 0 | Event ID: 0 = observation, 1 = dose, 2 = other event, 3 = system reset, 4 = reset + dose. If the column is omitted, the record type is inferred from `AMT` — see [Inferring doses without an `EVID` column](#inferring-doses-without-an-evid-column). |
+| `AMT` | numeric | 0 | Dose amount (for `EVID=1`/`EVID=4`; also the dose-inference signal when `EVID` is absent) |
+| `CMT` | integer | 1 | Compartment number (1-indexed). Negative only on an `EVID=2` row, where it turns that compartment off; see [Compartment on/off](#compartment-onoff-evid2-cmt-n). A float-formatted integer (`2.0`, as pandas writes a whole column once any cell in it is blank) reads as that integer. A missing (`.`/blank/`NA`) or unreadable cell, and an absent column, fall back to compartment 1 — reported as `W_CMT_DEFAULTED` whenever `CMT` selects something on that model, whether a dose’s compartment or an observation’s readout, scale or error model; see [`CMT` on `[odes]` models](#cmt-on-odes-models). |
+| `RATE` | numeric | 0 | Infusion rate. `0` = bolus, `>0` = constant-rate infusion (duration = `AMT/RATE`). NONMEM’s coded values `-1` (modeled rate via an `R{cmt}` `$PK` parameter) and `-2` (modeled duration via a `D{cmt}` `$PK` parameter) are supported on both analytical and ODE models — see [Infusion Doses](#infusion-doses). |
+| `MDV` | integer | 0 | Missing DV flag. 1 = DV should be ignored (row excluded from the likelihood). A non-dose `MDV=1` row is still a record, read like an `EVID=2` row: it can start the integration, and its covariate values govern the interval that ends at it, as in NONMEM. |
+| `II` | numeric | 0 | Interdose interval for repeated dosing |
+| `SS` | integer | 0 | Steady-state flag. 1 = assume steady state |
+| `CENS` | integer | 0 | Censoring flag. `1` = below LLOQ and `DV` carries the LLOQ; `-1` = above ULOQ and `DV` carries the ULOQ; `0` = quantified. Paired with `bloq_method = m3` in `[fit_options]` to enable likelihood-based handling — see [BLOQ example](examples/bloq.llms.md). Any other whole number is read by its sign and warned about; a cell that is not a whole number (`abc`) is an error — see [out-of-domain values](model-file/bloq.llms.md#out-of-domain-values). |
+| `L2` | integer | 0 (ungrouped) | Level-2 grouping id (NONMEM data item). Observation rows sharing an `L2` value within a subject form one **correlated observation unit** and pick up the `block_sigma` cross covariance — e.g. the total and unbound rows of one blood draw. `0` / absent = ungrouped. Only affects models with a [`block_sigma`](model-file/error-model.llms.md) correlated residual; see [Covariate-selected error models](model-file/error-model.llms.md). |
+
+> **An integer column may be float-formatted.** pandas writes a whole integer column as `1.0`, `2.0`, … once any cell in it is blank, and ferx’s own sdtab writes `CENS` as `1.000000`. Every integer column above, `ADDL`, the [occasion column](#occasion-column-iov) and `FREMTYPE` read such a cell as the whole number it spells, as NONMEM does: `ADDL=2.0` is two additional doses, `MDV=1.0` excludes the row, `CENS=1.0` is below the LLOQ, and a [`[data_selection]`](model-file/data-selection.llms.md) rule such as `ignore = CENS == 1` removes it ([\#1496](https://github.com/FeRx-NLME/ferx-core/issues/1496)).
+
+> **Missing DV on observation rows.** An `EVID=0` row contributes to the likelihood only when its `DV` is present. If the `DV` is missing (`.`, `NA`, or blank), mark the row `MDV=1`. As a safety net, ferx also treats an `EVID=0` row with a missing `DV` as `MDV=1` even when the flag is absent — the row is skipped rather than scored as `DV=0`, and kept as a record like any `MDV=1` row — and emits a single `W_MISSING_DV` warning reporting how many rows were skipped. Set `MDV=1` explicitly to silence it, or fix the data if the missing values are an error.
+>
+> **Simulation reads it the other way round.** When the dataset is a *design* being simulated from, the `DV` is the column about to be produced, so `DV = .` at every sampling time means “simulate here” rather than “nothing to score here”. `simulate()` fed a population read by `read_population_for_simulation()` keeps those rows and emits one simulated record per sampling time; no placeholder number is needed in the `DV` column. The kept rows are reported once as `W_DESIGN_DV`, so a simulation run off an observed dataset shows that it kept rows a fit would have skipped. `MDV=1` still excludes the record on both paths — that is the explicit statement that the row is not an observation. Such a population is for simulation only: passing it to `fit()` is rejected with `E_NONFINITE_DV`.
+
+## A cell that is not a number
+
+A cell ferx cannot read — `abc`, a stray unit (`5 mg`), or a fraction in a whole-number column (`EVID=1.5`) — is an **error** on a record that reads that column, as it is in NONMEM. Measured on NONMEM 7.5.1: `abc` in any of the columns below stops NM-TRAN with `(DATA ERROR) … ITEM IS NOT A NUMBER`, `MDV=1.5` with `INVALID MDV FIELD`, and `EVID=1.5`, `EVID=-1` and `ADDL=1.5` stop the run with `EVENT IDENTIFICATION DATA ITEM HAS INAPPROPRIATE VALUE` / `ADDITIONAL DOSES DATA ITEM MUST BE A NON-NEGATIVE INTEGER`. One difference: NONMEM rejects `abc` on **every** record it keeps, a dose record’s `DV` included, while ferx rejects it only on a record that reads the column. Before [\#1501](https://github.com/FeRx-NLME/ferx-core/issues/1501) ferx read such a cell as `0` without a warning: `DV = abc` was scored as a measured `0.0`, `EVID = abc` turned a dose into an observation, `ADDL = abc` dropped the additional doses.
+
+| Column | Must be | Read on |
+|----|----|----|
+| `TIME`, `EVID` | a number; a whole number from 0 to 4294967295 for `EVID` | every record |
+| `AMT` | a number | a dose record — and every record when the dataset has no `EVID` column, since the record type is then [inferred from `AMT`](#inferring-doses-without-an-evid-column) |
+| `MDV` | a non-negative whole number | an `EVID=0` record |
+| `RATE`, `II`, `SS` | a number | a dose record (`SS` other than 0 or 1 is rejected as before) |
+| `ADDL` | a non-negative whole number | a dose record |
+| `DV` | a number | an observation record (`EVID=0`, `MDV=0`), every endpoint |
+| `TENTRY` | a number | a time-to-event observation record |
+| `FREMTYPE` | a whole number from 0 to 65535 | a Gaussian observation record |
+| `CENS` | a whole number | a Gaussian observation record — see [out-of-domain values](model-file/bloq.llms.md#out-of-domain-values) |
+
+The message names the subject, the record’s `TIME` (or its position among the subject’s records, when `TIME` is the unreadable cell), the column and the cell. Three things are unchanged:
+
+- **A missing cell** (`.`, blank, `NA`, `NaN`) keeps the column’s default in the table above; only a present cell that is not a number is an error.
+- **A record the `[data_selection]` block removes is not read**, so a cell on it is not checked — NONMEM behaves the same way with `IGNORE`. The rule that removes the record must not decide it on the unreadable column itself: `ignore = CENS == 0` on `CENS = abc` would decide the record on a value the dataset does not hold, so it is an error too, naming the rule. The same holds for a rule that keeps the record on that column. A rule decides on the column only when its other terms hold: `ignore = EVID == 2 && RATE == 0` on an observation with `RATE = abc` is decided by `EVID` and reads without error. NONMEM 7.5.1 agrees on both sides of the single-term case: `IGNORE=(TIME.EQ.2)` removes a `CENS = abc` record without error, while `IGNORE=(CENS.EQ.0)` on it is a `(DATA ERROR)`. See [missing and unreadable cells](model-file/data-selection.llms.md#missing-and-unreadable-cells).
+- **`CMT`, the occasion column and `L2` keep their own handling**: an unreadable `CMT` falls back to compartment 1 and is counted in `W_CMT_DEFAULTED`, an unreadable occasion is counted in `W_IOV_OCC_MISSING`, and an unreadable `L2` is ungrouped.
+
+Why an unknown whole number is an error in `SS` but a warning in `CENS`: `SS=2` has a NONMEM meaning (superimpose the steady state) that ferx would run as something else (`SS=1`, reset), so the fit would be wrong; a `CENS` flag is only ever read by its sign, so under `bloq_method = m3` `CENS=7` is fitted as `CENS=1`, and the `W_CENS_UNEXPECTED` warning says how each method reads it.
+
+## Inferring doses without an `EVID` column
+
+`EVID` is optional. When the column is **absent**, ferx infers the record type from `AMT`, exactly as NONMEM does: a row with a nonzero `AMT` is treated as a **dose** (`EVID=1`), and every other row as an **observation** (`EVID=0`). This lets legacy NONMEM datasets that omit `EVID` — marking dose rows only by a nonzero `AMT` (often with `MDV=1`) — administer their doses instead of silently dropping every `AMT` row and fitting a degenerate, dose-free model.
+
+``` csv
+ID,TIME,DV,MDV,AMT
+1,0,.,1,100
+1,1,9.5,0,.
+1,2,7.3,0,.
+```
+
+Here the first row (`AMT=100`) is inferred as a dose; the others are observations. Inference keys on `AMT` only — a dose always carries a nonzero amount (for infusions, `AMT` is the amount and `RATE` the rate). When an `EVID` column **is** present, its values govern and nothing is inferred.
+
+One hard error and three warnings guard against a silently dose-free (or zero-dose) fit:
+
+- **`E_DOSE_NO_AMT`** *(error)* — the dataset has dose rows (`EVID=1`/`4`) but **no `AMT` column**, so every dose amount is zero and the fit would run with no drug in the system (a flat objective that pins every parameter at its initial estimate). This usually means the amount column is named something other than `AMT` (e.g. a NONMEM export using `DOSE`); rename it to `AMT` in the CSV header or via a rename in the `[data]` block.
+- **`W_ALL_DOSES_ZERO`** — an `AMT` column **is** present but every parsed dose has `AMT = 0` (e.g. a placebo-only typo or a mis-scaled amount column). Same flat-objective symptom as the error above, but the column exists so it is a warning rather than a hard stop.
+- **`W_AMT_NOT_DOSED`** — one or more **non-observation** rows carry `AMT != 0` but were not treated as doses: an `EVID` column is present and codes a dose row as something other than `1`/`4` (e.g. a dose row mistyped `EVID=0` with `MDV=1`). Their `AMT` was ignored. A *scored* observation (`MDV=0`) that merely carries a redundant or forward-filled `AMT` does **not** trigger this.
+- **`W_NO_DOSES`** — the dataset parsed **zero** dose events even though scored observations are present (usually a missing `AMT`/`EVID`). Not emitted for time-to-event/survival datasets, which legitimately have no PK doses.
+
+## Occasion Column (IOV)
+
+When using Inter-Occasion Variability (IOV), add an occasion-index column to the dataset and specify its name with `iov_column` in `[fit_options]`. The column:
+
+- Contains **integer occasion indices** (e.g. 1, 2, 3…) — one per row
+- Applies to both dose rows and observation rows, and also to `EVID=2` rows, `EVID=0` rows with `MDV=1` and resets: such a row governs the interval that ends at it, so it runs under its own occasion (see [Occasions](model-file/iov.llms.md#occasions))
+- Is **excluded from covariate auto-detection**
+
+Example dataset with `OCC` column:
+
+``` csv
+ID,TIME,DV,EVID,AMT,CMT,MDV,OCC
+1,0,.,1,100,1,1,1
+1,1,9.5,0,.,.,0,1
+1,2,7.3,0,.,.,0,1
+1,24,.,1,100,1,1,2
+1,25,10.1,0,.,.,0,2
+1,26,8.2,0,.,.,0,2
+```
+
+The occasion index can be any positive integer; they do not need to start at 1 or be consecutive, but a different number means a different occasion with its own kappa EBE.
+
+See [IOV documentation](model-file/iov.llms.md) for full details.
+
+## Covariate Columns
+
+By default, any column not in the standard set above is automatically treated as a covariate. Alternatively, declare covariates explicitly with a [`[covariates]`](model-file/covariates.llms.md) block in the model file; when present it is authoritative (only listed columns are covariates) and enables type tagging, validation, and the covariate output table. Covariate values are:
+
+- **Time-constant**: The first non-missing value for each subject is used
+- **Time-varying**: If values change over time for a subject, Last Observation Carried Forward (LOCF) is applied per event (NONMEM-equivalent: `[individual_parameters]` is re-evaluated at each dose and observation row using that row’s covariate values)
+
+A covariate column that exists but has no value for a subject — every cell `.`, blank or `NA` — is read as `NaN` for that subject, not `0`, and the reader warns once per covariate with `W_COVARIATE_MISSING`, naming the covariate and up to five of the subjects. The warning is raised only for a covariate a relation of the model reads — in any block, `[individual_parameters]`, `[scaling]`, `[error_model]`, `[derived]`, `[output]`, a numeric `[data_selection]` comparison and so on (a string comparison such as `FLAG == DROP` reads the raw text, so a label column is not reported); a column no relation reads cannot affect the fit or an output, so a gap in it is not reported, even when the column is declared in `[covariates]` or listed in `covariate_columns` ([\#2599](https://github.com/FeRx-NLME/ferx-core/issues/2599)). The model-blind `read_nonmem_csv` readers do not know the model and warn for every column. What a relation then does with the `NaN` depends on the operation: `/`, `-`, `^` and `exp` keep it, so the objective is non-finite; `log` and `sqrt` floor it, `min(a, b)` and `max(a, b)` return `b` when `a` is the `NaN` (and the `NaN` when `b` is), and a comparison is false (`!=` true), so the subject gets a finite value and the warning is the only sign anything is wrong. Impute the column, exclude the subjects, or guard the relation with [`present(COV)`](model-file/covariate-model.llms.md#missing-covariate-values).
+
+Covariate names are **case-sensitive**: a column name in the data file must match the name used in `[individual_parameters]` expressions (and in a `[covariates]` block) exactly. (Standard NONMEM columns like `ID`/`TIME` are matched case-insensitively; covariate columns are not.)
+
+### Time-varying covariate scope
+
+Time-varying covariates are supported for **all** analytical structural models and ODE-defined models:
+
+- 1-compartment IV (`one_cpt_iv`) — bolus and/or infusion per dose
+- 1-compartment oral (`one_cpt_oral`)
+- 2-compartment IV (`two_cpt_iv`) — bolus and/or infusion per dose
+- 2-compartment oral (`two_cpt_oral`)
+- 3-compartment IV (`three_cpt_iv`) — bolus and/or infusion per dose
+- 3-compartment oral (`three_cpt_oral`)
+- All ODE-defined models (via `[odes]`)
+
+For oral models, the bolus dose into compartment 1 is interpreted as the depot (NONMEM ADVAN2/ADVAN4/ADVAN12 convention) and observation read-out reads the central compartment.
+
+The analytic `Dual2` gradient path is event-driven for all analytical models; time-varying-covariate subjects fall back to finite differences for both the inner-loop gradient and the H-matrix Jacobian (a planned analytic-sensitivity extension).
+
+Infusion routing on the event-driven path:
+
+- **IV models**: central infusion (cmt=1) for all 1/2/3-cpt; **peripheral infusion** for 2-cpt (cmt=2) and 3-cpt (cmt=2 → periph1, cmt=3 → periph2). Steady-state amounts per channel are computed by linear superposition over the channels.
+- **Oral models**: depot infusion (cmt=1, a zero-order release then first-order `KA` absorption), central infusion (cmt=2, depot-bypassing), and — since \#375 — **peripheral infusion** (cmt=3 on `two_cpt_oral`; cmt=3 → periph1, cmt=4 → periph2 on `three_cpt_oral`). The oral propagators reuse the IV forced response: nothing flows back into the depot, so a rate into a peripheral drives exactly the central/peripheral sub-system the IV model has.
+
+Every compartment of the six analytical disposition models is therefore infusable. What is still rejected is `CMT=0` on an infusion (NONMEM’s *default dose compartment* is defined for a bolus, not for a zero-order input — name the compartment explicitly) and any `CMT` past the end of the model’s state vector. Transit and inverse-Gaussian absorption models are dosed through the depot (`CMT=1`) only.
+
+### `CMT` on `[odes]` models
+
+Both rules above apply unchanged to a model defined with an `[odes]` block, reading the block’s declared `states=[…]` list instead of a built-in model’s compartment list:
+
+- **`CMT` is 1-based against the declared states.** `states=[depot, central]` accepts `CMT=1` (depot) and `CMT=2` (central); `CMT=3` is an error naming the declared states. Before \#899 such a dose was **silently dropped** — the fit converged and reported a finite OFV having ignored it.
+- **`CMT=0` is NONMEM’s default dose compartment** and resolves to the first declared state, exactly as on the analytical engine. An *infusion* with `CMT=0` is rejected, for the same reason as above.
+- **A dataset that does not say gets compartment 1, and says so.** An absent `CMT` column, a missing cell (`.`/blank/`NA`) and an unreadable one all fall back to compartment 1, and every dose or observation row resolved that way is counted into one `W_CMT_DEFAULTED` warning. This is where NONMEM and ferx genuinely differ: `$MODEL` can declare `DEFDOSE` on any compartment, so NM-TRAN resolves an undecorated dose against *that*, while ferx has no such declaration to fall back on. A translated model whose `DEFDOSE` is not the first declared state therefore gets its drug in the wrong place — measured on a 1-cpt oral model written `states=[central, depot]`, an FOCEI OFV of 154050.6 where NONMEM reads −182.667 ([\#1009](https://github.com/FeRx-NLME/ferx-core/issues/1009)). Give the dataset a `CMT` column ordered like `states=[…]`, map an existing header onto it with `CMT = <header>` in `[data]`, or write `CMT=1` explicitly to say you meant the first state. When a defaulted dose row carries `ADDL`, the message also reports the expanded dose count — one cell can deliver thirty-one doses to the guessed compartment.
+
+Unlike the analytical engine there is no infusable subset: every declared state accepts both a bolus and an infusion. A compartment fed by a built-in absorption function (`transit()`, `first_order()`, …) is the one exception to how the dose *arrives* — it is delivered as an input rate over time rather than as an instantaneous bolus — but it is dosed by naming its `CMT` like any other.
+
+### When a defaulted `CMT` is reported (`W_CMT_DEFAULTED`)
+
+`CMT` addresses **three** things, and the warning covers all of them.
+
+The first is **which compartment a dose lands in** — and that is not only an `[odes]` question. An oral model’s `CMT=2` is the depot-bypassing central bolus and a 2-cpt IV model’s `CMT=2` is a peripheral bolus, both routed through the event-driven walk and both anchored against NONMEM (`ADVAN2` central, `ADVAN3`/`ADVAN4` peripheral). So a dataset that meant one of those and lost its `CMT` column silently gets a compartment-1 bolus instead, exactly as a translated `DEFDOSE` model does. The warning therefore fires for any model with more than one compartment a dose can reach, and stays silent for the models where there is nothing to choose: `one_cpt_iv`, a one-state `[odes]` model, a compartment-free model, and the transit / inverse-Gaussian absorption models, whose closed form absorbs every dose through the depot whatever `CMT` says.
+
+The second is **which readout, scale or error model an observation uses**. This one is engine-independent: a per-CMT `[scaling]` block parses on a `pk` model, and its validation only checks that the *observed* compartments have entries, so a `CMT`-less dataset keys every row to 1, `{1}` is a subset of `{1, 2}`, and nothing complains. Measured on `pk one_cpt_iv` with `obs_scale[CMT=1] = 1000` and `obs_scale[CMT=2] = 1`: the same data spelled with `CMT=2` gives OFV 0.0357, with the column dropped 6097015712.1246. The same holds for per-CMT `y[CMT=N]` readouts and `CMT=N:` error models — on a one-state `[odes]` model with `y[CMT=1] = central/V` and `y[CMT=2] = central/V*1000`, OFV 10028.0940 with the column against 0.0357 without.
+
+A model with a **declared endpoint** (survival, binary, categorical, CTMM) is reported too, and on an absent `CMT` column that duplicates `E_ENDPOINT_NO_RECORDS`. The duplication is deliberate: an endpoint model routes its rows **by CMT**, so a compartment the reader invented picks the endpoint. Suppressing the warning here on the grounds that `E_ENDPOINT_NO_RECORDS` already names the missing column was tried and reverted, because it covers only the absent-column case — a *missing* or *unparseable* cell leaves every endpoint with rows, so that error cannot fire, and the defaulted row is silently re-routed between endpoints instead. Measured on a competing-risks model with its endpoints at `cmt = 1` and `cmt = 2` (not the shipped example, whose endpoints are 2 and 3), one event row’s cell spelled `x` rather than `2`: the event moves from `cause_b` to `cause_a`, OFV 27.8497 against 28.3610, with no diagnostic at all while the warning was suppressed.
+
+Since [\#1409](https://github.com/FeRx-NLME/ferx-core/issues/1409) this reads the model’s **declared endpoints** rather than the shape of its error-model table, so an endpoint model that *also* declares an `[error_model]` is covered — it gets `ErrorSpec::Single`, and keying on the empty per-CMT error map used to miss it entirely. Measured on `examples/tte_exponential.ferx`, where a bad `CMT` cell moves an event row into the Gaussian grid for an OFV of 254.5871 against 166.4395: silent before, reported now. The mirror limit is closed too: an **endpoint-only** model whose only endpoint sits at `cmt = 1` is no longer reported, because the reader’s fallback *is* that endpoint and a row explicitly assigned any other compartment falls into the Gaussian vectors, where the empty per-CMT error map stops it with `E_PER_CMT_ERROR_MODEL` — there is nothing to guess wrong, and nothing silent about getting it wrong. The same endpoint on a model that also scores ordinary observations still reports, since a defaulted row there picks between the endpoint and the Gaussian grid.
+
+A `[data_selection]` clause that compares `CMT` is the third thing the column addresses, and is likewise covered. The filter is handed the compartment the reader *resolved*, so a guess can make a clause stop matching (a row you meant to drop is kept) or start matching (a row you meant to keep is deleted). Rows deleted that way are counted and named separately in the message, because they never reach the dose / observation counts; see [Data selection](model-file/data-selection.llms.md#supported-columns).
+
+## Event Types (EVID)
+
+| EVID | Meaning |
+|----|----|
+| 0 | Observation record. `DV` is used for estimation. |
+| 1 | Dosing record. `AMT` is administered to compartment `CMT`. |
+| 2 | Other event (typically a covariate-change marker). With a negative `CMT` it turns a compartment off, and with a positive one back on: see [Compartment on/off](#compartment-onoff-evid2-cmt-n). Otherwise the compartment state is unchanged but the rate matrix is refreshed from this row’s covariate values — matching NONMEM’s `$PK runs at every record` semantic. It is a record on every subject, time-varying covariates or not: the first one can be where the integration starts (see [`TIME` need not start at zero](#required-columns)). An `EVID=0` row with `MDV=1` is read the same way. |
+| 3 | System reset. All compartment amounts are set to zero at this time, and any ongoing infusion is turned off. No dose is given and `DV` is ignored. |
+| 4 | Reset and dose. Like EVID=3 (zero every compartment, stop ongoing infusions) followed immediately by a dose of `AMT` into compartment `CMT`. |
+
+## Record order at a shared `TIME` (pre-dose troughs)
+
+When an observation and a dose carry the **same** `TIME`, their order in the data file decides whether the sample is pre- or post-dose — exactly as in NONMEM, which processes records top-to-bottom:
+
+- **Observation row *before* the dose row** → a **pre-dose trough**: the dose has not yet been given, so the prediction excludes it.
+- **Observation row *after* the dose row** → a **post-dose sample**: the dose is already on board and contributes to the prediction.
+
+This is the common trough pattern in maintenance-dosing data (a level drawn immediately before the next infusion):
+
+``` csv
+ID,TIME,DV,EVID,AMT,CMT,MDV
+1,0,.,1,300,1,1
+1,14,18.6,0,.,.,0     # trough — listed BEFORE the day-14 dose → pre-dose
+1,14,.,1,300,1,1      # day-14 dose
+1,42,24.7,0,.,.,0     # trough before the day-42 dose
+1,42,.,1,300,1,1
+```
+
+ferx reproduces the NONMEM prediction for both orderings. (Internally a pre-dose observation is ordered just ahead of its coincident dose; the `TIME` reported in `sdtab`/`covtab` and by `predict()`/`simulate()` is the value you wrote.) You do **not** need to nudge trough times by a small epsilon to force pre-dose evaluation, as is sometimes done when porting NONMEM datasets.
+
+The same holds at a **steady-state** dose (`SS=1`). An observation listed before a co-timed `SS=1` row reads the amounts carried from the previous record: the initial state before a first SS dose (0, or the `init()` value), or the history so far before a later one. An observation listed after it reads the steady state. Measured against NONMEM 7.5.1 (`nonmem_anchor/dtmm_ss_record_order.ctl`). Before [\#2510](https://github.com/FeRx-NLME/ferx-core/issues/2510) ferx read the steady state for both orderings.
+
+Two cases are not yet covered ([\#2568](https://github.com/FeRx-NLME/ferx-core/issues/2568)). A time-to-event, CTMM or other non-Gaussian record listed before a co-timed dose still sees that dose. In a tie that holds a dose both before and after an observation (including an `ADDL`-implied dose landing at the tie), the observation sees both doses, whereas NONMEM’s sees only the first.
+
+### NONMEM comparison
+
+The infliximab population-PK benchmark (`run55`, ADVAN3 `TRANS4`, 42 subjects, 182 of 183 observations drawn as troughs at a dosing time) reproduces the NONMEM `METHOD=1 INTER` fit once record order is honored:
+
+| Parameter                       | NONMEM | ferx (FOCEI) |
+|---------------------------------|-------:|-------------:|
+| OFV                             |  662.2 |        664.0 |
+| CL (L/day)                      |  0.199 |        0.198 |
+| V1 (L)                          |   4.94 |         5.04 |
+| ATI effect on CL                |  0.722 |        0.763 |
+| Maintenance-phase CL multiplier |   1.40 |         1.41 |
+
+(The small OFV offset is the time-conditional residual-error term the ferx translation omits, not a structural difference.) Scoring the same model at the NONMEM estimates **without** record-order handling gave OFV 3751 — every trough mispredicted as a post-dose peak.
+
+### Covariate-change rows at a shared `TIME`
+
+An `EVID=2` row (or an `EVID=0, MDV=1` row) at the same `TIME` as an observation or a dose follows the same file-order rule. NONMEM advances the system into a shared `TIME` once, at the first record there in file order and under that record’s covariates, and every later record there advances by zero. So with exposure `X` changing at `TIME 4`:
+
+``` csv
+ID,TIME,DV,EVID,AMT,MDV,X
+1,4,5.2,0,.,0,1     # observation first: the interval ending at 4 runs on X = 1
+1,4,.,2,.,1,2       # covariate change, takes effect after the observation
+```
+
+Listed the other way round, the interval runs on `X = 2`. The same goes for an `EVID=2` row listed before a co-timed dose: the interval runs on the `EVID=2` row’s covariates, not the dose row’s. In each case the observation reads its own covariates in the readout, so only the state at the tie depends on the order. Before [\#1810](https://github.com/FeRx-NLME/ferx-core/issues/1810) ferx ran that interval on the `EVID=2` row in the first case and on the dose row in the second, whatever the file said. An `SS=1` dose follows the same rule (#2510). Measured against NONMEM 7.6.0 on \#1810’s seven tie cases, on an `[odes]` model and on `ADVAN1`.
+
+A reset (`EVID=3`) at the tie replaces the state there, so the covariate rule above does not apply to it, but the trough rule still does. The reset is always the first record at its engine `TIME`: anything listed before it at that `TIME` starts a new period (see [System Resets](#system-resets-evid3-evid4)). So an observation in the tie is listed after the reset and reads the reset state, and when a dose follows it, it does not see the dose:
+
+``` csv
+ID,TIME,DV,EVID,AMT,MDV
+1,30,.,3,.,1        # reset
+1,30,5.0,0,.,0      # trough: reads the reset state, not the dose
+1,30,.,1,100,1      # dose
+```
+
+Before [\#2728](https://github.com/FeRx-NLME/ferx-core/issues/2728) that trough was scored on the state from before the reset, and the objective was far off NONMEM’s with no warning. It now matches NONMEM 7.6.0 (`nonmem_anchor/reset_trough_tie`).
+
+The move is one ULP. These read the `TIME` you wrote, not the moved one: a `TIME`-keyed level block’s cells, the `(time, occasion)` grouping of `block_sigma` residual pairs, the `TIME` in sdtab, `predict()` and `simulate()`, and the time named in data-check messages ([\#1959](https://github.com/FeRx-NLME/ferx-core/issues/1959)). So does the `TIME` an `[individual_parameters]` expression (and a kappa `weight`) reads, as NONMEM’s `$PK` does: a step such as `if (TIME >= 24)` takes the later branch for a trough written at 24 and listed before a dose at 24 ([\#1969](https://github.com/FeRx-NLME/ferx-core/issues/1969)). Before \#1969 it took the earlier one, and on a 30-subject induction fixture the objective was 1007 units off NONMEM’s; it now agrees to 2e-8 (Linux).
+
+## Compartment on/off (EVID=2, CMT=-N)
+
+An `EVID=2` row with `CMT=-N` turns compartment `N` off, and one with `CMT=N` turns it back on. Urine collection is the usual reason: the bladder is emptied at the end of each collection window, so each window’s amount starts from zero.
+
+``` csv
+ID,TIME,DV,EVID,AMT,CMT,MDV
+1,0,0,1,100,1,1
+1,2,17,0,0,2,0
+1,4,30,0,0,2,0
+1,4,0,2,0,-2,1
+1,6,0,2,0,2,1
+1,8,10,0,0,2,0
+```
+
+Here urine is read at `t=4`, then emptied, and collects again from `t=6`. Every rule below is anchored case by case against NONMEM 7.5.1 (`nonmem_anchor/cmt_toggle.ctl`), except where it says ferx differs. This is `[odes]` only: on any other model the row is refused rather than ignored (`E_CMT_TOGGLE_UNSUPPORTED`).
+
+While a compartment is off:
+
+- **Its amount is zero and stays zero.** Mass that would flow in is lost, and the source compartment keeps losing it. Any `d/dt` term reading the compartment sees zero.
+- **It cannot be observed.** An observation with that `CMT` is an error, `E_OBS_CMT_OFF`, as in NONMEM. Read the compartment before the off row. An `EVID=0`, `MDV=1` row with that `CMT`, which stops a NONMEM run, is accepted here, because it asks for no prediction.
+- **Dose input into it stops, for good.** An infusion running when the row arrives does not resume when the compartment comes back, a lagged dose still in flight never lands, and the rest of an `ADDL` train never arrives.
+
+What turns a compartment on:
+
+- **An `EVID=2` row with `CMT=N`.** It restarts from zero and does not re-apply `init(...)`. On a compartment that is already on, this changes nothing, which is why a covariate marker with a `CMT` is harmless.
+- **A dose into it, at the dose’s arrival.** With a lagtime the amount stays at zero with no inflow until the arrival. Observing it in between reads zero and is not an error.
+- **A reset.** `EVID=3` and `EVID=4` turn every compartment on.
+
+Records at the same `TIME` as an on/off row take effect in file order. An observation listed before the off row reads the amount, one listed after it is refused, and a dose listed before it is wiped. Two placements cannot be represented: an on/off row between two doses at one `TIME`, or between a reset and a dose (`E_CMT_TOGGLE_TIE`). Give the row its own `TIME`.
+
+A negative `CMT` on any other record is an error, `E_NEGATIVE_CMT`. NONMEM stops on one on a dose or an observation too. On an `EVID=3` row it resets and leaves the compartment off, which ferx does not support: write the reset, then an `EVID=2` row.
+
+Limits:
+
+- There is no equivalent of `$MODEL` `INITIALOFF` or `NOOFF`. To start a compartment off, put an off row at the subject’s first record. After a reset it is on again, where `INITIALOFF` would restore it to off, so repeat the row.
+- An `SS=1` dose while a compartment is off is refused (`E_CMT_TOGGLE_SS`). After a lagged dose into the compartment that holds until an `EVID=2` on row or a reset, even once the dose has arrived, because the check cannot read the lag.
+- A compartment fed by a built-in absorption input cannot be switched, and neither SDE nor endpoint models support the rows (`E_CMT_TOGGLE_UNSUPPORTED`). An off row naming a compartment past the model’s states is `E_CMT_TOGGLE_OUT_OF_RANGE`. Adaptive dosing honours them; see [Compartment on/off records](model-file/adaptive-dosing.llms.md#compartment-onoff-records) for how a decision and a controller dose meet one.
+- `[derived]` outputs on the grid read `NaN` for such a subject. Per-observation compartment amounts are exact.
+- A lagged or modeled-rate dose into a switched compartment routes that subject to finite-difference gradients, reported in the usual warning.
+- A `[data_selection]` clause reading `CMT` sees compartment 1 on a negative cell, as on any other unreadable one, and `W_CMT_DEFAULTED` reports a row removed that way. An off row removed by such a clause is ignored.
+
+## System Resets (EVID=3 / EVID=4)
+
+A reset record empties every compartment at its `TIME`, as if the subject’s drug history started over from that point. `EVID=3` is a pure reset; `EVID=4` resets and then administers the row’s dose into the freshly emptied system. This matches NONMEM’s reset-event semantics and is useful for, e.g., modelling washout between treatment cycles or re-using one subject record for independent dosing episodes.
+
+``` csv
+ID,TIME,DV,EVID,AMT,CMT,MDV
+1,0,.,1,100,1,1
+1,1,9.5,0,.,.,0
+1,4,6.1,0,.,.,0
+1,24,.,3,.,.,1
+1,24,.,1,100,1,1
+1,25,9.4,0,.,.,0
+```
+
+### A reset cancels every dose recorded before it
+
+A reset is placed at its **record**, and so is a dose. A dose whose record comes before the reset contributes nothing after it, even when its lagtime (`ALAG`, or a per-route `lag=`) would deliver it after the reset: a lagged bolus that has not yet arrived, and a lagged infusion or absorption window that has not yet opened, are both cancelled. This is what NONMEM does (#1587, measured against `ADVAN2` and `ADVAN13`, `nonmem_anchor/evid_reset_lag`). With `ALAG1 = 2`:
+
+``` csv
+ID,TIME,DV,EVID,AMT,CMT,MDV
+1,9,.,1,100,1,1
+1,10,.,3,.,.,1
+1,12,0.1,0,.,.,0
+```
+
+The dose recorded at 9 would arrive at 11, after the reset at 10, and it is cancelled: the prediction at 12 is 0. With the reset at 8.5 instead, the dose is recorded after the reset and arrives at 11 as usual.
+
+A dose recorded **at** the reset’s time is kept when its row comes after the reset row, including an `EVID=4` row’s own dose. A dose row that comes before a reset row at the same `TIME` is cancelled, which follows row order as NONMEM does. Before \#1587 ferx applied a lagged dose recorded before a reset whenever its arrival came after the reset.
+
+### Stacked occasions with a restarting clock
+
+A common NONMEM idiom is to stack several independent dosing episodes under one subject ID, each opened by an `EVID=4` record whose `TIME` **restarts at 0** (so the records are not globally time-ordered):
+
+``` csv
+ID,TIME,DV,EVID,AMT,RATE,MDV
+1,0,.,4,100,100,1
+1,1,9.4,0,.,.,0
+1,8,2.1,0,.,.,0
+1,0,.,4,100,100,1
+1,1,9.6,0,.,.,0
+1,8,2.0,0,.,.,0
+```
+
+NONMEM processes records sequentially, so the second `EVID=4` begins a fresh occasion that re-uses the first occasion’s wall-clock. ferx-core reproduces this: each restarting occasion is shifted onto a single monotonic internal timeline (the reset zeros every compartment at the boundary, so no drug carries across), and the subject keeps **one shared set of random effects** across the occasions — exactly matching NONMEM’s `EVID=4` semantics. The two occasions are *not* merged or double-dosed.
+
+Diagnostics are reported on the **raw** data clock: the `TIME` column of `{model}-sdtab.csv` (and `{model}-covtab.csv`) echoes the value you wrote, and `TAFD` / `TAD` reset per occasion (time after that occasion’s first / most recent dose). The monotonic shift is purely internal to the prediction engine.
+
+> **`[derived]` integrals and stacked resets.** Integral columns with an absolute window (`[from, to]` or a periodic `anchor`) are evaluated per occasion in raw `TIME` coordinates. Each occasion is integrated independently, so crossover designs produce correct per-occasion AUC values. Occasions with no observations inside the window return `NaN` for that row.
+>
+> **Grid-based integrals** (`step = <dt>` or `step = auto`) evaluate on the internal shifted clock rather than raw `TIME`, so expressions referencing `TIME` inside a grid integral will see the shifted value. Use observation-based integrals (`step = obs` or `data_based = true`) when raw `TIME` must appear inside the integrand expression.
+
+Notes:
+
+- Resets force the [event-driven analytical / ODE prediction path](estimation/foce.llms.md) — dose superposition cannot express a mid-record reset — so any analytical or ODE model supports them with no configuration.
+- Reset-bearing subjects use the analytic gradient where in scope and otherwise fall back to finite-difference gradients; results are unaffected, only the gradient method.
+- Resets are **not** supported on the EKF/SDE path (`[diffusion]` models). A reset row on an SDE model emits a warning and is ignored.
+
+## Example Dataset
+
+``` csv
+ID,TIME,DV,EVID,AMT,CMT,RATE,MDV,WT,CRCL
+1,0,.,1,100,1,0,1,70,95
+1,0.5,9.49,0,.,.,.,0,70,95
+1,1,14.42,0,.,.,.,0,70,95
+1,2,17.56,0,.,.,.,0,70,95
+1,4,15.23,0,.,.,.,0,70,95
+1,8,10.15,0,.,.,.,0,70,95
+2,0,.,1,150,1,0,1,85,110
+2,0.5,14.2,0,.,.,.,0,85,110
+2,1,21.3,0,.,.,.,0,85,110
+```
+
+Key points: - Dose records (`EVID=1`) have `MDV=1` and `DV=.` (missing) - Observation records (`EVID=0`) have `MDV=0` and a valid `DV` - Covariates (`WT`, `CRCL`) are included as extra columns - Missing values can be represented as `.` or left empty
+
+## Infusion Doses
+
+For IV infusions, set `RATE` to the infusion rate (amount per time unit):
+
+``` csv
+ID,TIME,DV,EVID,AMT,CMT,RATE,MDV
+1,0,.,1,500,1,50,1
+```
+
+This administers 500 units at a rate of 50 units/hour (duration = 10 hours).
+
+### NONMEM coded `RATE` values
+
+NONMEM overloads the `RATE` column with negative codes that change its meaning:
+
+| `RATE` | NONMEM meaning | ferx-core |
+|----|----|----|
+| `0` | Bolus — route set by the dose compartment | ✅ supported |
+| `> 0` | Constant-rate infusion (duration = `AMT/RATE`) | ✅ supported |
+| `-1` | Infusion **rate** is *modeled* — defined by `R{cmt}` in `$PK` | ✅ supported on ODE and analytical models (#324) |
+| `-2` | Infusion **duration** is *modeled* — defined by `D{cmt}` in `$PK` | ✅ supported on ODE and analytical models (#324, \#394) |
+
+`RATE = -2` makes the infusion **duration** a model parameter: declare an individual parameter `D{cmt}` (`D1` for a dose into compartment 1, etc.) and ferx infuses `AMT` over that duration — rate `AMT / D{cmt}`, evaluated per iteration and occasion. Supported on **both** the analytical `pk(...)` engine and `ode(...)` models; see [Modeled infusion duration](model-file/ode-models.llms.md#modeled-infusion-duration-dn-rate-2) for the DSL and semantics. A `RATE=-2` dose with no matching `D{cmt}` parameter (on either engine) is a **loud error** — never a silent bolus.
+
+On an analytical **oral** model (`pk one_cpt_oral` / `two_cpt_oral` / `three_cpt_oral`), a `D1` into the **depot** (compartment 1) gives a **zero-order absorption** model: drug is released into the depot at a constant rate over `D1`, then absorbed first-order into central via `KA` (#400). `D2` into the same model is a depot-bypassing infusion straight into central. Both stay on the closed-form analytical engine — no `ode(...)` block needed. (Compartment amounts in `sdtab`/`[derived]` are not available for analytical depot-zero-order subjects; the predictions themselves are exact — use an `ode(...)` model if you need the per-compartment amounts.) `D3` on a `two_cpt_oral` model (and `D3`/`D4` on `three_cpt_oral`) infuses a **peripheral** compartment, also on the closed-form engine since \#375.
+
+`RATE = -1` makes the infusion **rate** a model parameter: declare an individual parameter `R{cmt}` (`R1` for a dose into compartment 1, etc.) and ferx infuses `AMT` at that rate — duration `AMT / R{cmt}`, evaluated per iteration and occasion (the mirror of `-2`). Supported on both engines; a `RATE=-1` dose with no matching `R{cmt}` is the same loud `E_MODELED_RATE_NO_PARAM` error as the duration case. `R{cmt}`/`D{cmt}` are recognised compartment-indexed parameter names (like NONMEM’s reserved `$PK` names); recognising one only reserves it when a coded `RATE` actually targets that compartment.
+
+> **Bioavailability and infusion shape (`F ≠ 1`).** ferx applies `F` to an infusion the NONMEM way (#419), holding whichever quantity you specified and scaling the other so total exposure is `F·AMT` either way:
+>
+> - **rate-defined** (`RATE>0` data **and** `RATE=-1` → `R{cmt}`): the rate is held and the **duration** is scaled to `F·AMT/RATE`. So a `RATE=-1` dose behaves exactly like its explicit `RATE = R{cmt}` twin.
+> - **duration-defined** (`RATE=-2` → `D{cmt}`): the duration is held at `D{cmt}` and the **rate** is scaled to `F·AMT/D{cmt}`.
+>
+> The two modes therefore produce a different infusion *shape* under `F ≠ 1` (same total exposure). At `F = 1` they coincide. (Earlier versions scaled the rate for every infusion, which diverged from NONMEM for rate-defined infusions; \#419.)
+
+Any other negative or non-finite `RATE` on a dose row is rejected. Earlier versions silently treated all coded forms as a bolus, producing wrong predictions with no warning (#324). Note `-1`/`-2` are driven by `$PK` parameters — **not** a separate `DURATION` data column.
+
+A runnable demo of the supported forms — a bolus (`RATE=0`) and a constant-rate infusion (`RATE>0`) mixed in one dataset — is in `examples/dose_rate.ferx` (data: `data/dose_rate.csv`).
+
+## Steady-State Dosing
+
+For steady-state simulations, set `SS=1` and `II` to the dosing interval:
+
+``` csv
+ID,TIME,DV,EVID,AMT,CMT,SS,II,MDV
+1,0,.,1,100,1,1,12,1
+1,0.5,25.3,0,.,.,.,.,0
+```
+
+This assumes the subject has reached steady state with 100 units every 12 hours before the observation at TIME=0.5.
+
+SS=1 is supported on every prediction path: analytical (1-/2-/3-cpt with or without time-varying covariates) and ODE. SS=1 also composes with `LAGTIME` — the lagged SS curve at time `t` equals the un-lagged curve at `t - lagtime`. See [Steady-State Doses](model-file/steady-state.llms.md) for the full reference, including the data-validation warnings emitted for malformed rows (missing `II`).
+
+## Multiple Doses
+
+Multiple doses are supported as separate rows:
+
+``` csv
+ID,TIME,DV,EVID,AMT,CMT,MDV
+1,0,.,1,100,1,1
+1,0.5,9.49,0,.,.,0
+1,12,.,1,100,1,1
+1,12.5,15.2,0,.,.,0
+1,24,.,1,100,1,1
+1,24.5,18.1,0,.,.,0
+```
+
+### Doses after the last observation
+
+A dose after a subject’s last scored record cannot change any prediction in the objective, so `fit()` leaves it out of the likelihood ([\#2778](https://github.com/FeRx-NLME/ferx-core/issues/2778)). Nothing is needed in the dataset: dosing records can run to end of treatment while sampling stops early. An `ADDL` train crossing that point is cut at it.
+
+The cut is per subject, at the last record of any endpoint: an observation, censored or not, or a time-to-event, discrete-state or count record, including the right bound of an interval-censored event. A dose listed ahead of that record at the same `TIME` stays, since it acts on the observation. Later `EVID=2`, `EVID=3` and `EVID=4` rows go with the doses. Four exceptions:
+
+- A subject with a non-Gaussian record also keeps the first record after it, which closes the interval holding that record.
+- A subject’s first dose always stays, because `TAD` and `TAFD` read it before it arrives.
+- A model with a lag keeps every record: a compartment lag (`lagtime`, `ALAG{n}`) or a per-route `lag=`. The estimation search can take a lag negative, which brings a later dose ahead of the last observation.
+- A model with more than one `level` keeps every record.
+
+Only the estimation steps use the shorter list, including `run_covariance()` and `run_sir()`. Data-derived covariate statistics such as `center = median`, validation, `[derived]` outputs, the sdtab and the saved fit all see the dataset as supplied, and `predict()` and `simulate()` keep every dose.
+
+An occasion that only trailing rows carry keeps its `kappa` block, so the layout of the fitted occasions does not change.
+
+A fit matches the same data with those rows deleted exactly, unless an occasion only trailing rows carry keeps its block. Against scoring every record, as earlier versions did:
+
+- Closed-form and constant-parameter ODE fits do not change.
+- With time-varying covariates or IOV, the objective and the EBEs at any given parameters do not change, but the outer gradient can round differently, by up to 3e-15 relative on the test fixtures. The optimizer can amplify that and stop at a slightly different point. Run to convergence on Linux, those fixtures kept the objective to 14 digits and the estimates to 2e-9 relative.
+- A subject whose route depended on the removed rows takes the route of the data without them, for example when a covariate the model reads varied only there. On an integrated ODE the two routes differ within solver tolerance: 1.7e-6 on the test fixture at the default `reltol = 1e-4`, moving the objective from 153.89223 to 153.89225.
+
+## Column Name Case
+
+Column names are case-insensitive. `ID`, `Id`, and `id` are all recognized. Covariate columns preserve their case as declared in the CSV header.

@@ -1,0 +1,221 @@
+# Packed Parameter Space
+
+Every optimizer, the covariance step, SIR, and simulation-with-uncertainty work on a single flat `Vec<f64>` — the **packed parameter vector** — rather than on the model’s natural $(\theta, \Omega, \Sigma)$ values. This page is the canonical description of that vector: its layout, its bounds, and the consequences of living in it.
+
+The packing and unpacking live in `estimation/parameterization.rs` (`pack_params` / `unpack_params`); they are exact inverses.
+
+## Why transform at all
+
+The natural parameters are constrained: $\theta$ and $\Sigma$ are (usually) positive, and $\Omega$ must be symmetric positive-definite. General-purpose optimizers want an unconstrained (or box-constrained) real vector. Packing maps the constrained parameters onto one such vector, so the constraints hold **by construction** on unpacking rather than by rejection:
+
+- a log-packed value can only unpack to a positive number;
+- $\Omega$ is stored by its lower Cholesky factor $L$ and rebuilt as $\Omega = L L^\top$, which is positive semi-definite for any $L$, and positive-definite whenever the diagonal is non-zero — which log-packing the diagonal guarantees.
+
+## Layout
+
+The vector is built in fixed segment order. Later segments are appended, so adding IOV or mixture parameters never shifts an existing index.
+
+| Segment | Packed as | Notes |
+|----|----|----|
+| Theta | $\log \theta_i$ when `theta_lower` $\ge 0$; $\theta_i$ itself otherwise | See [Theta: log vs identity](#theta-log-vs-identity) |
+| Omega (BSV) | $\log L_{ii}$ on the diagonal, raw $L_{ij}$ off-diagonal | $\Omega = L L^\top$; a diagonal Ω packs only the diagonal entries |
+| Sigma | $\log \sigma_k$ |  |
+| Omega (IOV) | same as BSV Omega | Only when the model has an `[iov]` block |
+| Mixture overrides | $\log$ of the class Cholesky diagonal / $\log$ class $\sigma$ | Only per-class Ω/Σ overrides are packed (#977) |
+
+For a two-eta diagonal model with two thetas and one sigma:
+
+$$x = \bigl[\log \theta_1,\ \log \theta_2,\ \log L_{11},\ \log L_{22},\ \log \sigma_1\bigr]$$
+
+and for a `block_omega` on the same two etas the Omega segment becomes $\bigl[\log L_{11},\ L_{21},\ \log L_{22}\bigr]$ — the off-diagonal is packed untransformed, because it is genuinely sign-free.
+
+Note the Omega diagonal is $\log L_{ii}$, i.e. the log of a **standard deviation**, not of the variance: $\omega^2_{ii} = \exp(2 x_{ii})$ for a diagonal Ω.
+
+### Theta: log vs identity
+
+A theta is log-packed when its declared lower bound is $\ge 0$ — the usual case for CL, V, KA. A **negative** lower bound is the opt-in to identity packing, for parameters that must be able to be negative: covariate exponents (`(DOSE/100)^γ`, $\gamma \in [-3, 3]$), additive covariate effects, logit-scale parameters, and neural-network weights. Log-packing those would clamp them at `1e-10` and the optimizer could never reach the true value.
+
+`theta_lower = 0` still log-packs (the `max(1e-10)` floor handles the boundary), so declaring a lower bound of exactly zero does not silently change the parameterization.
+
+#### An identity-packed θ started near zero
+
+An identity-packed θ reaches the NLopt outer optimizers on its natural scale, so one started at, say, `1e-5` is a coordinate whose useful moves sit five orders of magnitude below the optimizer’s unit step and its stopping tolerances (#2159). Whether that matters depends on what the θ is. A volume written in small units (`V = TVV_S / 1e-6`) does need moves of its own size; a covariate exponent started at `0.001` is usually an O(1) slope and needs unit-sized moves.
+
+The value alone cannot tell the two apart, so before the outer optimizer starts, each free identity-packed θ with $0 < |\theta_0| < 0.1$ is evaluated at two more points inside its declared bounds — $\theta_0 \mp \delta$ with $\delta = |\theta_0|/2$, or, when θ₀ sits near a bound, $\theta_0 + \delta$ and $\theta_0 + 2\delta$ on the side with room (two extra inner solves per such θ). The quadratic through the three equally spaced points $x_0 < x_1 < x_2$ has its minimizer at
+
+$$x^* = x_1 - \delta\,\frac{f_2 - f_0}{2\,(f_0 - 2f_1 + f_2)},$$
+
+and the θ is divided by $|\theta_0|$ in the optimizer’s scale vector when $|x^* - \theta_0| \le 10\,|\theta_0|$: the minimizer is predicted within a few times the θ’s own size. Otherwise — and when the second difference shows no positive curvature above $10^{-6}(1 + |f(\theta_0)|)$ — it keeps the unit scale. A probe the optimizer could not take — a `NaN` or diverged objective, or one the EBE guard rejects (more than `max_unconverged_frac` of the subjects unconverged, or a hard-rejected start) — scales the θ, since a move of its own size already leaves the feasible region. A start the guard rejects is not probed.
+
+When every subject is inside the exact R-matrix’s scope (a Gaussian endpoint, no `gradient = fd`, the subject’s random effects within the [analytic widths](../estimation/foce.llms.md#known-fd-fallbacks)), the same quadratic is read off exact derivatives at θ₀ instead of the two probes. The EBEs are re-solved once, warm, at the covariance step’s tolerance (`cov_inner_tol`), and at those modes the pre-flight takes the adjoint gradient $f'$ and the R-matrix’s diagonal $f''$ along each candidate, both of the same objective, penalties included. The second difference is then $f''\delta^2$ and the minimizer’s distance the Newton step $|f'/f''|$, with the same two cuts. A θ those derivatives would leave on the unit scale is still checked at the two probe points with the EBEs held, without re-solving: a non-finite or walled objective there means the optimizer could not take a move of the θ’s own size, and the θ is scaled, as on the probe route.
+
+That costs one warm inner solve and one R-matrix pass along the candidates, where the probes cost two cold population inner solves per candidate, which grew with the number of θ: on a 1,317-θ covariate network the probes took 68 of an 87 s fit.
+
+The probes are used instead when any of these holds:
+
+- a subject does not converge at that tolerance;
+- `analytic_cov_hessian = false`;
+- the model is a `[mixture]`;
+- a subject is outside that scope;
+- `nn_smooth_lambda > 0`, since the smoothness penalty’s Hessian is its Gauss–Newton part only, not the exact curvature.
+
+The statistic is a ratio of objective differences, so the decision does not change when every likelihood contribution is repeated — more subjects, or more observations per subject — which multiplies the objective without moving its minimizer. The objective probed is the one the optimizer minimises: parameter priors and the covariate-NN regularizer are included, so a θ whose small moves a tight prior makes matter is scaled. This applies to `bobyqa`, `slsqp`, `nlopt_lbfgs` and `mma` under the default `parameter_scaling = auto` and under `abs`, `[mixture]` models included (probed on the mixture objective); `none` and `rescale2` keep their own vectors.
+
+Measured on warfarin with `V = TVV_S / 1e-6` and `TVV_S` started at `1e-5` (macOS arm64): BOBYQA used to stop at OFV −205.97, SLSQP at −198.95 and L-BFGS at −269.47, each reporting convergence; all three now reach the minimum, −286.0042, the same as the plain model from `TVV = 10`. The probes predict `TVV_S`’s minimizer 0.12·\|θ₀\| away (second difference 124). On `two_cpt_oral_cov` with both covariate exponents started at `0.001` the second differences are 6.3e-6 and 1.1e-5, under the 1.0e-3 floor at OFV −1033 (read anyway, the predicted steps are 708 and 261·\|θ₀\|), so neither is rescaled and all three optimizers still reach −1199.3264. A two-class mixture (`tests/nonmem/mixture_iv.csv`) with the same small-unit volume stopped at OFV 303.06 under BOBYQA and now reaches 301.58, its plain model’s minimum.
+
+#### An identity-packed θ far from 1
+
+The NLopt outer optimizers’ default magnitude scaling (`parameter_scaling = abs`, which `auto` resolves to for the gradient-based optimizers) divides each packed coordinate by its initial size. When any θ is identity-packed that is switched off for every coordinate, since a near-zero covariate effect beside O(1) log-packed coordinates hurts the quasi-Newton Hessian estimate. A θ with a large magnitude would then reach the optimizer in raw units: its packed gradient is about $1/|\theta_0|$ of the unit-magnitude one, so the optimizer barely moves it and the stop test is met far from the minimum (#2146).
+
+So under `auto` and `abs` every identity-packed θ with $|\theta_0| > 10$ is divided by $|\theta_0|$ in the optimizer’s scale vector — `bobyqa` and `mma` included, which are otherwise unscaled under `auto`. Every other coordinate is unchanged; `none` and `rescale2` keep their own vectors. The bar is 10, not 1: at 1 the rule moves `ctmm_pd_2state`’s `LQ01 = -1.2` and every optimizer’s end point on it, while BOBYQA first stalls at $\theta_0 = 100$.
+
+Measured on warfarin with `V = TVV_S / 1e5` and `TVV_S` started at `1e6`, symmetric bounds (macOS arm64): L-BFGS used to stop at OFV −265.42 and BOBYQA at −265.42, each reporting convergence with `TVV_S` unmoved; both now reach the minimum, −286.00 at `TVV_S = 773770.6`. `parameter_scaling = none` still stops at −265.42.
+
+#### An identity-packed θ and the covariance step’s floor
+
+The covariance step inverts $S$ and $R$ in packed coordinates through an eigenvalue floor, `max(1e-10·λmax, 1e-12)`: under `covariance_method = s` a clipped eigenvalue refuses $S$ as rank-deficient, under `r` and `rsr` it is reported as a regularization. Log-θ, the log-Cholesky Omega diagonal, log-σ and the `block_sigma` correlations are dimensionless, but an identity-packed θ’s row and column carry the θ’s own units, so writing it in units $k$ times larger divides its diagonal entry by $k^2$. Before \#2145 that alone could clip a well-determined fit.
+
+So the floor is tested on a rescaled matrix: each identity-packed θ’s row and column are scaled so its diagonal entry equals the largest diagonal entry among the dimensionless coordinates, and the inverse is mapped back. Every other coordinate is left as it is, so a tiny diagonal there is still caught as a flat direction, and so is a θ with no information (a zero diagonal) or one collinear with another. The eigenvalues and the floor printed in a “Covariance step regularized” warning are those of the rescaled matrix, and they no longer move with a θ’s units. When every free coordinate is an identity-packed θ (Omega and Sigma FIX) there is no dimensionless entry to match, and each θ is scaled to a unit diagonal instead.
+
+The weights of a `[covariate_nn]` block are identity-packed too (their bounds are $\pm\infty$), but they are not parameters in user units, so they are not rescaled (#2273). A weight the data does not identify — one feeding a saturated unit, say — keeps a tiny diagonal entry, is clipped, and is reported in the regularization warning, which is what lets `max_condition_number` and `max_correlation` in a model-selection run reject the fit.
+
+Measured on warfarin with `V = TVV_S / k` and `TVV_S` identity-packed, at its FOCEI estimates (`tests/cov_floor_identity_theta_units.rs`, macOS arm64): at $k = 10^5$ and $10^6$, `s` used to fail and `r`/`rsr` reported `SE(TVV_S)/k` = 0.0535 / 0.0118 at $10^5$; every SE now equals the $k = 1$ fit’s (0.240 under `r`, 0.238 under `rsr`, 0.466 under `s`) to within $3
+\times 10^{-10}$, and at $k = 3 \times 10^{-6}$ TVKA’s SE is 0.149 under `r` (was 0.064). At $k = 10^5$ on the block-Ω \#432 model the `MATRIX=R` SEs match NONMEM 7.5.1 to $2 \times 10^{-5}$.
+
+#### An identity-packed θ and SIR’s proposal
+
+SIR conditions its proposal with a floor of its own: the free block of the packed covariance is eigendecomposed, and a direction with variance under `max(1e-10·λmax, 1e-12)` is reported as carrying no uncertainty and floored. An identity-packed θ’s variance scales as $k^2$ with its units, so in large units it became $\lambda_{\max}$ and floored every other direction, and in small units it fell under `1e-12` itself. Since \#2179 the proposal is conditioned with each identity-packed θ rescaled as in the covariance step, with one difference: the anchor reads each dimensionless coordinate’s variance no larger than the bound cap lets it keep. Otherwise a direction the covariance step had floored (variance ~1e7) would set the θ’s scale, and the cap that shrinks it would take the θ’s variance with it. The proposal SIR falls back to when the covariance step fails (a non-positive-definite Hessian) floors the Hessian in the same rescaled coordinates.
+
+Measured on the warfarin model above with seeded SIR (`tests/sir_proposal_identity_theta_units.rs`, macOS arm64): at $k = 10^5$, $10^6$ and $3 \times 10^{-6}$ the intervals and the ESS equal the $k = 1$ run’s to within $2 \times 10^{-10}$. Before the fix, $k = 10^5$ reported six null directions with the ESS cut from 172 to 27; on \#2179’s longer run $k = 10^6$ collapsed every interval to a point and $k = 10^8$ rejected every draw.
+
+#### An Omega Cholesky off-diagonal and the covariance step’s floor
+
+The other packed coordinate with units is an Omega (or Omega-IOV) Cholesky off-diagonal (`chol_<i>_<j>`). With $\Omega = L L^\top$, $L_{ij}$ ($i > j$) has the units of $\eta_i$: dimensionless for an η on a log scale (`CL = TVCL·exp(ETA_CL)`), but the units of the parameter itself for an additive one (`BASE = TVBASE + ETA_B`). Its row’s diagonal $L_{ii}$ has the same units, so since \#2274 the floor tests each off-diagonal divided by its row’s estimated $\hat L_{ii}$, which is unit-free whether the η is additive or not (ferx cannot tell from the packed vector which it is). The scale is the estimate, not the matrix, so a genuinely flat off-diagonal direction is still clipped. On a block-Omega model this moves the floor by an O(1) factor ($\hat L_{ii}$ is typically 0.1–1 for a log-scale η), so a standard error the floor was already binding on can change in its last digits; one it was not binding on is unchanged.
+
+The packing rails ($|L_{ij}| \le 10$, $\log L_{ii} \in [-6, 6]$) already limit how far an additive η’s units can stretch, so it takes a direction that is weak in its own right for the units to decide whether it is clipped. Measured on `data/covmuref_power.csv` with `V = (TVV_S + ETA_VS) / k` in a block with `ETA_CL` and a barely-informed allometric-exponent θ (`tests/cov_floor_omega_offdiag_units.rs`, macOS arm64): at $k = 3 \times
+10^{-4}$ the $L_{21}$ diagonal reaches $10^7$, and before \#2274 `r` and `rsr` reported a regularized step and `s` refused $S$; every SE now equals the $k = 1$ fit’s to within $10^{-6}$, at $k = 15$ as well.
+
+## Bounds
+
+`compute_bounds()` returns a box in packed space:
+
+| Segment | Lower | Upper |
+|----|----|----|
+| Theta (log-packed) | $\log$ `theta_lower` | $\log$ `theta_upper` |
+| Theta (identity-packed) | `theta_lower` | `theta_upper` |
+| Omega / Omega-IOV diagonal | $-6$ | $6$ ($L_{ii} \le e^6 \approx 403$, variance $\approx 1.6\times10^5$ — wide enough for FREM covariate omegas) |
+| Omega / Omega-IOV off-diagonal | $-10$ | $10$ |
+| Sigma | $-8$ ($\approx 3\times10^{-4}$) | $5$ ($\approx 148$) |
+
+**FIX’d parameters are pinned by setting `lower == upper == packed value`.** That is how every bound-respecting optimizer (NLopt SLSQP / L-BFGS / MMA, the built-in BFGS, the Gauss-Newton step clamp) holds them fixed — there is no separate free-subspace vector.
+
+The Omega and Sigma limits above, plus the `1e-10` / `1e9` caps substituted for a log-packed Theta range that extends beyond them, are internal guards rather than model-file bounds. If a free estimate reaches one (within the few ULPs that optimizer scaling can introduce), the fit emits the structured `parameter_at_runaway_guard` warning. FIX’d coordinates are excluded because their equal bounds are intentional. The check is made in packed space, so it compares directly with the literal guard even though fit output reports Omega on the variance/covariance scale and Sigma on its stored SD scale.
+
+Each hit carries a **verdict**, and it is the verdict — not the side — that says what happened and what follows from it:
+
+- **`collapse`** — the coordinate fell to a floor at zero. Only the log-packed coordinates have one: a Theta lower cap, an Omega / Omega-IOV Cholesky *diagonal* at $-6$, a Sigma at $-8$. The warning stays a `Warning` and `converged` is left alone, because an unsupported component collapsing is usually a modelling decision to make rather than a numerical failure.
+- **`runaway`** — the coordinate is held at an implementation rail. Every upper hit is one, and so is *either* rail of an Omega / Omega-IOV **off-diagonal**, which is the raw $L_{ij}$ bounded symmetrically at $\pm 10$: a correlation coordinate driven to $-10$ ran away exactly as its $+10$ twin did, and nothing about it collapsed toward zero. A runaway hit **demotes `converged` to `false` and raises the warning to `Critical`** (#1118): a point held at an implementation rail is by construction not an interior optimum, so a script or agent keying off the boolean must not accept it.
+
+One rail is reachable by a model that is otherwise sound: the Sigma ceiling, $e^5 \approx 148$ on the stored SD scale. An additive error model on unscaled data (DV in ng/mL, µg/L, cell counts) can have a residual SD genuinely above it. The remediation there is the data scale rather than the model — rescale DV, or use a proportional or log-transformed error model — and the warning message says so when the hit is a Sigma.
+
+### The same box, on the way in
+
+`parameter_at_runaway_guard` is about where a fit *ended*. The box also applies before the first objective evaluation: `clamp_to_bounds()` moves the packed **start** inside it, and until \#1251 that happened in silence. A `theta TVCL(0.05, 0.1, 10.0)` fits from `0.1` — a factor of two from what was written — and reports nothing.
+
+The start is now compared against the same box, by the same walk, with two verdicts split on *whose* bound it is:
+
+- **Outside a bound you declared** — a `theta` below its own lower or above its own upper — is an error, `E_THETA_INIT_OUTSIDE_BOUNDS`, refused before any fitting. NM-TRAN refuses the identical stream too (error 24). On an evaluation-only run it is a warning instead, `W_THETA_INIT_OUTSIDE_BOUNDS` (see the list below).
+- **Outside one of the internal guards above** — the hidden `1e9` Theta cap, the Omega rails, the Sigma rails — is a `W_INIT_OUTSIDE_BOUNDS` warning carrying the `init_outside_bounds` category. It is a warning because these recover: `omega ETA_CL ~ 1e8` on `examples/warfarin.ferx` packs to $+9.21$ against the $+6$ rail, starts from a variance of $1.6\times10^5$, and still reaches the base optimum under all eight optimizer × method combinations. The Omega **lower** rail is the exception and is an error (`E_OMEGA_INIT_AT_RAIL`), because there the fit is genuinely trapped.
+
+There is deliberately no third verdict for the `1e-10` Theta **floor**, and the reason is the packing rather than an oversight: `pack_params()` floors the value at `1e-10` and the box floors the bound at `1e-10`, so a start below it compares *equal* and nothing has been moved relative to the box. A declared range that lies entirely below the floor is a different matter — see below.
+
+That flooring is also why the **declared** verdict is not decided on the packed scale. `theta TVCL(-5.0, 0.0, 10.0)` packs the start and its declared lower onto the same $\ln(10^{-10}) = -23.0259$, so a packed comparison would see a start sitting exactly on its bound and say nothing — while the fit actually begins from $10^{-10}$, which is neither the declared $-5$ nor the declared $0$. A declared lower bound of `0` is the idiomatic spelling for a positive parameter (`theta TVLAG(0.0, 0.0, 12.0)` ships in this repo), so the shape most likely to carry the mistake was the one shape the packed predicate could not see. `E_THETA_INIT_OUTSIDE_BOUNDS` therefore compares `theta[i]` against `theta_lower[i]` / `theta_upper[i]` directly, on the natural scale, and reports where the fit really starts. The internal guards keep the packed comparison, which is the only scale on which they exist. Over every `.ferx` file in this repository the two predicates give the same answer — zero out-of-box thetas — so the stronger one costs nothing.
+
+#### Why the Omega lower rail traps and the upper one does not
+
+The two Omega rails are not symmetric, and the asymmetry is measured rather than argued. On `examples/warfarin.ferx` + `data/warfarin.csv` (10 subjects, FOCE, `covariance = false`), with `E_OMEGA_INIT_AT_RAIL` bypassed so the optimizer could be reached at all:
+
+| start | packs to | outcome |
+|----|----|----|
+| `omega ETA_CL ~ 6.144212353328210e-6` | $-6.0$ exactly | **trapped** — the coordinate is bit-identical for the whole run, ending at the rail with TVV 10x high and $\sigma$ at 42% |
+| the same start, against a rail moved to $-6.0000001$ | $-6.0$ | recovers the base optimum exactly (OFV $-280.3595$, $\omega^2_{CL}$ 0.028597 — measured as $-280.3640$ / 0.028595 before \#1722 froze the FOCE EBE search’s residual variance; the trap and the recovery are unchanged) |
+| `omega ETA_CL ~ 162754.79141900392` | $+6.0$ exactly | recovers the base optimum, under `lbfgs` and under `bobyqa` |
+| `omega ETA_CL ~ 1e8` | $+9.21$, clamped onto $+6.0$ | recovers the base optimum |
+
+So what traps a fit is the exact equality `packed_start == lower` — not the value, and not a basin of the objective, since one part in $10^7$ of slack is enough to recover the optimum to every printed digit. Nor is it a general property of starting on a bound: `theta TVCL(0.001, 0.001, 10.0)` and `theta TVKA(0.01, 0.01, 50.0)` both begin exactly on their own active lower bound on this dataset and converge normally.
+
+No accepted model can reach the trapped state. Every free Omega / Omega-IOV / mixture-Omega diagonal at or below the rail is an `E_OMEGA_INIT_AT_RAIL` error before any optimizer runs, and the upper rail — which nothing rejects — does not trap.
+
+That is also why the Omega **regularisation floor** sits *below* the rail rather than inside it. A declared `omega NAME ~ 0.0` is not positive-definite, so it is regularised with an eigenvalue floor of `1e-8`, giving $L_{ii} = 10^{-4}$ and a packed start of $-9.21$ — 3.2 units below the $-6$ the same model’s box carries. Reading that as a defect and lifting the floor into the interior is exactly what would stop `omega ~ 0.0` being rejected, since the gate fires on `packed <= lower`. The floor answers “what can be factored” and the rail answers “what may be searched”; they are kept apart on purpose, and the invariant that matters is that a regularised zero is always *caught* rather than quietly clamped into the interior.
+
+#### When the box is empty
+
+A packed box can come out **empty** — `lower > upper` — and then there is no side to be outside of. That is `E_INIT_BOUNDS_INVERTED`, an error, with three causes. The code is not Theta-specific even though only a `theta` can reach it through the parser: every other segment’s bounds are compile-time constants, and a FIX pin is `lower == upper`, which is equal rather than inverted. The three causes are:
+
+- the declared bounds are swapped, `theta TVCL(1.0, 5.0, 2.0)`;
+- the declared range lies entirely **above** the `1e9` cap, which the box substitutes for the declared upper: `theta TVCL(5e9, 2e9, 1e12)` packs to a lower of $21.42$ against an upper of $20.72$;
+- the declared range lies entirely **below** the `1e-10` floor, which the box substitutes for the declared lower: `theta TVCL(1e-12, 1e-13, 1e-11)` — an ordinary declaration of a small parameter, with its own lower bound below its own upper — packs to a lower of $-23.03$ against an upper of $-25.33$.
+
+This is the one start-side **error** that is raised at `maxiter = 0` too. The other errors are not raised there, because a clamped start does not stick without a search (a `theta` outside its declared range becomes a warning instead, see below); an empty box is not clamped at all — `clamp_to_bounds()` cannot clamp into an interval that does not exist — and an evaluation-only run clamps too, so exempting it would leave the aborting case unreported. The remedy is to rescale the parameter (fit it in different units, or factor out a constant) so its range lands inside $(10^{-10}, 10^{9})$. Only the affected coordinate is silenced by it: the rest of the file is still walked, so `ferx check` reports a swapped `TVCL` bound and an `omega ~ 1e8` in the same pass.
+
+Three things the comparison deliberately does not do:
+
+- A start sitting **exactly on** a bound is left alone. There `clamp_to_bounds` is a no-op, so nothing is silently moved and the premise does not apply. (This is a deliberate divergence from NM-TRAN, which also rejects equality, with errors 627 and 628.)
+- A **FIX’d** coordinate is never reported, and needs no special case: its bounds are pinned to its own packed value, so it cannot be strictly outside them.
+- An **evaluation-only** run (`maxiter = 0`) is never *refused* for a start outside its box, exactly as for `E_OMEGA_INIT_AT_RAIL` — with the single exception of the empty box above. It clamps too; it just does not hold the clamped value through a search, and that stickiness is what the errors are about. The clamp still decides the one number such a run reports, so a `theta` outside its **declared** range is reported there as a warning, `W_THETA_INIT_OUTSIDE_BOUNDS`. “Evaluation-only” means `maxiter = 0` under `foce`, `focei`, `laplace` or `gn`; `saem`, `imp`, `impmap`, `bayes`, `vi` and `gn_hybrid` search whatever `maxiter` says and keep the error. `theta TVCL(0.5, 0.001, 0.2)` at `maxiter = 0` is scored at `0.2`, and on `examples/warfarin.ferx` that is an OFV of $-200.2526$ where the declared `0.5` scores $2544.1094$ (measured on macOS arm64). The message names the declared start and the value scored. It is a warning so that `--dofv`, `ferx gam --no-fit` and the bootstrap Δofv sweep keep running on machine-produced parameters ([\#2865](https://github.com/FeRx-NLME/ferx-core/issues/2865)). The internal rails are still not reported at `maxiter = 0`: a free `omega ~ 0.0` is scored at the rail variance without a diagnostic.
+
+#### What the box cannot see: values the packer moved
+
+The comparison above is against the **packed** start, which is not the same question as “did my declared values reach the optimizer”. `pack_params()` clamps *before* any box exists, and the box is then built from the already-moved value, so a coordinate the packer moved compares perfectly **in-box**. Two guards do this:
+
+- the `1e-10` **log floor**, on every log-packed segment — Theta, the Omega and Omega_IOV Cholesky diagonals, Sigma, the `[mixture]` overrides. `ln` has no value at or below 0, so the floor is structural rather than a policy choice and cannot be lifted by declaring the parameter `FIX`: `ln(0)` is $-\infty$, which the optimizer’s magnitude scaling would then divide a coordinate by.
+- the Fisher-z **rail** on a residual correlation, $\pm 3$, i.e. $|\rho| \le 0.995055$. This one *is* a policy choice — it bounds what the optimizer may search — so since \#1307 it applies to a **free** correlation only. A `FIX`ed one is held exactly.
+
+A coordinate either guard moved is reported as `W_INIT_NOT_REPRESENTABLE` (category `init_not_representable`), naming the declared value and the value the optimizer actually sees. It carries its own code rather than reusing `init_outside_bounds` because the two support opposite conclusions: a silent `W_INIT_OUTSIDE_BOUNDS` does **not** mean your declared values survived the pack, which is exactly the inference the separate code exists to stop. Like the empty box, it is **not** exempt at `maxiter = 0` — an evaluation-only run scores the substituted value too, so there is no run of any length in which the declared number is used.
+
+It stands down only on a coordinate another diagnostic **will actually be emitted** for, which makes the two complementary rather than two opinions on the same coordinate. “Will actually be emitted” is the whole of the rule: the internal-rail walk above is itself exempt at `maxiter = 0`, so at that setting it claims nothing and this arm reports what it found there. The declared-range walk emits on every run, as the error or as `W_THETA_INIT_OUTSIDE_BOUNDS`, so it always claims its Theta. What is left over in a searching run is precisely the set nothing else can see: a **`FIX`ed** coordinate, whose box is pinned to the moved value; a Theta whose declared lower bound is itself at or below the floor, where value and bound are floored identically; and a free correlation, which lands exactly *on* its rail rather than outside it.
+
+A coordinate can be moved **twice** — `sigma PROP_ERR ~ 0.0 (sd)` is floored to an SD of $10^{-10}$ by the packer and then clamped onto the $e^{-8} =
+3.354626\times 10^{-4}$ rail by the box. The message always names the value the fit will actually use, and its cause names both steps; the number is obtained by running the real unpacker over the clamped vector, so it cannot drift from the packing convention.
+
+Over every `.ferx` file in this repository exactly **one** declaration is claimed: `theta TVBETA(0.0, FIX)` in `nonmem_anchor/ss_chz_const_fit.ferx`, the ferx spelling of NONMEM’s `$THETA 0.0 FIX`. It runs at $10^{-10}$, which is numerically indistinguishable from zero inside that model’s $\exp(\texttt{TVBETA} \cdot c)$ and is why the anchor was green without anyone noticing. If you need an exact zero on a log-packed Theta, declare a negative lower bound — `theta TVBETA(0.0, -5.0, 5.0) FIX` — which selects identity packing and holds the zero exactly.
+
+## Held parameters
+
+A free coordinate the optimizer leaves on one of the lower rails above has *collapsed*: an Omega or kappa variance at $e^{-12} = 6.144 \times 10^{-6}$, a sigma at $e^{-8}$, or a THETA with no declared lower bound on the internal `1e-10` floor. The `parameter_at_runaway_guard` warning reports it as a `collapse` ([warnings](../warnings.llms.md)). Its standard error is not a standard error. The covariance step’s curvature along a packed coordinate on the rail is real, but it is so small that the packed (log-scale) SE comes out around 10. On the reporting scale the delta method multiplies that by $2\omega^2$, which turns it into a small, plausible-looking number such as `0.00012`. That number describes an interval of $e^{-6 \pm 20}$.
+
+So ferx (#2797) reports no SE for it. It is listed in `FitResult::held_at_bound` with the reason `collapsed_at_guard`, alongside the profiled levels that sit on their declared box (`profiled_bound`, \#2112). Every renderer prints its SE as `N/A`, and the YAML writes `se: ~` and `held: <reason>`. A runaway (an upper rail, or any off-diagonal on its ±10 rail) is never held. Its fit is already rejected with `converged: false`, and holding it would hide the evidence.
+
+### Conditional on the held rows, only after a clean verdict
+
+The step builds `R` (and `S`) over the usual free coordinates and runs its usual positive-definiteness verdict on them. The collapsed coordinate is included, so every diagnostic is unchanged: the eigenvalue floor, the fallback to `S` and the stationarity test. Only then:
+
+| the step’s `R` | what the step reports | `cov_fixed` | stored `se_*` |
+|----|----|----|----|
+| clean (nothing clipped, no `S` fallback) | the covariance **conditional** on the held coordinate at its estimate: the inverse of `R`’s sub-block over the rest, with a zero row and column for the held coordinate (exactly the matrix a `FIX` gives) | marks it | `0.0`, as a `FIX` parameter’s |
+| floored, or replaced by `S⁻¹` | the unconditional matrix, unchanged | does not mark it | the unconditional value |
+| no matrix | nothing | (empty) | none |
+
+The order matters. At a poor point the collapsed coordinate can itself be the direction along which `R` is indefinite. On the \#2797 fixture with sigma moved from 0.10 to 0.02, `R` has a minimum eigenvalue of −21.96, which the floor clips and reports as `severe`. Holding the coordinate *before* the verdict would remove that eigenvalue, return a clean-looking matrix and cut sigma’s SE by 98.6%. Holding it after the verdict leaves the floor warning, the matrix and every SE as they were.
+
+At a stationary collapse the hold barely moves anything else. On the same fixture at its optimum, the other SEs move by at most $5.4 \times 10^{-6}$ relative, and they equal a run with the coordinate `FIX`, to the bit, on both the analytic R-matrix and the finite-difference stencil.
+
+`held_at_bound` says that the SE is not available. `cov_fixed` says whether the other SEs are conditional on the held coordinate. The guard warning says the same in words: “the other standard errors are computed with them held at the floor” after a clean `R`, and only “their standard errors are not reported” otherwise. Its `details.parameters[].held` mirrors `cov_fixed`. Every consumer of the matrix treats a held collapse as the same coordinate `FIX`: the covariance step under every `covariance_method`, profiled or not, SIR and the asymptotic draws (#2816). A `[mixture]` per-class override (`omega(k)` or `sigma(k)`) on the rail is held under the same rule (#2809). Its `held_at_bound` entry carries `class: k`, and its `kind` and `index` name the base parameter it overrides. So the base parameter keeps its own SE, and the other SEs equal a run with the override `FIX`. The override’s own row prints `N/A` (`held: <reason>` in the YAML) — see [Mixture per-class overrides](../output.llms.md#mixture-overrides) (#2833).
+
+## Where the packed space surfaces
+
+It is not purely internal; it shows up in several user-visible places.
+
+- **Covariance matrix.** `FitResult.covariance_matrix` — and the `covariance_matrix:` block in the fit YAML — is the inverse covariance Hessian of the OFV **with respect to the packed vector**, not with respect to $(\theta, \Omega, \Sigma)$. Its `parameters:` list names the packed coordinates: `log_chol_<eta>` for an Omega diagonal, `chol_<i>_<j>` for an off-diagonal, `log_chol_<eta>_MIX<k>` / `<eps>_MIX<k>` for a `[mixture]` Ω / σ override and `<eps_i>~<eps_j>` for a `block_sigma` correlation. Reported standard errors on the natural scale are obtained from it by the delta method. See [Output Files](../output.llms.md).
+- **SIR.** The proposal, the resamples, and the retained `sir_resamples_packed` pool are all in packed space; SIR’s bound-collapse diagnostics are phrased in it too. See [SIR](../estimation/sir.llms.md).
+- **Simulation with uncertainty.** Asymptotic draws are MVN **in packed space**, which is what keeps every draw a valid parameter set. See [Simulation](../api/simulation.llms.md#uncertainty-distribution).
+- **Parameter scaling.** `parameter_scaling` / `scale_params` rescale packed coordinates, which is why dividing by $|\log V|$ is a poor idea — see [Fit Options](../model-file/fit-options.llms.md).
+- **Multi-start.** `start_sigma` perturbs log-packed thetas multiplicatively (`× exp(N(0, start_sigma))`) and identity-packed thetas additively.
+- **Gradients.** The analytic outer gradient is assembled directly in packed coordinates (including the $\times L_{ii}$ chain factor on the log-Cholesky diagonal), which is what analytic-vs-finite-difference parity tests compare.
+
+## Consequences worth knowing
+
+- A symmetric Gaussian step in packed space is **asymmetric** on the natural scale: log-normal for theta, sigma, and the Omega Cholesky diagonal. Uphill moves are wider than downhill ones, and no draw or step can produce a non-positive value.
+- $\Omega$ never has to be checked for positive-definiteness after an optimizer step or an uncertainty draw. It is PD by construction.
+- The number of packed Omega entries depends on the declared structure: a diagonal Ω contributes $n_\eta$ entries, a full block contributes $n_\eta(n_\eta+1)/2$. Structurally-zero off-diagonals are not parameters.
+- Two fits with the same OFV surface but different packing (e.g. a theta re-declared with a negative lower bound) will follow different optimizer trajectories, even though the optimum itself is unchanged.

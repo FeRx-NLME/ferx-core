@@ -1,0 +1,395 @@
+# CLI Reference
+
+The `ferx` command-line tool runs population PK estimation from model files and data.
+
+## Usage
+
+``` bash
+ferx <model.ferx> --data <data.csv> [--output <run.fitrx>] [--include-data] [--inits-from-nca[=METHOD]] [--output-format yaml|json|both]
+ferx <model.ferx> --simulate          [--output <run.fitrx>]
+ferx check <model.ferx> [--data <data.csv>] [--json]
+ferx summary <run.fitrx> [<run2.fitrx> ...]
+ferx bootstrap <model.ferx> [--data <data.csv>] [--samples N] [--seed N] [--stratify-on COL]
+ferx covsearch <search.ferxsearch> [--directory DIR] [--threads N] [--resume]
+ferx modelsearch <search.ferxsearch> [--directory DIR] [--threads N] [--resume]
+ferx globalsearch <search.ferxsearch> [--directory DIR] [--threads N] [--resume] [--reuse-from DIR]
+ferx ruvsearch <search.ferxsearch> [--directory DIR] [--threads N] [--resume]
+ferx allometry <model.ferx> --data <data.csv> [--covariate WT] [--reference 70] [--estimate]
+ferx --help                    # or -h; also: ferx check --help, ferx summary --help,
+                               # ferx bootstrap --help, ferx covsearch --help
+ferx --licenses                # licenses and third-party notices of this binary
+```
+
+`ferx --licenses` prints the MIT license, the LGPL-3.0 and GPL-3.0 texts that cover the linked `ferx-search` crate, the third-party notices (NLopt among them), and how to rebuild the binary with a modified `ferx-search`; see [License](license.llms.md).
+
+## Commands
+
+### Fit with Data
+
+``` bash
+ferx model.ferx --data data.csv
+```
+
+Parses the model file, reads the data, and runs the estimation method specified in `[fit_options]` (defaults to FOCEI).
+
+### Simulate and Fit
+
+``` bash
+ferx model.ferx --simulate
+```
+
+Parses the model file, generates simulated data from the `[simulation]` block, and fits the model to the simulated data. Requires a `[simulation]` block in the model file.
+
+### Bootstrap (`bootstrap`)
+
+``` bash
+ferx bootstrap model.ferx --data data.csv --samples 200 --seed 12345 --threads 8
+```
+
+Resamples subjects with replacement, refits the model to each replicate dataset, and reports bias, standard errors and confidence intervals from the spread of the estimates — the non-parametric case bootstrap, modelled on `PsN::bootstrap` (see [Bootstrap](tools/bootstrap.llms.md) for where it differs). Writes PsN-named CSV artefacts to `{model}-bootstrap/`. Progress is drawn as a bar on stderr while the replicates fit, when stderr is a terminal; `--no-progress` turns it off.
+
+Unlike a fit, this is a *tool*: it lives in the `ferx-tools` crate and calls the estimation engine many times without changing it. See [Bootstrap](tools/bootstrap.llms.md) for the options, the stratification rules, the confidence-interval estimator, and a worked comparison against the covariance step’s standard errors.
+
+### GAM Covariate Screening (`gam`)
+
+``` bash
+ferx gam model.ferx --data data.csv
+```
+
+Regresses every declared covariate against every ETA and prints a table ranked by ΔAIC = `AIC_null − AIC_best`; a positive ΔAIC means the covariate improves the model for that ETA. This is the Rust equivalent of Xpose4’s `xpose.gam()`.
+
+The screen needs empirical Bayes estimates, so by default it fits the model first. Two ways to avoid paying for that fit:
+
+``` bash
+# Reuse a fit you already ran.
+ferx gam --from-fit run.fitrx
+
+# Compute EBEs at the initial estimates only (NONMEM MAXEVAL=0).
+ferx gam model.ferx --data data.csv --no-fit
+```
+
+`--from-fit` needs `--data` as well when the bundle was written without `--include-data`; the dataset must be the one the fit was run on, since ETAs are matched to covariates by subject position. `--no-fit` is refused for methods that would estimate anyway — SAEM, IMPMAP, Bayes, VI, and `gn_hybrid`, whose FOCEI polish runs a fixed 100 iterations regardless of `outer_maxiter`.
+
+| flag | default | meaning |
+|----|----|----|
+| `--no-fit` | off | compute EBEs at the initial estimates, skip the outer loop |
+| `--from-fit PATH` | — | load a `.fitrx` bundle instead of fitting |
+| `--csv PATH` | `{model}-gam.csv` | where to write the ranked table |
+| `--no-csv` | off | print the table only, write no file |
+| `--spline-df N` | `2,3` | spline degrees of freedom to try (repeatable) |
+| `--no-linear` | off | drop the linear form from the candidates |
+| `--shrink FRAC` | `0.30` | warn above this ETA shrinkage |
+| `--threads N` | auto | rayon worker count |
+
+The same screen runs as part of an ordinary fit with `--gam`, which writes `{model}-gam.csv` using the default options:
+
+``` bash
+ferx model.ferx --data data.csv --gam
+```
+
+Treat the output as a shortlist, not a model — see [GAM covariate screening](tools/gam-screening.llms.md) for what ΔAIC does and does not tell you, the shrinkage caveat, and the Xpose4 validation.
+
+### Stepwise Covariate Modelling (`covsearch`)
+
+``` bash
+ferx covsearch warfarin.ferxsearch --directory warfarin-covsearch --threads 8
+```
+
+PsN `scm` forward / forward-then-backward selection — Pharmpy’s `covsearch` — driven by a [`.ferxsearch` file](tools/search.llms.md) whose `COVARIATE?(...)` statements are the candidate effects and whose `[covsearch]` section sets the algorithm, `p_forward`, `p_backward` and `max_steps`. Each step fits its candidates in parallel, judges them by the strictness gate and the likelihood-ratio test, and prints a step table with every candidate’s ΔOFV, p-value, convergence status and decision. Writes `steps.csv`, `final.ferx` and `final-fit.yaml` into the directory, plus one journalled runner directory per step, so `--resume` picks an interrupted search up where it stopped. See [Covariate search](tools/covsearch.llms.md), including the PsN `scm` comparison.
+
+### Structural Model Search (`modelsearch`)
+
+``` bash
+ferx modelsearch warfarin.ferxsearch --directory warfarin-modelsearch --threads 8
+```
+
+Pharmpy’s `modelsearch`: a search over structural PK models — absorption route, elimination, peripheral compartments, transit compartments and lag time — driven by a [`.ferxsearch` file](tools/search.llms.md) whose `ABSORPTION`, `ELIMINATION`, `PERIPHERALS`, `TRANSITS` and `LAGTIME` statements are the space and whose `[modelsearch]` section picks the algorithm (`reduced_stepwise`, `exhaustive_stepwise`, `exhaustive`) and the IIV strategy for new parameters. Each layer fits its candidates in parallel, judges them by the strictness gate, and the models are ranked on `[rank] type` (the mixed BIC by default). Prints a model table with every candidate’s structure, criterion, rank, convergence status and fit time; writes `models.csv`, `final.ferx`, `final-fit.yaml` and every candidate under `models/` into the directory, plus one journalled runner directory per layer, so `--resume` picks an interrupted search up where it stopped. See [Structural model search](tools/modelsearch.llms.md), including the Pharmpy and NONMEM comparisons. Most of the space is an analytic template swap; the saturable eliminations and the zero-order / Weibull absorptions have no closed form and are generated as [`[odes]` candidates](tools/modelsearch.llms.md#the-odes-candidates), which cost an order of magnitude more per fit and are scheduled and multi-started accordingly.
+
+### Global Model Search (`globalsearch`)
+
+``` bash
+ferx globalsearch warfarin.ferxsearch --directory warfarin-globalsearch --threads 8
+```
+
+pyDarwin in ferx: a genetic algorithm (or, with `algorithm = "exhaustive"`, every point) over **one grid** whose axes are the structural categories and the `COVARIATE?` pairs of a [`.ferxsearch` file](tools/search.llms.md), ranked on pyDarwin’s **penalized fitness** (`[rank] type = "penalized"`: OFV + 10 per estimated parameter + 100 per failure, `[rank.penalties]` overlaying any charge). A `[globalsearch]` section picks the algorithm and, under `[globalsearch.ga]`, the population size, generations, seed and the crossover / mutation / niche knobs. Every batch is fitted in parallel through the shared runner and judged by the strictness gate; a gene that changes nothing, a point no template can build, and a fit the gate refused are charged on top so the search is steered without selecting them. Prints a model table with every candidate’s genome, criterion, fitness, rank, convergence status and fit time, and the GA’s per-generation trajectory; writes `models.csv`, `generations.csv`, `final.ferx`, `final-fit.yaml` and every candidate under `models/` into the directory, plus one journalled runner directory per batch, so `--resume` on the seeded GA refits nothing. `--reuse-from DIR` re-scores fits another search (a modelsearch or covsearch run) already made rather than repeating them. See [Global model search](tools/global-search.llms.md), including when a global search beats the stepwise tools and when it does not.
+
+### Residual-Error Search (`ruvsearch`)
+
+``` bash
+ferx ruvsearch warfarin.ferxsearch --directory warfarin-ruvsearch --threads 8
+```
+
+Pharmpy’s `ruvsearch`: a search over the `[error_model]` block, driven by a [`.ferxsearch` file](tools/search.llms.md) with no `[space]` — the candidates are the four residual-error forms: IIV on the residual error, a `power` form, a `combined` form, and a time-varying magnitude cut at the time-after-dose quantiles. Each iteration adds every remaining candidate to the parent on its own, fits them in parallel, judges them by the strictness gate and the likelihood-ratio test at `[ruvsearch] p_value`, and keeps the largest significant drop; the selected model must beat the input by the `df = 1` cutoff or the input is returned. `cwres_prescreen = true` is Pharmpy’s path: the candidates are fitted to the parent’s CWRES first and only the winner is refitted. Prints a step table with every model’s ΔOFV, p-value, convergence status and decision; writes `steps.csv`, `final.ferx`, `final-fit.yaml` and every model under `models/`, plus one journalled runner directory per step, so `--resume` picks an interrupted search up where it stopped. See [Residual-error search](tools/ruvsearch.llms.md).
+
+### Allometric Scaling (`allometry`)
+
+``` bash
+ferx allometry model.ferx --data data.csv                # (WT/70)^0.75 on CL, Q; ^1.0 on V1, V2
+ferx allometry model.ferx --data data.csv --estimate     # estimate the exponents instead
+ferx allometry search.ferxsearch                         # ALLOMETRY(WT, 70) in the space
+```
+
+Adds the allometric convention to the base model as `[covariate_model]` lines and fits the base and the scaled model side by side. Options on the [covariate search page](tools/covsearch.llms.md#allometry).
+
+### Validate without Fitting (`check`)
+
+``` bash
+ferx check model.ferx                  # parse + structural validation
+ferx check model.ferx --data data.csv  # also run data-dependent checks
+ferx check model.ferx --data data.csv --json
+```
+
+Runs the parser and every validation step that normally happens at the start of a fit — *without* fitting — then reports the findings. This is a fast `author → diagnose → fix` loop, especially useful for tooling and coding agents that author model files programmatically.
+
+- Without `--data`, parse / structural and model–option compatibility checks run (no data is read) — e.g. an SDE model paired with SAEM, or `optimizer = trust_region` on an IOV model.
+- With `--data`, the dataset is read and the data-dependent checks run too: referenced covariates present, per-CMT scaling / error-model coverage, steady-state dosing well-formed, and non-negative typical-value lag time.
+- That read applies the model file’s own [`[data_selection]`](model-file/data-selection.llms.md) clauses, so those checks describe the records a fit of the same two files would score: a compartment a clause empties is not reported as uncovered, and a finding that names the observed compartments names the ones that survive the filter. **The model file’s clauses and only those** — `ferx check` takes no fit options, so conditions a caller merges in (`fit_from_files`, or `ferx_fit(ignore =, accept =, ignore_ids =)` from R) are invisible to it, and a check cannot speak for them ([\#1465](https://github.com/FeRx-NLME/ferx-core/issues/1465)).
+- `--json` emits a structured [check report](file-formats/check-report.llms.md) to stdout instead of the human-readable summary.
+
+Human output lists one diagnostic per line as `severity[CODE] block:line: message`, with an indented `help:` line for any suggestion, then a one-line summary:
+
+``` text
+error[E_MISSING_COVARIATE]: Model references covariate(s) not found in data (case-sensitive): WGT. Available covariate columns: (none).
+    help: available covariate columns: (none)
+invalid: mymodel — 1 error(s), 0 warning(s)
+```
+
+A severity of `info` marks a row that reports a fact rather than a finding, such as the per-level counts `W_LEVEL_SUMMARY` gives for a model with nested levels. It is printed as `info[CODE] …` and counted on its own in the summary (`ok: mymodel — no errors (0 warning(s), 2 info)`), never as a warning; the count is left out when there are none ([\#2387](https://github.com/FeRx-NLME/ferx-core/issues/2387)).
+
+The exit code is `0` when no errors are found (warnings and info rows alone still exit `0`), `1` when any error is found, and `2` on a usage error. See the [check report reference](file-formats/check-report.llms.md) for the JSON schema and the full error-code table.
+
+### Summarize a Saved Fit (`summary`)
+
+``` bash
+ferx summary run1.fitrx
+```
+
+Loads a saved [`.fitrx` bundle](file-formats/fitrx.llms.md) and prints a concise, [`psn::sumo`](https://uupharmacometrics.github.io/PsN/)-style summary of the run to **stdout** — no re-fitting, no data required. Handy for reviewing an old run, diffing two fits, or piping into a report. The summary covers:
+
+- **Run status** — estimation method (or chain), convergence, iterations, and the subject / observation / parameter counts.
+- **Objective function** — OFV, AIC, BIC.
+- **Parameter estimates** — the THETA table with SE and %RSE, OMEGA variances with CV% and off-diagonal correlations, KAPPA (IOV) variances for a fit with occasion effects (the same rows the fit prints, including a weighted kappa’s `weight = …` line) with a `block_kappa`’s off-diagonal correlations (#1667), and SIGMA (with CV% for the proportional component). `[FIX]`-flagged parameters show `---` for SE.
+- **Diagnostics** — covariance status, condition number, and η / ε shrinkage, plus kappa shrinkage (pooled, then per occasion slot) for a fit with occasion effects (#1667). A non-finite shrinkage is left out rather than printed as `NaN`.
+- **Run info** — wall time, ferx version, and any fit warnings.
+
+``` text
+============================================================
+ferx run summary — warfarin
+============================================================
+Method:     FOCEI
+Converged:  YES
+Iterations: 28
+Subjects: 32   Observations: 251   Parameters: 7
+
+--- Objective Function ---
+  OFV:  -280.1838
+  ...
+```
+
+The exit code is `0` on success, `1` if the bundle cannot be loaded, and `2` on a usage error (missing path).
+
+#### Compare Multiple Runs
+
+Pass two or more bundles to compare them side by side. Instead of the single-run report above, `summary` prints a **Markdown table** — method, convergence, OFV / AIC / BIC, ΔOFV (relative to the first run), runtime, and the subject / observation / parameter counts, followed by THETA (with %RSE), OMEGA, and SIGMA estimate tables. Each column is labelled with the bundle’s file stem, and a `—` marks a parameter absent from a run. Handy for pasting into a report or a PR.
+
+``` bash
+ferx summary run1.fitrx run2.fitrx run3.fitrx
+```
+
+``` markdown
+| Run | run1 | run2 | run3 |
+| --- | --- | --- | --- |
+| Model | warfarin | warfarin | warfarin |
+| Method | FOCE | FOCEI | SAEM → IMP |
+| Converged | yes | yes | yes |
+| OFV | -280.3595 | -281.0102 | -280.9998 |
+| ΔOFV | +0.0000 | -0.6507 | -0.6403 |
+| ... | ... | ... | ... |
+
+**THETA**
+
+| Parameter | run1 | run2 | run3 |
+| --- | --- | --- | --- |
+| TVCL | 0.1330 (5.0%) | 0.1332 (4.9%) | 0.1331 (5.1%) |
+| ... | ... | ... | ... |
+```
+
+#### Machine-Readable Summary (`--json`)
+
+``` bash
+ferx summary --json run1.fitrx run2.fitrx
+```
+
+`--json` emits the same content as **one JSON document on stdout**, for a script or agent comparing saved runs without scraping the tables (it mirrors `ferx check --json`). The document carries a `schema_version` (bumped only on a breaking change, the policy of `{model}-fit.json`), the `fit_schema_version` of the fit JSON its fields follow, and a `runs` array with one object per bundle in command-line order:
+
+- `label` (the file stem) and `path`.
+- **Run status** — `model_name`, `method`, `method_chain`, `converged`, `status` (the usability verdict, with reasons), `final_gradient`, `final_gradient_source`, `n_iterations`, `n_subjects`, `n_obs`, `n_parameters`.
+- **Objective** — `ofv`, `ofv_data`, `ofv_prior`, `aic`, `bic`, `prior_summary`, `saem_objective`, `importance_sampling`.
+- **Estimates** — `estimates`, the name-keyed layout of the fit YAML / JSON (`estimates.theta.CL.estimate`, with `se` and `rse_pct`; Ω `variance`, `cv_pct` and off-diagonal `correlation`; `omega_iov` for κ; σ), with `fixed: true` on a FIX parameter; and `error_model`. Like the text table, `estimates.theta` leaves out the coefficients of a compact θ block (20 or more levels) and `[covariate_nn]` weights, so every θ is also given by position in `theta`, `theta_names`, `theta_fixed` and `se_theta`, with `held_at_bound` naming coordinates held on a bound (no SE) and `profiled_blocks` the blocks declared `profile`.
+- **θ blocks** — `theta_blocks`, keyed by block name, the `--- THETA BLOCKS ---` rows: `n_free_coefficients`, `n_fixed_coefficients`, `profiled`, `min`, `median`, `max` (over every coefficient, FIX included), and `theta_start` / `theta_end`, the half-open index range of the block’s coefficients in `theta`. `{}` for a fit without one.
+- **Diagnostics** — `covariance_status`, `covariance_method`, `cov_condition_number`, and `shrinkage_eta`, `shrinkage_kappa`, `shrinkage_kappa_by_occ`, `shrinkage_eps` as **fractions** (not percent), indexed like `eta_names` / `kappa_names`.
+- **Run info** — `wall_time_secs`, `ferx_version`, and `warnings_structured` (`severity`, `category`, `message`, …).
+
+Every one of these is copied from the fit JSON’s own serializer under the same key, so a value reads the same here and in `{model}-fit.json`. Non-finite values are `null`. With two or more bundles the document also has `reference_run: 0` and each run a `delta_ofv` against the first run (the comparison table’s ΔOFV row; `null` when the first bundle failed to load).
+
+``` json
+{
+  "schema_version": 1,
+  "fit_schema_version": 1,
+  "reference_run": 0,
+  "runs": [
+    { "label": "run1", "path": "run1.fitrx", "ofv": -280.3595, "delta_ofv": 0.0,
+      "converged": true, "estimates": { "theta": { "TVCL": { "estimate": 0.133, ... } } }, ... },
+    { "label": "run2", "path": "run2.fitrx", "error": "failed to load run2.fitrx: ..." }
+  ]
+}
+```
+
+The exit codes are those of the text summary. A bundle that fails to load does not stop the others: it gets an `error` entry in place of the fit fields, the document is still printed, and the exit code is `1`.
+
+## Output Files
+
+Two files are always generated, named after the model file:
+
+| File | Contents |
+|----|----|
+| `{model}-sdtab.csv` | Per-observation diagnostics |
+| `{model}-fit.yaml` | Parameter estimates, standard errors, an `estimation:` block (wall time, thread count), an `environment:` block (OS, arch, Docker, username, ferx version), and (when the covariance step ran) a `covariance_matrix:` block containing the full optimizer-space parameter covariance matrix |
+
+See [Output Files](output.llms.md) for detailed format descriptions.
+
+## Portable Fit Bundle (`--output`)
+
+Pass `--output run.fitrx` to additionally write a portable `.fitrx` bundle — a zip of JSON and CSV designed to be read from Rust, R, Python, or Julia. Use `--include-data` to embed the input NONMEM CSV inside the bundle (off by default). A data file edited since the fit started is refused: the fit still completes, with a warning that no bundle was written.
+
+``` bash
+ferx model.ferx --data data.csv --output run1.fitrx --include-data
+```
+
+## Estimates format (`--output-format`)
+
+The human-readable estimates file defaults to YAML (`{model}-fit.yaml`). Pass `--output-format` to control it:
+
+| Value | Writes |
+|----|----|
+| `yaml` (default) | `{model}-fit.yaml` — curated, human-readable |
+| `json` | `{model}-fit.json` — the complete `FitResult`, machine-readable |
+| `both` | both files |
+
+``` bash
+ferx model.ferx --data data.csv --output-format json
+```
+
+The JSON is the full fit under a versioned schema — intended for scripts, the R wrapper, or an agentic model-development loop. It is unrelated to the `--output` `.fitrx` bundle above (which packages a whole run for archival/interchange). See [Output Files](output.llms.md#fit-json-modelfitjson) for the schema.
+
+## NCA-based starting values (`--inits-from-nca`)
+
+Pass `--inits-from-nca` to derive starting values from the data via non-compartmental analysis before fitting, overriding the model file’s defaults. The flag overrides the `inits_from_nca` `[fit_options]` key for this run. A bare `--inits-from-nca` uses the `nca_sweep` strategy; pass an explicit method to pick another:
+
+``` bash
+ferx model.ferx --data data.csv --inits-from-nca           # = nca_sweep
+ferx model.ferx --data data.csv --inits-from-nca=nca       # NCA only (fastest)
+ferx model.ferx --data data.csv --inits-from-nca=nca_ebe   # EBE-refined sweep
+```
+
+See [NCA-based starting values](model-file/fit-options.llms.md#nca-based-starting-values) for what each strategy does.
+
+See [the `.fitrx` format reference](file-formats/fitrx.llms.md) for the full schema.
+
+## Console Output
+
+### Progress
+
+The estimation progress is printed to stderr, including: - Model and data summary (subjects, observations, parameters) - Optimizer iterations with OFV values (FOCE) or condNLL values (SAEM) - Covariance step status - Final parameter table
+
+### Result Summary
+
+A brief summary is printed to stdout:
+
+    Fit completed!
+    OFV: -280.1838
+    Elapsed: 0.496s
+      TVCL = 0.132735
+      TVV = 7.694842
+      TVKA = 0.757498
+
+### Allocator environment variables
+
+The `ferx` binary uses the [mimalloc](https://github.com/microsoft/mimalloc) memory allocator. mimalloc reads `MIMALLOC_*` environment variables when the program starts, and some of them print to stderr. For example, `MIMALLOC_VERBOSE`, `MIMALLOC_SHOW_STATS` and `MIMALLOC_SHOW_ERRORS` print diagnostics and statistics. With none of them set, which is the normal case, the allocator prints nothing. If you parse `ferx`’s stderr in a script, make sure these variables are not set in its environment. The R package and other programs that embed `ferx-core` keep their own allocator.
+
+## Exit Codes
+
+| Code | Meaning |
+|----|----|
+| 0 | Success (for `check`: no errors found; also returned by `-h`/`--help`, which prints usage to stdout) |
+| 1 | Error (parse failure, data error, convergence failure; for `check`: errors found; for `summary`: bundle failed to load) |
+| 2 | Usage error for `check` / `summary` (e.g. missing model or bundle path) |
+
+`-h`/`--help` is recognized as the first argument (`ferx --help`) and as the argument right after `check`/`summary` (`ferx check --help`, `ferx summary --help`); it prints usage to stdout and exits `0` (usage-error paths print the same text to stderr and exit `1`/`2`).
+
+## Tool name or model file?
+
+The first argument is either a tool (`covsearch`, `bootstrap`, …) or the model to fit, decided in this order:
+
+1.  a tool name (`check`, `summary`, `bootstrap`, `gam`, `covsearch`, `allometry`, `modelsearch`, `ruvsearch`, `iivsearch`, `iovsearch`, `amd`, `globalsearch`) runs that tool — these names are reserved, so a *file* called `check` in the working directory is not reachable as a model under that name (give it a path: `ferx ./check`);
+2.  an argument starting with `-` is a flag, not a model;
+3.  otherwise a file that is there is the model, whatever it is called — an extension-less model file works;
+4.  otherwise a bare word is read as a tool name, and anything carrying a `.` or a path separator as a file path.
+
+That last split decides which error you get when the argument resolves to nothing:
+
+``` bash
+$ ferx covsearh run1.ferxsearch       # a tool this build does not have
+Error: tool `covsearh` not recognized.
+Did you mean `covsearch`?
+Available tools: check, summary, bootstrap, gam, ...
+To fit a model, give its file path: ferx run1.ferx --data data.csv
+
+$ ferx run1.ferx --data data.csv      # run1.ferx is not in this directory
+Error: the model `run1.ferx` was not found at this location. Please check folder and file names.
+```
+
+A tool name within two edits of a real one also gets a `Did you mean ...?` line. Both cases exit `1`.
+
+A binary built without model search (see [Building](#building)) still knows the eight search tool names, and says what is missing instead (exit `1`):
+
+``` bash
+$ ferx covsearch run1.ferxsearch
+Error: `covsearch` is a model-search tool, and this ferx was built without the `search` feature.
+Rebuild ferx-cli with its default features (or `--features search`) to use it.
+```
+
+A path the filesystem cannot answer for — an unreadable parent directory, a symlink loop — is not reported as missing: it goes to the fit path, which opens it and reports the OS error.
+
+## Examples
+
+``` bash
+# One-compartment oral warfarin model
+ferx examples/warfarin.ferx --data data/warfarin.csv
+
+# Two-compartment IV with FOCE
+ferx examples/two_cpt_iv.ferx --data data/two_cpt_iv.csv
+
+# SAEM estimation
+ferx examples/warfarin_saem.ferx --data data/warfarin.csv
+
+# Simulation-estimation study
+ferx examples/warfarin.ferx --simulate
+```
+
+## Building
+
+``` bash
+# Build the ferx binary. The repo is a cargo workspace and the root package is
+# the ferx-core library, so the binary's package has to be in scope.
+cargo build --release -p ferx-cli
+
+# Run directly via cargo
+cargo run --release -p ferx-cli -- model.ferx --data data.csv
+
+# Without the model-search tools (covsearch, allometry, modelsearch, ruvsearch,
+# iivsearch, iovsearch, amd, globalsearch) and their ferx-search dependency
+cargo build --release -p ferx-cli --no-default-features
+```
+
+Model search is the `search` feature of `ferx-cli`, on by default.

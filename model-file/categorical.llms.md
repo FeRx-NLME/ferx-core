@@ -1,0 +1,93 @@
+# Categorical endpoints — `[binary_model]`
+
+Categorical (discrete-state) endpoints let a model score a **non-Gaussian** observation — a category index rather than a continuous concentration. The first member of the family is the **binary / Bernoulli** endpoint: mixed-effects **logistic regression**, declared with a `[binary_model]` block.
+
+> Poisson and negative-binomial counts have their own block, documented in [Count endpoints](../model-file/count.llms.md). An ordinal (proportional-odds) endpoint is a planned follow-up. This page documents the binary endpoint only.
+
+## The `[binary_model]` block
+
+``` ini
+[binary_model]
+cmt   = 3
+logit = TH0 + THX * X + THT * TIME     ; log-odds of P(DV = 1)
+; link = logit                          ; optional; logit is the default
+```
+
+Observations for the block’s `cmt` carry `DV ∈ {0, 1}` (`EVID = 0`). The model computes a per-observation probability (under the default logit link; see [The probit link](#the-probit-link) for the other)
+
+$$p = \operatorname{logit}^{-1}(\eta_\text{lp}) = \frac{1}{1 + e^{-\eta_\text{lp}}},$$
+
+where the **linear predictor** `logit` (the log-odds) is any expression over the same namespace the hazard and error blocks use — population parameters `θ`, random effects `η`, data covariates, values from `[individual_parameters]`, and the per-record `TIME` builtin. The data term is the negative Bernoulli log-likelihood
+
+$$-\log L = -\sum_j \big[\, y_j \log p_j + (1 - y_j)\log(1 - p_j) \,\big].$$
+
+### Keys
+
+| Key | Required | Meaning |
+|----|----|----|
+| `cmt` | yes | Data-file `CMT` column value for this endpoint’s rows. |
+| `logit` | one of `logit` / `probit` | Linear predictor under the logit link (log-odds of `DV = 1`). Any θ/η/covariate/`[individual_parameters]`/`TIME` expression. |
+| `probit` | one of `logit` / `probit` | The same linear predictor under the probit link (see [The probit link](#the-probit-link)). |
+| `link` | no | `logit` (the default) or `probit`. It must agree with the predictor’s key. |
+
+### The probit link
+
+Write the predictor under `probit =` instead of `logit =` and the model computes
+
+$$p = \Phi(\eta_\text{lp}),$$
+
+the standard-normal CDF of the linear predictor, which is NONMEM’s `P = PHI(LP)` and R’s `glm(..., family = binomial(link = "probit"))`. `link = probit` may be added, but it is implied by the key:
+
+``` ini
+[binary_model]
+cmt    = 3
+probit = TH0 + THX * X + ETA_I        ; P(DV = 1) = Phi(...)
+```
+
+The key names the link, so a predictor is never called `logit` when it is not one. A block with `link = probit` and a `logit =` predictor (or the other way round) is refused, and so is a block that gives both keys. `cloglog` is not available.
+
+The data term is the same Bernoulli likelihood, computed as `−log Φ(s·η_lp)` with `s = +1` for `DV = 1` and `−1` for `DV = 0`. It is evaluated in log space, and in the lower tail (where `Φ` would underflow) it never forms `Φ` at all, so a record far in either tail (an event at `η_lp = −40`, say) contributes its exact `≈ η_lp²/2` rather than `log(0)`. The gradient, the η-Hessian and the covariance step’s derivatives are exact, as under logit.
+
+The probit link is anchored against NONMEM `METHOD=COND LAPLACE LIKE` with `P = PHI(LP)` on a 2400-row binary meta-analysis fixture (`probit_b1` in `nonmem_anchor/README.md`).
+
+### Random effects and the fixed-effects special case
+
+A per-subject random effect in the predictor (`logit = TH0 + ETA_I`) gives a **mixed-effects** logistic model — a random intercept (or slope). Omitting all random effects (no `omega`, `n_eta = 0`) gives ordinary **fixed-effects logistic regression**, exactly analogous to base-R `glm(..., family = binomial)`. Both are supported; the fixed-effects case needs no `[structural_model]`, `[error_model]`, or `[individual_parameters]` blocks (a logistic-only model can be just `[parameters]` + `[binary_model]` + `[fit_options]`).
+
+Covariates on the predictor are read **per record**: the `TIME` builtin is the record’s time, and a covariate column that changes within a subject (an arm, a dose group) is read at the record’s own value, as a `$PRED` reads the current record (#2562). The one exception is a subject that also carries time-to-event records, whose rows the reader cannot line up one-to-one with its binary records: a time-varying covariate on the predictor is then refused (`E_ENDPOINT_TV_COVARIATE`), since it could only be read at baseline.
+
+A θ level block (`theta PLACEBO[STUDY, TIME](0.0)`) may be read in the predictor, as in a binary model-based meta-analysis: each record is scored at the level its own columns name, and the binary records define the block’s levels as Gaussian observations do (see [θ level blocks](../model-file/parameters.llms.md)). It may also be `profile`d there, under either link (see [Through a link](../model-file/parameters.llms.md#through-a-link)).
+
+## Data format
+
+`DV` holds the 0/1 outcome directly (there is no censoring code). One row per observation; no dose rows are needed for a logistic-only model.
+
+``` csv
+ID,TIME,DV,CMT,EVID,MDV,X
+1,0,0,3,0,0,1.07
+1,1,0,3,0,0,1.07
+1,2,1,3,0,0,1.07
+2,0,1,3,0,0,-1.01
+```
+
+A `DV` value of `2` or more on a binary CMT is a data error — the fit stops with a clear message (an ordered response with more than two categories needs an ordinal endpoint, which is not yet available).
+
+## Example
+
+`examples/binary_logistic.ferx` (with `data/binary_logistic.csv`) fits a fixed-effects logistic model with a subject covariate `X` and a `TIME` effect:
+
+``` ini
+[parameters]
+  theta TH0(0.0, -10.0, 10.0)
+  theta THX(0.0, -10.0, 10.0)
+  theta THT(0.0, -10.0, 10.0)
+
+[covariates]
+  X continuous
+
+[binary_model]
+  cmt   = 3
+  logit = TH0 + THX * X + THT * TIME
+```
+
+See [Categorical estimation](../estimation/categorical.llms.md) for the estimator guidance and the validation against R `glm`.

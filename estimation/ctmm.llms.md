@@ -1,0 +1,75 @@
+# Continuous-time Markov models (CTMM)
+
+A [`[markov_model]`](../model-file/markov-model.llms.md) endpoint is fit with the same generalized negative-log-likelihood machinery as the time-to-event and categorical endpoints. The observed process is a discrete **state** `s ∈ {0…S−1}` recorded at irregular times; between two consecutive observations `Δt` apart the per-subject data term is
+
+$$-\log L = -\sum_m \log P(\Delta t_m)_{s_m,\,s_{m+1}},
+\qquad P(\Delta t) = \exp(Q\,\Delta t),$$
+
+where `Q` is the transition-intensity (generator) matrix — off-diagonals `q_{jk} ≥ 0` are the declared `transition` intensities and the diagonal is fixed row-sum-zero (`q_{jj} = −Σ_{k≠j} q_{jk}`).
+
+## Why the matrix exponential, not a probability ODE
+
+A CTMM’s state-occupancy probabilities obey `dP/dt = Qᵀ P`. For a **time-homogeneous** generator this has the exact closed-form solution `P(Δt) = expm(Q·Δt)`, so ferx forms the transition matrix directly with a matrix exponential (nalgebra’s Higham scaling-and- squaring Padé) rather than integrating the ODE — no ODE solver in the loop, and exactly differentiable. A genuinely drug-driven, time-varying `Q(t)` *does* need the occupancy ODE, and takes that path instead (see [current scope](#current-scope)).
+
+### The η-gradient is exact
+
+The EBE search differentiates the transition likelihood **analytically** (#759). The intensities are replayed over dual numbers with θ and η seeded, giving an exact `∂Q/∂η`; that is chained to `∂P/∂Q` through the Van Loan (1978) Fréchet derivative of the matrix exponential, `L(A,E) = d/dt expm(A + tE)|₀`. The row-sum-zero constraint (`q_jj = −Σ_{k≠j} q_jk`) is inherited for free — differentiation is linear, so the derivative of a valid generator is a valid direction.
+
+Only one *entry* of `P` is ever read per observation gap, so ferx uses the adjoint form `⟨C, L(A,E)⟩ = ⟨L(Aᵀ,C), E⟩`: a single Fréchet solve per gap serves every parameter at once, instead of one solve per (parameter, gap). That makes the exact gradient *cheaper* than the finite differences it replaces, not merely more accurate.
+
+The FOCEI Laplace `½log|H̃|` term needs the **second** derivative of the data term w.r.t. η, which Van Loan does not give; it is exact too, taken by running the generator and the scaling-and-squaring `expm` on a second-order η-dual. The **outer** (θ) gradient is the exact marginal gradient, as for [TTE](../estimation/tte.llms.md#outer-gradient-reconverged). A subject that also carries `[binary_model]` or time-to-event records stays analytic — those terms have exact gradients too ([categorical endpoints](../estimation/categorical.llms.md#analytic-inner-gradient), [TTE](../estimation/tte.llms.md#estimation)). A drug-driven `Q(t)` is exact as well: its likelihood is an occupancy ODE rather than an `expm`, so the Fréchet identity does not apply, and the occupancy ODE is solved on dual numbers instead.
+
+ferx does **not** use the NONMEM `EVID=3` / occupancy-flag CTMM dataset mechanism: it reads ordinary `(ID, TIME, STATE)` rows and conditions on each subject’s first observed state (see the [data format](../model-file/markov-model.llms.md#data-format)).
+
+## Estimation method
+
+| Method | CTMM | Notes |
+|----|:--:|----|
+| **FOCEI** (Laplace) | ✓ | Default. The inner EBE gradient is **analytic** (exact `∂Q/∂η` × Van Loan, above); the `½ log\|H̃\|` correction uses the [exact η-Hessian](../estimation/tte.llms.md#exact-data-term-curvature) of the data term, and the outer θ-gradient is the exact marginal gradient, as for TTE / binary. |
+| **SAEM** | ✓ | Preferred for sparse state data — no Laplace approximation. |
+| **IMP** (importance sampling) | ✓ | Unbiased marginal likelihood. |
+| **FOCE** (no interaction) | — | Drops the log-det correction and is biased for a non-Gaussian data term; use `focei`. |
+| Pure Gauss–Newton | — | The `J'R⁻¹J` structure is Gaussian-specific; rejected fail-loud. |
+
+The **fixed-effects** (`n_eta = 0`) case has no inner loop — the objective reduces to the plain transition likelihood `Σ_j −log L_j`, and the outer optimizer fits the log- intensities by direct maximum likelihood. This is the ferx analogue of a two-state R `msm` model.
+
+## Validation — exact agreement with NONMEM
+
+A fixed-effects CTMM minimises the exact panel/snapshot likelihood `−2 Σ log P(Δt)_{s,s'}`, and NONMEM can score that identical likelihood through its general `F_FLAG=1` (LIKELIHOOD) route — the closed-form 2-state transition matrix written directly in `$PRED`. So the fit is anchored **against NONMEM** (not R `msm`): NONMEM’s *dataset* CTMM mechanism (`EVID=3` + `A0_FLG`) is architecturally incompatible with ferx’s reader, but its *likelihood* is not, and for `n_eta = 0` both engines optimise the same objective.
+
+A 2-state chain was Gillespie-simulated with data-generating intensities `q_{0→1} = 0.5`, `q_{1→0} = 0.3` (so `LQ01 = log 0.5 = −0.693`, `LQ10 = log 0.3 = −1.204`) and observed on an irregular grid (`data/ctmm_2state.csv`, 60 subjects × ~12 observations). Fitting `examples/ctmm_2state.ferx` and the matching NONMEM control stream (`tests/nonmem/ctmm_2state.ctl`, `METHOD=0`):
+
+| Parameter              |         ferx |  NONMEM 7.5.1 | Data-generating |
+|------------------------|-------------:|--------------:|----------------:|
+| `LQ01` (log `q_{0→1}`) |    −0.539011 |     −0.540113 |          −0.693 |
+| `LQ10` (log `q_{1→0}`) |    −1.215053 |     −1.215660 |          −1.204 |
+| **OFV (−2 log L)**     | **606.9817** | **606.98181** |               — |
+
+The OFV agrees to four decimals; the log-intensities agree to ~0.001 (well under 0.01 of the ~0.14 standard errors — the likelihood is flat near the optimum, so the two optimizers stop at sub-tolerance-different points on the same objective). Both estimates sit within sampling error of the data-generating truth (a single stochastic realisation). The comparison is a `slow-tests`-gated test, `tests/markov_nonmem.rs`.
+
+The numerical core is additionally anchored in-repo, license-free: the `matrix_exp` / `ctmm_data_term` primitives are unit-tested against the exact 2-state generator solution and the truncated Taylor series (`src/markov`), and the endpoint data term against the closed-form `P(Δt)_{00} = (b + a·e^{-(a+b)Δt})/(a+b)` for `Q = [[-a,a],[b,-b]]`.
+
+## Current scope
+
+The **fit path** ships for both a time-homogeneous generator and a **drug-driven** one (an intensity may reference an ODE state, e.g. `transition s0 -> s1 = exp(LQ01 + SLOPE * (central / V))` — see `examples/ctmm_pd_2state.ferx`). The drug-driven case integrates the occupancy ODE `dP/dτ = P·Q(τ)` over each gap rather than forming `expm(Q·Δt)`, so it does not use the Van Loan derivative above; its derivatives are exact all the same, because the occupancy ODE is evaluated on dual numbers.
+
+The **minimal CTMM** (`type = mctmm`) is available as parse-time sugar for the CTMM above (see [the model-file page](../model-file/markov-model.llms.md#minimal-ctmm-type-mctmm)), so it gets the same estimators, the analytic η-gradient and the drug-driven route. The discrete-time Markov model (`type = dtmm`) has its own page, [Discrete-time Markov models](../estimation/dtmm.llms.md). CTMM simulation/prediction is a planned follow-up.
+
+## Minimal CTMM validation
+
+The mCTMM is validated four ways:
+
+- **NONMEM.** A 3-state model with two cut-points and a covariate on the linear predictor (`examples/mctmm_3state.ferx`, 80 simulated subjects) is scored by NONMEM 7.5.1 through `F_FLAG=1`, with `expm(Q·Δt)` written in closed form (Sylvester’s formula on the tridiagonal generator’s eigenvalues) — `tests/nonmem/mctmm_3state.ctl`.
+- **An independent optimizer.** R `nlminb` on `expm::expm` (`tests/nonmem/mctmm_3state_refit.R`) confirms NONMEM’s optimum to 3e-9 in OFV. That matters because NONMEM ends this run with ERROR=134, rounding errors, after its objective has gone flat.
+- **Reduction.** An mCTMM equals the `type = ctmm` model with its expanded transitions written out by hand, bit for bit.
+- **Closed forms and parity.** The generator matches the published construction: adjacent-only rates, pairwise relaxation at `1/τ`, and `π·Q = 0` for the proportional-odds `π`. The 2-state case matches `P(Δt) = Π + (I − Π)e^{−Δt/τ}`. The dual gradient on `τ` and the cut-points matches central finite differences.
+
+|         |           ferx |   NONMEM 7.5.1 |     R `nlminb` |
+|---------|---------------:|---------------:|---------------:|
+| `LTAU`  |       0.637929 |       0.637932 |       0.637929 |
+| `C1`    |      −0.440238 |      −0.440228 |      −0.440238 |
+| `LD2`   |       0.506227 |       0.506227 |       0.506227 |
+| `BX`    |       1.064568 |        1.06458 |       1.064568 |
+| **OFV** | **966.446931** | **966.446931** | **966.446931** |
+
+The ferx column is measured on macOS arm64. There, ferx lands on R’s optimum to 1e-9, with the OFV 3.4e-9 from NONMEM’s and the estimates within 1.3e-5 of NONMEM’s. The test bounds come from an earlier Linux run (OFV gap 7e-7, worst estimate gap 1.5e-4, under 1e-3 of every standard error, 0.08–0.31): the likelihood is flat near the optimum. The comparison is the `slow-tests`-gated `tests/markov_nonmem.rs::ferx_mctmm_matches_nonmem_3state`.

@@ -1,0 +1,298 @@
+# AGQ — Adaptive Gaussian Quadrature
+
+> **Maturity: beta** — see [Feature Maturity](../maturity.llms.md) for what this means.
+
+`agq` (aliases `aghq`, `gauss_hermite`, `adaptive_gaussian_quadrature`) generalises the Laplace approximation. Where [FOCE/FOCEI](../estimation/foce.llms.md) approximate each subject’s marginal likelihood with a *single* Gaussian centred at the empirical-Bayes mode, AGQ keeps that centring but evaluates the integrand on a Gauss–Hermite grid laid around the mode. One node reproduces Laplace exactly; more nodes refine the marginal.
+
+Its two defining properties:
+
+- **It integrates the model’s real likelihood.** Nothing is linearised and no Gaussian-residual assumption is made, so count, categorical and time-to-event endpoints are handled by the same engine, without the approximation FOCE/FOCEI structurally depend on.
+- **It is deterministic.** The grid is fixed, so the objective carries no Monte-Carlo noise — unlike [SAEM](../estimation/saem.llms.md) or [IMP](../estimation/importance-sampling.llms.md), it needs no common random numbers, no step-size schedule, and returns a bit-identical OFV run to run.
+
+## Usage
+
+``` ini
+[fit_options]
+  method = laplace
+  n_agq  = 3      # Gauss-Hermite nodes per random effect (default 1 = Laplace)
+```
+
+There is no separate `method = agq`: adaptive Gauss–Hermite quadrature is `method = laplace` with `n_agq > 1` (the exact Hessian anchor). `n_agq = 1` (the default) is the Laplace approximation.
+
+From R:
+
+``` r
+fit <- ferx_fit(model, data, method = "agq", settings = list(n_agq = 5))
+```
+
+`n_agq` is the number of nodes **per random effect**. Odd values are conventional — they keep a node exactly at the mode. `n_agq = 1` *is* the Laplace approximation (see below).
+
+## Cost, and the dimensionality limit
+
+The grid is a tensor product: `n_agq ^ n_eta` likelihood evaluations per subject per outer iteration. That is the whole cost model, and it is exponential in the number of random effects.
+
+| n_eta | `n_agq = 1` | `n_agq = 3` | `n_agq = 5` | `n_agq = 7` |
+|-------|-------------|-------------|-------------|-------------|
+| 2     | 1           | 9           | 25          | 49          |
+| 3     | 1           | 27          | 125         | 343         |
+| 5     | 1           | 243         | 3 125       | 16 807      |
+| 8     | 1           | 6 561       | 390 625     | 5.7 M       |
+
+ferx rejects a fit whose grid exceeds **100 000 nodes** rather than start work that will not finish. If you hit that, lower `n_agq`, reduce the number of random effects, or use [SAEM](../estimation/saem.llms.md) / [IMP](../estimation/importance-sampling.llms.md) — Monte-Carlo methods whose cost does not grow with the η dimension. AGQ is at its best at **n_eta ≤ 4**.
+
+> **Note on grid pruning.** A natural-looking optimisation — dropping nodes whose Gauss–Hermite weight is negligible — is *unsound* here and ferx does not do it. The adaptive rule multiplies each weight by `exp(‖z‖²)`, which exactly cancels the `e^{−z²}` decay the Hermite weights carry, so the corrected weights are `Θ(1)` right across the grid. A node with a tiny raw weight can carry a perfectly ordinary share of the integral. Sparse (Smolyak) grids are the real answer for `n_eta = 5..8` and are tracked as future work.
+
+## `n_agq = 1` is exactly Laplace — and has its own method name
+
+Because the one-node case is a genuinely useful estimator in its own right (it is NONMEM’s `$EST METHOD=1 LAPLACIAN`), it is exposed directly:
+
+``` ini
+[fit_options]
+  method = laplace     # alias: laplacian
+```
+
+`method = laplace` with the default `n_agq = 1` **is** the Laplace approximation: one node, no grid, the exact-Hessian anchor. Raising `n_agq` turns the same objective — same analytic gradient, same covariance step, same code — into adaptive Gauss–Hermite quadrature. Prefer `n_agq = 1` when you want a NONMEM-`LAPLACIAN`-comparable fit or a baseline to raise `n_agq` from.
+
+It is the cheapest configuration — one node, no grid — and on warfarin it converges *faster than FOCEI* (0.23 s vs 0.60 s), because the analytic gradient needs fewer outer iterations.
+
+The **Hessian anchor** is what the method name selects: `method = laplace` anchors the grid on the exact conditional Hessian, `method = focei` on the Gauss-Newton `H̃`. So `method = focei` with `n_agq > 1` is the Gauss-Newton-anchored quadrature — FOCEI refined toward the exact marginal. Both anchors converge to the same integral as `n_agq → ∞`; they differ only in where the nodes are placed (and, at one node, in whether the `½log|H|` term carries the exact curvature or the Gauss-Newton approximation).
+
+> **`laplace` is not `focei`.** Both place a single Gaussian at the empirical-Bayes mode, but they build it from different Hessians — see below. They are different estimators and will report different OFVs.
+
+With one node the rule is `z = 0` with weight `√π`, and the quadrature sum collapses, term for term, to
+
+$$L_i \approx (2\pi)^{d/2}\,|H|^{-1/2}\,\exp\!\big(l_i(\hat\eta)\big),$$
+
+which is the Laplace approximation. This is an identity, not a numerical coincidence.
+
+**AGQ(1) is Laplace with the *exact* Hessian — NONMEM’s `$EST METHOD=1 LAPLACIAN`.** It is deliberately *not* identical to ferx’s FOCEI, which is Laplace with the **Gauss-Newton** Hessian `CᵀC + Ω⁻¹` (that form drops `∂²f/∂η²`). ferx computes `H` as the exact Hessian of the true conditional NLL, TTE and categorical terms included, because the Gauss-Newton form carries *no curvature at all* from TTE or categorical endpoints — it is blind on precisely the models AGQ exists to serve.
+
+The grid scaling only affects accuracy at finite `n` (AGQ converges to the same marginal under any invertible scaling), but at `n_agq = 1` it enters the objective directly through `½·log|H|`. So the two Laplace variants differ by exactly that term, and no more.
+
+## Validation
+
+### Against NONMEM
+
+NONMEM has no AGQ. But `n_agq = 1` *is* Laplace with the exact Hessian, and that is precisely what `$EST METHOD=1 LAPLACIAN` computes — so LAPLACIAN is the exact external anchor for the one-node identity.
+
+Warfarin, OFV evaluated at identical initial parameters (`MAXEVAL=0`):
+
+| Objective | ferx | NONMEM |
+|----|----|----|
+| FOCEI — Laplace, Gauss-Newton Hessian (`METHOD=1 INTER`) | 7.496684 | **7.4967** |
+| **AGQ `n_agq = 1`** — Laplace, exact Hessian (`METHOD=1 LAPLACIAN INTER`) | 7.899403 | **7.8994** |
+| `METHOD=1 LAPLACIAN` *without* `INTER` | — | 17.2049 |
+
+AGQ(1) reproduces NONMEM’s LAPLACIAN to **5 significant figures**. Three things follow, and together they are the strongest statement available about this implementation:
+
+1.  **The one-node/Laplace identity holds against an independent engine**, not just against ferx’s own arithmetic.
+2.  **NONMEM shows the same 0.40-unit gap between LAPLACIAN and FOCEI that ferx does.** So that gap is FOCEI’s Gauss-Newton Hessian — a real property of the estimator, reproduced by the reference implementation — and not a defect here.
+3.  **`INTER` is required.** Plain `LAPLACIAN` misses by 9.3 OFV units, because the exact Hessian of the conditional NLL must carry the curvature of the η-dependent residual variance (`ln V(f(η))` under a proportional error model). ferx’s `individual_nll` includes that term, which is exactly why the Hessian is taken from the true NLL rather than from the Gauss-Newton form — the latter would have silently dropped it.
+
+Converged fit (`MAXEVAL=9999` / `maxiter = 500`, `optimizer = auto` → L-BFGS on the analytic gradient). `n_agq = 1` is the like-for-like comparison — both are Laplace with the exact Hessian:
+
+| Parameter  | NONMEM `LAPLACIAN INTER` | ferx AGQ `n_agq = 1` | Δ       |
+|------------|--------------------------|----------------------|---------|
+| OFV        | −285.9703                | −285.9702            | 0.0001  |
+| TVCL       | 0.132687                 | 0.132688             | +0.001% |
+| TVV        | 7.737460                 | 7.737470             | +0.000% |
+| TVKA       | 0.810924                 | 0.810898             | −0.003% |
+| PROP_ERR   | 0.0105646                | 0.010565             | +0.004% |
+| ω²(ETA_CL) | 0.0285916                | 0.028592             | +0.001% |
+| ω²(ETA_V)  | 0.00959221               | 0.009592             | −0.002% |
+| ω²(ETA_KA) | 0.336006                 | 0.336021             | +0.004% |
+
+**Every parameter agrees with NONMEM to within 0.004%.** Raising to `n_agq = 3` moves the OFV to −285.9739 (a strictly better marginal) and barely moves the estimates — on warfarin the Laplace approximation is already near-exact, so the two share a minimum. That is the *point*: where Laplace is good, AGQ confirms it; where it is not, AGQ moves away from it and you can watch it happen by raising `n_agq`.
+
+### The one-node rule carries no jitter (#2538)
+
+Until \#2538 the anchor Hessian was factored with a relative `10⁻⁶` diagonal jitter added, so `method = laplace` scored `½log|H + εD|` rather than the Laplace approximation’s `½log|H|`: about `10⁻⁶·d` too high per subject. The warfarin table above is at 5 significant figures and cannot see that; a tighter fixture does. On `nonmem_anchor/profile_mbma` (12 studies, one η entering nonlinearly, a between-arm κ, additive error weighted by `SE`) with `$EST METHOD=COND LAPLACE INTER`, a converged ferx fit of the same model (`outer_ftol = 1e-12`, `outer_xtol = 1e-10`) reaches:
+
+|                                        | OFV           | vs NONMEM |
+|----------------------------------------|---------------|-----------|
+| NONMEM `METHOD=COND LAPLACE INTER`     | 101.974094188 | —         |
+| ferx `method = laplace`, before \#2538 | 101.974184455 | +9.03e-5  |
+| ferx `method = laplace`, after         | 101.974094148 | −4.0e-8   |
+
+The remaining `−4e-8` is ferx’s own optimum sitting just below its value at NONMEM’s point, the same `5e-8` measured on the issue. The NONMEM run is the issue’s (the `anchor` image); ferx is Linux x86-64. At the default `outer_ftol = 1e-6` the fit stops about `1.6e-4` short of either optimum on this fixture: a relative tolerance on an OFV near 100, not the objective.
+
+### Speed
+
+Same fit, wall-clock:
+
+|                                            | evaluations | wall       |
+|--------------------------------------------|-------------|------------|
+| ferx FOCEI (analytic gradient)             | 42          | 0.60 s     |
+| **ferx AGQ `n_agq = 1`**                   | 31          | **0.23 s** |
+| **ferx AGQ `n_agq = 3`**                   | 32          | **0.30 s** |
+| NONMEM `LAPLACIAN INTER`                   | 220         | 1.21 s     |
+| ferx AGQ, naive finite-difference gradient | 38          | 6.5 s      |
+
+AGQ is **faster than ferx’s own FOCEI** and ~4–5× faster than NONMEM’s LAPLACIAN, while integrating a strictly better marginal. The last row is what the analytic gradient bought: a ~20× speedup over differencing the objective numerically, because that route re-solves every subject’s inner loop at every perturbed parameter and this one never does.
+
+(NONMEM’s 1.21 s is its reported *estimation* time and excludes the gfortran compile of the control stream, which dominates a real NONMEM run. Different hardware, so read the ratio, not the absolute.)
+
+### Against ferx’s importance sampler
+
+The NONMEM check validates `n_agq = 1`. To validate the *node sweep* — the part NONMEM cannot anchor, because it has no AGQ — the reference is ferx’s own importance sampler, which estimates the same integral by a completely different route.
+
+Warfarin, OFV evaluated at identical initial parameters and identical EBEs — so the *only* thing varying across rows is the marginal approximation.
+
+| Method                   | OFV       | What it approximates               |
+|--------------------------|-----------|------------------------------------|
+| FOCE                     | 16.475    | Sheiner–Beal *linearised* marginal |
+| FOCEI                    | 7.497     | Laplace, Gauss-Newton Hessian      |
+| **AGQ `n_agq = 1`**      | **7.899** | **Laplace, exact Hessian**         |
+| AGQ `n_agq = 3`          | 7.697     |                                    |
+| AGQ `n_agq = 5`          | 7.501     |                                    |
+| AGQ `n_agq = 7`          | 7.483     |                                    |
+| AGQ `n_agq = 11`         | **7.480** | ← converged                        |
+| **IMP** (20 000 samples) | **7.457** | Monte-Carlo marginal (independent) |
+
+The last row is the check that matters. Importance sampling estimates the *same integral* by a completely different route — a Student-t proposal with self-normalised weights: no quadrature, no Hessian, no Laplace. AGQ’s refined grid lands within **0.02 OFV units** of it, which is inside IS’s own Monte-Carlo error at 20 000 samples. Two estimators sharing no code path agree, which certifies both the marginal and the likelihood’s constant convention (an error in either would show as tens of OFV units, not hundredths).
+
+Note that FOCEI’s 7.497 is *closer* to the truth than AGQ(1)’s 7.899 here. That is not a defect — and NONMEM reproduces exactly the same ordering. Both are one-term approximations, and on this model FOCEI’s Gauss-Newton Hessian error happens to partially cancel the Laplace error. The point of AGQ is that you do not have to rely on that cancellation: you add nodes and watch the number stop moving.
+
+### Converged fit vs FOCEI
+
+Full fit of the same model, `maxiter = 500`, covariance step on:
+
+| Parameter  | FOCEI    | AGQ (`n_agq = 3`) |
+|------------|----------|-------------------|
+| OFV        | −286.004 | −285.973          |
+| TVCL       | 0.132673 | 0.132684          |
+| TVV        | 7.73806  | 7.73881           |
+| TVKA       | 0.809975 | 0.811433          |
+| ω²(ETA_V)  | 0.009593 | 0.009589          |
+| ω²(ETA_KA) | 0.336241 | 0.337807          |
+| PROP_ERR   | 0.010565 | 0.010561          |
+
+On a well-behaved Gaussian PK model Laplace is already accurate, so AGQ reproduces the FOCEI estimates to ~0.2% — which is the expected and desired result. AGQ earns its cost on models where that assumption *fails*: non-Gaussian endpoints, sparse data, and large `ω²`.
+
+> **Reproducing the NONMEM anchor.** The runner is `C:\package\ferx\nm_agq_laplace_warfarin.R` (klebsiella, `nmfe75`). It submits the four control streams above and prints the comparison table. Note the warfarin data has `CMT = 1` on observation rows, so the `$ERROR` block must use `IPRED = A(2)/V`, not `IPRED = F`.
+
+## What runs under the hood
+
+AGQ reuses the FOCE/Laplace machinery almost entirely:
+
+1.  **Inner loop — unchanged.** The per-subject EBE mode `η̂` comes from the same solver FOCE/FOCEI use, on the exact inner gradient from the adjoint’s recording wherever it serves the subject. AGQ does **not** re-optimise the mode; it only lays the grid around it.
+2.  **Hessian.** Under the exact anchor (Laplace’s) `H` is the exact conditional Hessian `∂²nll/∂η²` from the same recording — the TTE, binary and CTMM terms on a second-order η-dual — central-differenced from the conditional NLL only where no recorder serves the subject (the [known FD fallbacks](../estimation/foce.llms.md#known-fd-fallbacks)). Under the Gauss–Newton anchor it is FOCEI’s `H̃`.
+3.  **Grid.** Gauss–Hermite nodes/weights are computed by Golub–Welsch, then transformed to `η_j = η̂ + √2·Σ^{1/2}·z_j` with `Σ = H⁻¹`.
+4.  **Objective.** The exact conditional likelihood is evaluated at each node.
+5.  **Outer loop.** AGQ has an **analytic outer gradient** (below), so `optimizer = auto` resolves to gradient-based **L-BFGS**. The covariance step works on the AGQ objective too, so the reported standard errors belong to the likelihood that was actually optimised — see [the analytic covariance](#the-analytic-covariance) for when that is computed analytically rather than by finite differences.
+
+Subjects are evaluated in parallel (rayon); the node sweep is serial within a subject. The population sum is reduced in a fixed subject order, so the OFV does not depend on the thread count.
+
+## The analytic outer gradient
+
+The quadrature has no closed form, but its *gradient* does. At the mode, the subject objective `A` and the inner gradient `∇_η l` (which vanishes there) combine into one scalar whose partial derivative at fixed `η̂` is the total derivative:
+
+    Ψ = A − wᵀ ∇_η l,     w = H⁻¹ ∇_η A,     H = ∇²_η l
+
+This is the same adjoint identity FOCE and FOCEI use ([the analytic gradient](../estimation/optimizers.llms.md#analytic-foce-focei-gradient-analytical-pk-models)), and it is exact at **every** node count. The nodes are built from `(η̂, H_a)`: `b_j = η̂ + √2·L⁻ᵀz_j`, with `L` the Cholesky factor of the anchor `H_a` (#2538: of `H_a` itself whenever it is positive-definite, so one node is the Laplace approximation exactly; of `H_a` plus a `10⁻⁶` relative diagonal jitter, then of `Ω⁻¹`, only when it is not). Both the node displacement and the anchor sit on the reverse tape. So the **grid response**, the term that moves with where the grid is centred and how it is scaled, is differentiated with everything else. It is not small: on warfarin the fixed-η score alone is 26% wrong at `n_agq = 1` (where the rule *is* Laplace) and 0.8% wrong at `n_agq = 3`, measured against a finite difference of the reconverged objective.
+
+Under the Gauss–Newton anchor (`focei`, `n_agq > 1`) `H̃` reads only `∂f/∂η`. Under Laplace’s exact anchor `H` reads `∂²f/∂η²` as well. Its adjoint is `c_j·S` per row, so the recording carries the second derivatives along `S`’s eigenvectors and the reverse sweep reaches them. Neither anchor needs a finite-difference `dH/dθ`, and no node is ever re-solved.
+
+### Scope
+
+The AGQ gradient has the FOCE/FOCEI adjoint’s scope **exactly**: closed-form, compartment-free and `[odes]` models, IOV, M3 censoring, IIV-on-RUV, custom residual magnitudes, LTBS, correlated residuals (`block_sigma`, its estimated ρ included), FREM, and the TTE, binary and CTMM endpoints, whose data terms are evaluated exactly at every node. There is no separate list of families to drift out of step with the FOCE/FOCEI gate.
+
+A subject outside it — one of the [known FD fallbacks](../estimation/foce.llms.md#known-fd-fallbacks), or `gradient_method = fd` — takes a per-subject finite difference of the objective with the inner loop reconverged at each point. That is correct, but slower than the analytic score. The fit output reports which route ran.
+
+A subject inside the scope can still miss the exact gradient at one trial point. If the inner search stops short of the mode (a Nelder–Mead fallback, for example) and the exact Hessian there is indefinite, the identity behind the exact score does not hold. The subject then takes the exact score at its EBE re-solved at the trial point, which is stationary, so the identity holds there; where no recorder serves it either, it takes the reconverged finite-difference score. Neither leaves out the EBE-response term, which a held-EBE gradient would, and the outer gradient fallback warning counts only the reconverged subjects. The covariance step takes the exact score or the reconverged one the same way.
+
+### Where AGQ stops
+
+AGQ stops on the **objective-change** criterion (`outer_ftol`, default 1e-6) and the step-size criterion (`outer_xtol`), not on a gradient norm. FOCE/FOCEI are given a `1e-12` stop, and are ended by the gradient norm, the stagnation guard and verification legs that re-solve the EBEs at a tight tolerance.
+
+The rule began as a noise floor: the anchor Hessian and the grid response were central differences, and an unreachable stop left the optimizer stepping on noise until the line search failed and the run reported **not converged** on a flat OFV (warfarin + IOV: 14.5 s → 8.2 s when it changed). The gradient is now exact, the adjoint differentiating the exact-Hessian anchor and the grid on its own tape, so the rule stays as a measured cost/accuracy choice. Giving Laplace/AGQ the FOCEI regime instead (#2549) cost 1.15–2.9× on the `pk1` benchmark fits (an ODE AGQ-3 fit from 222 G to 651 G instructions) for at most `1e-5` OFV, and 7× on a 26-parameter, five-effect Laplace fit for 0.10. Set `outer_ftol` lower where that precision matters.
+
+That relative stop can still be met mid-descent on a slow creep: on `pk2_big`, Laplace stopped there 0.10 OFV above the optimum. So a quadrature tolerance stop is checked before it is accepted (#2549). From the incumbent’s own per-subject quadrature scores (the rows its gradient summed, so the check costs no extra pass) the BHHH Newton decrement predicts how much a Newton step from the best point would still gain. Where that exceeds `1e-3` OFV, the stop takes the same polish legs a BOBYQA tolerance stop gets: L-BFGS restarted from the best point at `ftol_rel = 1e-10`, `xtol_rel = 1e-7`, another leg while one still gains more than `1e-3`, the last leg’s stop deciding `converged`. On `pk2_big` that reaches −3485.2110, the optimum the exact-gradient regime ends at, in about half its work; the easy `pk1` fits read a predicted gain far below `1e-3` and stop as before.
+
+A leg whose line search fails without gaining, while the decrement still predicts more than `1e-3`, has not verified the stop, and the fit is **not reported as converged**, with a warning naming the predicted gain (#2585). That is the signature of an objective that is not smooth at the stop: some subjects’ conditional modes switch between local minima as the parameters move, so the line search meets jumps its gradient cannot see. The failure, not the decrement’s size, is the test: near an optimum the decrement overstates what is left (0.41 predicted 0.003 OFV from `pk2_big`’s optimum, where the legs end on their tolerance).
+
+From ten starts with every parameter perturbed by up to 30%, `pk2_big` under Laplace reached its optimum (to 0.003) from six and ended 39 to 285 OFV above it from four, each on a failed leg with 2.8 to 74 predicted; `main` before this release trapped four of the same ten (different ones: the warm-start predictor changes the path) and stopped 0.07 to 0.75 short of the optimum on the rest. The four used to be reported converged. Where the warning appears, compare fits from several starts.
+
+What decides a hard Laplace fit first is the EBE warm-start predictor, which now serves Laplace too ([Predicted warm starts](../estimation/foce.llms.md#predicted-warm-starts)).
+
+### Don’t use BOBYQA
+
+`optimizer = bobyqa` **false-converges** on the AGQ objective. On warfarin it stops 0.015 OFV units above the optimum at the default `inner_tol` — and gets *worse*, to 0.18, as `inner_tol` is tightened, because a smoother objective merely lets its trust-region stopping rule trip sooner (63 → 34 evaluations, still reporting “converged”). Its ω estimates land ~3% off NONMEM. This is the failure mode ferx records in \#317. `auto` picks L-BFGS for AGQ precisely to avoid it.
+
+## The analytic covariance
+
+The analytic R-matrix supports every quadrature fit, under either anchor:
+
+| Fit | Covariance objective |
+|----|----|
+| `method = foce` | FOCE marginal with residual variance frozen at zero random effects |
+| `method = focei`, `n_agq = 1` | FOCEI marginal |
+| `method = focei`, `n_agq > 1` | FOCEI-anchored quadrature marginal, including movement of the nodes |
+| `method = laplace`, any `n_agq` | the quadrature marginal under the exact anchor |
+
+It is the gradient’s identity one order up: `Uᵀ∇²Ψ U`, with `U = [I; dη̂/dx]` the mode’s tangent, by forward over reverse through the same recorder and kernel ([the R-matrix](../estimation/foce.llms.md#sensitivity-assembly)). Under the exact anchor the predictions carry `∂²f/∂η²` on an inner η-dual, so the fourth derivative `∂²H/∂x²` needs is exact too. That case is what used to keep `method = laplace` on the finite-difference stencil.
+
+Outside the analytic scope the covariance step uses finite differences of the objective. Under AGQ that is expensive: the stencil needs `~2·n_free²` **reconverged population objectives**, and every one of them sweeps the whole `n_agq^d` node grid for every subject.
+
+### When it applies
+
+The analytic route is taken for every subject a recorder serves, including IOV (correlated blocks shared across occasions), LTBS, observation scaling and the TTE, binary and CTMM endpoints, at any number of random effects (stacked under IOV) and under either anchor. A subject outside the scope is finite-differenced on its own, and `gradient = fd` keeps the whole-population stencil. The anchor must be positive-definite at the subject’s **mode**. At a quadrature node it may be indefinite (common in the tails of a wide-Ω grid), since the assembly never inverts it there.
+
+### Covariance validation
+
+For IOV, `tests/iov_analytic_covariance.rs` compares FOCEI R-matrix standard errors at the stored NONMEM 7.6.0 beta 1 `MATRIX=R` estimates for warfarin with two occasions. All eight SEs agree within 0.44% (the test allows 1%); OFVs are 308.83426 in ferx and 308.83047 in NONMEM. The control stream and output are stored as `tests/nonmem/warfarin_iov_cov_r.{ctl,ext}`. FOCE and FOCEI IOV Hessians are also checked against reconverged analytic gradients, including correlated BSV and IOV blocks; AGQ-FOCEI is checked against its reconverged quadrature objective. The legacy objective stencil was numerically indefinite at this reference point, so it is not used as the SE reference.
+
+For M3, `bloq_m3_analytic_covariance_at_nonmem_minimum` evaluates the analytical FOCEI R-matrix at the stored NONMEM 7.5.1 LAPLACE M3 minimum. Fixed-effect SEs agree within 0.38%; residual and random-effect variance SEs differ by 5–16%, consistent with ferx’s documented FOCEI Gauss–Newton versus NONMEM full-Laplace curvature difference. The regression allows 1% for fixed effects and 20% for variance parameters.
+
+The shared FOCEI covariance machinery is checked against the stored NONMEM 7.5.1 `MATRIX=R` reference at the same parameter values, using `tests/covariance_se_at_nonmem_minimum.rs`. All seven checked standard errors pass its 6% acceptance band. This anchors FOCEI; the AGQ Hessian is checked against its own quadrature objective:
+
+- **Finite-difference oracles at three and five nodes** — diagonal and correlated Ω, proportional and combined residual errors. The packed Hessian is compared against a reconverged second difference of the AGQ objective in optimizer space. This is the check that matters, because it sees the assembly end to end, including the `√2` node scaling and the softmax-response term.
+- **Reduction to FOCEI at one node** — at `n_agq = 1` the grid collapses onto the mode and its node-curvature term reproduces the FOCEI term, with no jitter left in the log-determinant (#2538): the two agree to rounding. This check *cannot* see a `√2` error (the single node sits at `z = 0`, so the scaling drops out), which is why the multi-node oracle above is the primary evidence rather than a supplement.
+- **Production covariance dispatch** — FOCE, FOCEI, and AGQ-FOCEI standard errors are compared against the finite-difference covariance. The test also asserts that the analytic dispatcher accepts each fixture and rejects exact-anchor Laplace.
+- **Censoring combinations** — FOCE and FOCEI M3 Hessians match reconverged analytic-gradient differences, including two-occasion IOV. AGQ-FOCEI M3 matches a reconverged second difference of its quadrature objective, both with and without IOV.
+- **Anchor identity** — the covariance uses the directly assembled objective anchor, without recovering it by inverting its inverse. A regression checks exact matrix equality and confirms that the old inverse round trip changes the fixture’s entries.
+
+Since \#486 the assembly differences nothing: the R-matrix is `Uᵀ∇²Ψ U` at the mode, by forward over reverse through the same recorder and quadrature kernel the adjoint gradient uses, the grid’s dependence on the anchor included (see [FOCE / FOCEI](../estimation/foce.llms.md) for the identity).
+
+## Inter-occasion variability (IOV)
+
+AGQ and `laplace` both support `[iov]`. Under IOV the integral is over the **stacked** random-effect vector
+
+$$b = [\eta,\ \kappa_1,\ \dots,\ \kappa_K],
+\qquad d = n_\eta + K \cdot n_\kappa$$
+
+whose prior is the block-diagonal `Ω_joint = Ω ⊕ Ω_iov ⊕ … ⊕ Ω_iov` (one block per occasion). That is not a new model — it is exactly what ferx’s IOV likelihood already scores, since
+
+``` text
+nll_iov = ½·(ηᵀΩ⁻¹η + log|Ω| + Σ_k κ_kᵀΩ_iov⁻¹κ_k + K·log|Ω_iov| + data)
+        = ½·(bᵀΩ_joint⁻¹b + log|Ω_joint| + data)
+```
+
+So **every formula on this page carries over verbatim** with `d` the stacked dimension: the marginal, the `½log|H|` normaliser, the node transform, the Fisher-identity gradient. IOV is a change of *dimension*, not of method. The mode is the joint `(η̂, κ̂)` one the inner loop already converges.
+
+**The catch is the dimension.** The tensor grid is `n_agq^d`, and `K` — the number of occasions — comes from the *data*. Three η, one κ, two occasions gives `d = 5` and `3⁵ = 243` nodes (fine); ten occasions gives `d = 13` and `3¹³ ≈ 1.6 M` (not). ferx enforces the 100 000-node cap against the stacked dimension once the data is read, and the error names the occasion count so the cause is obvious.
+
+> **`method = laplace` is always tractable under IOV.** Its grid is a *single point* no matter how large `d` grows — only the Hessian gets bigger. So Laplace + IOV works at any occasion count, and is the natural choice when the AGQ grid blows up.
+
+## Limitations
+
+- **Exponential in the random-effect dimension** — see the cost table above, and the IOV section below. This is the real limit.
+- Subjects outside the adjoint’s scope take a reconverged finite-difference score rather than an analytic one (see [Scope](#scope)). The gradient is the same, but each iteration is slower.
+- Mixture models run under `laplace` and under `focei` with `n_agq > 1` too: each class is scored with this page’s subject objective at the class’s own mode (see [Mixture models](../estimation/mixture.llms.md#laplace-and-agq)).
+
+## Method boundaries
+
+`focei` with multiple nodes and `laplace` with multiple nodes are intentional quadrature variants. The former uses the Gauss–Newton anchor; the latter uses the exact conditional Hessian. A numerical fallback changes how a derivative is computed, never which anchor or likelihood is requested. Both file-based and Rust API fits reject `n_agq = 0`; zero cannot silently select plain FOCEI or one-node Laplace. The IOV grid cap inspects every stage in a method chain, including a quadrature stage following a non-quadrature estimator.
+
+An explicitly requested terminal `agq_eval_only` stage is a likelihood readout: it preserves the preceding estimator’s parameters and covariance and updates the reported OFV. The reported estimation method remains that preceding estimator.
+
+This applies to standard errors too. The R-matrix, the score matrix used by `s` and `rsr`, and SIR all evaluate the selected quadrature objective. The score matrix uses subject negative-log-likelihood scores directly; the optimizer doubles these for its OFV gradient. A FOCEI eta-response correction must not be added to a quadrature score that already includes mode and grid movement.
+
+If a required derivative perturbation cannot produce a finite anchor or grid response, only that subject’s analytic score is declined first. Its numerical fallback reconverges the mode and differences the same quadrature objective; other subjects keep their analytic scores. For `s` and `rsr`, a failed inner solve, rejected start, or non-finite/penalty objective makes the score unavailable and the covariance step reports unavailable standard errors. It never squares an optimizer penalty into S, regardless of `max_unconverged_frac`, and uses `cov_inner_tol` for numerical scores. Finite-grid posterior-mean scores are generally nonzero; the exact-integral Bartlett identity does not remove their mode-response contribution.
+
+The analytic R-matrix is assembled in parallel and summed in fixed subject order. Zero-weight nodes are skipped before sensitivity evaluation. Grid abscissae are materialized only for covariance; objective and gradient sweeps reconstruct their indices rather than allocating another coordinate vector per node.
+
+## References
+
+- Pinheiro & Bates (1995), *Approximations to the log-likelihood function in the nonlinear mixed-effects model*, J Comput Graph Stat 4(1):12–35.
+- Adaptive Gaussian quadrature as a generalisation of the Laplacian method, as implemented in Phoenix NLME (ADPO), J Pharmacokinet Pharmacodyn (2025).

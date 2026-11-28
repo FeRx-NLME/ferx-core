@@ -1,0 +1,495 @@
+# The `.fitrx` Fit Bundle
+
+A `.fitrx` file is a single, portable, self-describing container for a fit result. It is designed to be readable from any language with stdlib-level support for zip, JSON, and CSV — Rust, R, Python, Julia.
+
+A `.fitrx` is just a zip archive. You can inspect it without any tooling:
+
+``` bash
+unzip -l run1.fitrx
+unzip -p run1.fitrx manifest.json
+unzip -p run1.fitrx fit.json | jq .theta
+```
+
+## When to use it
+
+Use `--output run1.fitrx` (CLI) or `save_fit()` (Rust API) when you want a single artifact that can be shipped between machines and languages — for example, fitting in Rust and post-processing in R/Python. The legacy `*-sdtab.csv` and `*-fit.yaml` files are still written; `--output` is additive.
+
+## Producing a bundle
+
+From the CLI:
+
+``` bash
+ferx model.ferx --data data.csv --output run1.fitrx
+ferx model.ferx --data data.csv --output run1.fitrx --include-data
+```
+
+`--include-data` embeds the input NONMEM CSV verbatim inside the bundle. Off by default — without it, downstream tools must re-supply the data when they want to call `predict()` or recompute diagnostics.
+
+From the Rust API:
+
+``` rust
+use ferx_core::io::fitrx::{save_fit, SaveFitOptions};
+use std::path::{Path, PathBuf};
+
+save_fit(
+    &fit_result,
+    &population,
+    &std::fs::read_to_string("model.ferx").unwrap(),
+    Path::new("run1.fitrx"),
+    SaveFitOptions { include_data: Some(PathBuf::from("data.csv")) },
+)?;
+```
+
+The bundle is built in memory, written to a temporary file in the target’s directory, and renamed into place. A save that fails leaves an existing bundle as it was and no partial file behind. The new file keeps what `File::create` would have given it: an existing bundle’s permissions, the umask’s for a new one, and a symlink at the path is followed. A read-only bundle is refused.
+
+`save_fit` refuses, with `FitrxError::Unwritable`, anything that is not what was fitted:
+
+- a data file whose SHA-256 is not `FitResult::data_hash`. The error names the file.
+- model text whose SHA-256 is not `FitResult::model_hash`.
+
+A fit with no recorded hash, such as one made in memory, has nothing to compare, so its data and model text are written unchecked.
+
+## Bundles in memory
+
+`save_fit` and `load_fit` wrap functions that work on a bundle’s bytes, for an interface that carries the bundle on its fit object:
+
+| Function | Purpose |
+|----|----|
+| `save_fit_to_bytes` | The bytes `save_fit` would write |
+| `load_fit_from_bytes` | `load_fit` from bytes |
+| `load_fit_from_bytes_without_population` | `load_fit_without_population` from bytes |
+| `bundle_with_data` | Add or replace `data.csv`, checked against the bundle’s `data_hash` |
+| `bundle_with_interface_extras` | Set `interface_extras.json`, or remove it with `None` |
+
+The two `bundle_with_*` functions return new bytes laid out as a save with that content would be. Other entries are carried over unchanged, and the manifest keeps its `created_at`.
+
+## Saving a loaded fit
+
+`save_fit` needs a `Population` for the `TIME`, `DV` and `OCC` columns of `predictions.csv`, which `FitResult` does not hold. `save_fit_from_bundle` takes them from the bytes of the bundle the fit was loaded from instead, so a bundle with no `data.csv` can be saved again:
+
+``` rust
+use ferx_core::io::fitrx::{load_fit_from_bytes, save_fit_from_bundle, SaveFitOptions};
+
+let bundle = std::fs::read("run1.fitrx")?;
+let loaded = load_fit_from_bytes(&bundle)?;
+save_fit_from_bundle(&loaded.fit, &bundle, Path::new("copy.fitrx"), SaveFitOptions::default())?;
+```
+
+A bundled `data.csv` is kept unless `SaveFitOptions::include_data` names another file, and it is checked against `data_hash` in either case.
+
+Those columns only belong to the fit if its subjects are the bundle’s, so the save is refused unless the subjects have the same IDs in the same order and the same `PRED`, `IPRED`, `CWRES` and `IWRES` values. To save a fit whose subjects have changed, pass the population to `save_fit`.
+
+## Loading a bundle
+
+``` rust
+use ferx_core::io::fitrx::load_fit;
+
+let loaded = load_fit(Path::new("run1.fitrx"))?;
+println!("OFV: {}", loaded.fit.ofv);
+```
+
+`loaded.population` is `Some(...)` only when `data.csv` was bundled. The model source is always available as `loaded.model_source` and can be re-parsed via `parse_model_string` to reconstruct a `CompiledModel` (e.g. to run `predict()`). `loaded.verdicts` holds the [model-selection verdicts](#model-selection-verdicts-and-cov_fixed) as they were reached when the fit was saved.
+
+## Archive layout
+
+| Entry | Format | Required | Contents |
+|----|----|----|----|
+| `manifest.json` | JSON | yes | Format version, ferx version, timestamp, entry index |
+| `fit.json` | JSON | yes | All scalars, vectors, and matrices on `FitResult` |
+| `ebes.csv` | CSV | yes | One row per subject: `ID, <eta names...>, ofv_contribution, n_obs` |
+| `ebes_kappa.csv` | CSV | only when `n_kappa > 0` | One row per (subject, occasion): `ID, OCC, <kappa names...>` |
+| `conddist.csv` | CSV | only when `[fit_options] conddist = true` (SAEM-only) | One row per (subject, eta): `ID, ETA, COND_MEAN, COND_SD, COND_MODE` |
+| `predictions.csv` | CSV | yes | One row per observation: `ID, TIME, DV, PRED, IPRED, CWRES, IWRES, EBE_OFV, N_OBS` plus optional `NPDE, NPD, EPRED, PWRES` (after `IWRES`), `CENS`, `OCC` |
+| `predictions_discrete.csv` | CSV | only when the fit has binary-endpoint records | One row per record: `ID, CMT, TIME, DV, PRED, IPRED, IWRES` |
+| `predictions_tte.csv` | CSV | only when the fit has time-to-event records | One row per record: `ID, CMT, TIME, DV, COXSNELL, MARTINGALE, DEVIANCE, PIT`, plus a trailing `NPDE` when some record has a simulation-based npde |
+| `covtab.csv` | CSV | only with a `[covariates]` block | One row per input record: `ID, TIME, EVID, <covariates...>` |
+| `trace.csv` | CSV | only with `optimizer_trace = true` | The per-iteration optimizer trace |
+| `model.ferx` | UTF-8 text | yes | Verbatim model source |
+| `warnings.txt` | UTF-8 text | no | One warning per line. Mirrors `fit.json:warnings` for grep-friendliness; loaders read warnings from `fit.json` and ignore this entry. Writers should still produce it. |
+| `data.csv` | CSV | only with `--include-data` | Copy of the input NONMEM data |
+| `interface_extras.json` | JSON | only when an interface set it | An interface’s own data, opaque to core |
+
+Entries are deflate-compressed inside the zip archive.
+
+### Numbers in the CSV entries
+
+Every double in the CSV entries is written as the shortest text that reads back as the same `f64` (`0.1`, `0.30000000000000004`, `1e-7`), with an exponent when the value is far from one. `NaN` is an empty cell and the infinities are `inf` / `-inf`. A reloaded fit therefore holds the EBEs, κ̂ and predictions the saved fit held, bit for bit, which is what lets `run_covariance` and `run_sir` repeat the fit’s own covariance step and SIR on it ([\#1847](https://github.com/FeRx-NLME/ferx-core/issues/1847)).
+
+## `manifest.json`
+
+``` json
+{
+  "format_version": "2",
+  "ferx_version": "0.1.0",
+  "model_name": "warfarin",
+  "created_at": "2026-05-15T18:06:56Z",
+  "entries": ["manifest.json", "fit.json", "ebes.csv", "..."]
+}
+```
+
+- `format_version` — currently `"2"`. Loaders should refuse unknown values rather than try to parse them. New keys may be added within a version; removals or semantic changes bump the version. See [Versioning](#versioning).
+- `created_at` — ISO-8601 UTC timestamp (seconds resolution).
+
+## `fit.json`
+
+Top-level keys mirror `FitResult` fields. Enums are encoded as snake_case strings:
+
+| Enum | Values |
+|----|----|
+| `method` / `method_chain` | `"foce"`, `"focei"`, `"foce_gn"`, `"foce_gn_hybrid"`, `"saem"` |
+| `covariance_status` | `"not_requested"`, `"computed"`, `"failed"` |
+| `error_model` | `"additive"`, `"proportional"`, `"combined"` |
+| `theta.transform[i]` | `"identity"`, `"log"`, `"logit"`, `"logit_probability"` |
+| `sigma.types[i]` | `"proportional"`, `"additive"` |
+| `eta_param_info[i].param_type` | `"log_normal"`, `"additive"`, `"logit"`, `"logit_probability"`, `"custom"` |
+| `iov.kappa_param_types[i]` | `"log_normal"`, `"additive"`, `"logit"`, `"custom"` — parallel to `iov.kappa_names` |
+
+Matrices use a row-major dense representation:
+
+``` json
+{ "rows": 2, "cols": 2, "data": [0.1, 0.0, 0.0, 0.2] }
+```
+
+`warnings` holds the message strings. `warning_details` (absent when empty) holds the structured warnings that carry a `details` payload, each a `WarningEntry` object (`severity`, `category`, `message`, `source_method`, `details`). On load these are matched to their message in `warnings`, and every other structured entry is rebuilt from its message. An entry whose `category` the loader does not know is ignored and its message is re-classified, so a newer bundle still loads. See [Where `details` is written](../warnings.llms.md#where-details-is-written).
+
+`Option<T>` fields use JSON `null` when absent (e.g. `covariance_matrix` is `null` when the covariance step did not run). A key the format always writes is required: a `fit.json` missing it is refused, not filled with a default.
+
+**Non-finite floats.** JSON has no representation for `NaN` or `±Inf`. The format encodes any non-finite `f64` as JSON `null`, both for scalars (e.g. `shrinkage_eps`, `cov_condition_number`) and for elements of numeric arrays including matrix `data` vectors. Loaders convert `null` back to `NaN`. This keeps the format robust for legitimate fits — `shrinkage_eps` is `NaN` when the model has fewer than two valid residuals, and `cov_condition_number` is `+Inf` when the smallest eigenvalue is non-positive.
+
+### Layout
+
+``` json
+{
+  "method": "focei",
+  "method_chain": ["focei"],
+  "converged": true,
+  "ofv": -280.18,
+  "ofv_data": -280.18,
+  "ofv_prior": 0.0,
+  "aic": -266.18,
+  "bic": -247.28,
+  "n_obs": 110,
+  "n_subjects": 10,
+  "n_parameters": 7,
+  "n_iterations": 42,
+  "interaction": true,
+  "wall_time_secs": 1.234,
+  "method_wall_times_secs": [1.134],
+  "covariance_wall_time_secs": 0.1,
+  "n_threads_used": 4,
+  "uses_ode_solver": false,
+  "gradient_method_inner": "analytic",
+  "gradient_method_outer": "finite differences",
+  "nlopt_missing_algorithms": [],
+  "covariance_status": "computed",
+  "covariance_n_evals_estimated": null,
+  "trace_path": null,
+  "ebe_convergence_warnings": 0,
+  "max_unconverged_subjects": 0,
+  "total_ebe_fallbacks": 0,
+  "total_ebe_nm_polished": 0,
+  "warnings": [],
+  "saem_mu_ref_m_step_evals_saved": null,
+
+  "theta": {
+    "names": ["TVCL", "TVV", "TVKA"],
+    "estimates": [0.13, 7.7, 0.76],
+    "se": [0.014, 0.29, 0.035],
+    "fixed": [false, false, false],
+    "transform": ["log", "log", "log"]
+  },
+  "omega": {
+    "names": ["eta_CL", "eta_V", "eta_KA"],
+    "matrix": { "rows": 3, "cols": 3, "data": [/* row-major */] },
+    "se": [/* SEs of the free entries, or null */],
+    "fixed": [false, false, false],
+    "log_transformed": [true, true, true],
+    "param_corr": null,
+    "shrinkage": [0.05, 0.10, 0.15]
+  },
+  "sigma": {
+    "names": ["prop"],
+    "estimates": [0.05],
+    "se": [0.001],
+    "fixed": [false],
+    "types": ["proportional"]
+  },
+  "error_model": "proportional",
+  "shrinkage_eps": 0.05,
+  "covariance_matrix": { "rows": 7, "cols": 7, "data": [/* ... */] },
+  "cov_eigenvalues": [1.0, 0.5, 0.2],
+  "cov_condition_number": 5.0,
+  "cov_fixed": [false, false, false, false, false, false, false],
+
+  "sir": null,
+  "iov": null,
+
+  "stalled_at_init": false,
+  "estimate_near_boundary": false,
+  "max_abs_correlation": 0.42,
+
+  "eta_param_info": [
+    {
+      "eta_name": "eta_CL",
+      "param_type": "log_normal",
+      "linked_theta": "TVCL",
+      "individual_param_name": "CL"
+    }
+  ],
+  "model_name": "warfarin",
+  "ferx_version": "0.1.0",
+  "environment": {
+    "os": "linux",
+    "arch": "x86_64",
+    "in_docker": true,
+    "username": "ron"
+  },
+
+  "model_path": "examples/warfarin.ferx",
+  "data_path":  "data/warfarin.csv",
+  "model_hash": "e3b0c4...",
+  "data_hash":  "ba7816..."
+}
+```
+
+`sir` is non-null only when `[fit_options].sir = true`; `iov` is non-null only when the model uses kappa (block IOV).
+
+#### Model-selection verdicts and `cov_fixed`
+
+`stalled_at_init`, `estimate_near_boundary` and `max_abs_correlation` are the verdicts of the functions of the same name in `ferx_core::model_selection`, derived from the fit when it is saved, so a reader with no engine has them. On load they are on `LoadedFit::verdicts`. The loaded `FitResult` gives the same answers through those functions. `stalled_at_init` is `null` when there is nothing to judge by, and `max_abs_correlation` when there is no covariance matrix or fewer than two usable coordinates.
+
+`cov_fixed` says which rows of `covariance_matrix` the step held, so a held row is told from a degenerate one without reading it off a zero diagonal. It is absent when there is no matrix or no mask for it, and otherwise has the matrix’s dimension; any other length is refused on save and on load.
+
+`held_at_bound` (#2797) lists the parameters whose standard error is not available, in packed order, each as `{name, kind, index, packed_index, reason}`, with `reason` `profiled_bound` or `collapsed_at_guard` ([held parameters](../estimation/parameterization.llms.md#held-parameters)). It is absent when the list is empty. An entry for a `[mixture]` per-class override also has `class`, its 1-based class (#2809). Its `kind` and `index` then name the **base** parameter it overrides, so a reader matching entries to the base estimates must skip an entry that has `class`. A base entry has no `class` key. A reader built before \#2809 drops the key and would read the override as its base parameter.
+
+A bundle written before `held_at_bound` existed carries only `profiled_levels_at_bound`; on load those levels become `profiled_bound` entries, so old and new bundles read the same way.
+
+A `reason` the reading build does not know — one a later ferx added — loads as `unknown` instead of failing the bundle (#2817). The entry still counts as held, so its standard error shows as `N/A`. Re-saving writes it back as `unknown`; the original token is not kept. An entry whose `kind` the build does not know (a parameter family a later ferx added) is dropped on load, since there is no family to show it under; the rest of the list loads. Both rules apply when a `FitResult` JSON file is read, too.
+
+#### Engine results
+
+`bayes`, `importance_sampling`, `impmap_trace` and `exclusions` hold the `FitResult` fields of those names, with their Rust field names as keys, and are absent when the fit has none. A non-finite float is `null` here as everywhere. An `importance_sampling.proposal_df` of `null` is the multivariate-normal proposal and reads back as `∞`.
+
+`covariate_types` maps each `covtab.csv` covariate to `"continuous"` or `"categorical"`. It is absent exactly when that entry is, and a covariate named in one but not the other is refused.
+
+#### Recorded SIR and scoring settings
+
+`sir.settings` records every setting the SIR draws were scored under (`FitResult::sir_settings`, [\#1758](https://github.com/FeRx-NLME/ferx-core/issues/1758)): `samples`, `resamples`, the resolved `seed`, `df`, `scale`, `keep_samples`, and, flat beside them, the scoring settings below. The enums are written as their `[fit_options]` tokens (`"natural"`, `"lbfgs"`, `"rodas5p"`); an unknown token, a value `[fit_options]` would reject (`df < 1`, a non-positive ODE tolerance, `n_agq` out of range, …) or a `seed` that disagrees with the top-level `sir_seed` fails the load as corrupt. The writer holds both records to the same rule ([\#1770](https://github.com/FeRx-NLME/ferx-core/issues/1770)): `save_fit` refuses a `FitResult` whose `sir_settings` or `scoring_settings` holds such a value (`FitrxError::Unwritable`, naming the field, and no file is written), so a bundle is never saved that cannot be loaded. `fit()` never records one; only a result edited afterwards can hold one. The top-level `sir_seed` is written from `sir_settings.seed` whenever the record is present: the record is canonical, so a fit whose `sir_settings.seed` was edited before saving loads with both fields agreeing. `df` is a JSON number, except for the multivariate-normal proposal (`sir_df = normal`, `df = ∞`), which JSON has no number for: it is written as the token `"normal"`, and `"normal"` or `"mvn"` reads back as `∞`; a `null` `df` is corrupt ([\#1819](https://github.com/FeRx-NLME/ferx-core/issues/1819)). `run_sir` on a fit without `settings` takes its scoring settings from `scoring_settings` (below) when the bundle has one, and uses the caller’s options as given when it has neither ([\#1806](https://github.com/FeRx-NLME/ferx-core/issues/1806)).
+
+`scoring_settings` records the settings of the stage that produced the estimates (`FitResult::scoring_settings`, [\#426](https://github.com/FeRx-NLME/ferx-core/issues/426)): `inner_maxiter`, `inner_tol`, `inner_restarts`, `mu_referencing`, `n_agq`, `inner_optimizer`, `ebe_warm_start`, `gradient_method` (`fd` when the run took finite differences, else `auto`) and the six `ode_*` settings, as the stage that produced the estimates ran them. `run_covariance` takes each one the caller leaves at its default from here, and so does `run_sir` on a fit with no `sir.settings`. A fit saved since \#1806 scored its SIR under this record, so the scoring half of `sir.settings` equals it. It is decoded and checked like `sir.settings`. A recorded `gradient_method = ad` is corrupt ([\#1835](https://github.com/FeRx-NLME/ferx-core/issues/1835)).
+
+`environment` records where the fit ran. Loaders return it as written rather than re-detecting the *loading* machine’s environment.
+
+`model_path` / `data_path` / `model_hash` / `data_hash` are populated when the fit was produced via `fit_from_files` (or `run_model_with_data`); they are absent (the keys are omitted) for in-memory `fit()` calls. Paths are stored verbatim as the caller supplied them (no canonicalisation), and the hashes are SHA-256 hex digests of the raw file bytes. They round-trip on save/load and are used by `run_sir` to refuse running against modified source files.
+
+### `data_bindings`
+
+The data-derived bindings the fitted model was compiled from (`FitResult::data_bindings`, [\#1621](https://github.com/FeRx-NLME/ferx-core/issues/1621)): each `theta NAME[COL, ...]` level block’s observed levels, and the summary statistics behind a symbolic `[covariate_model]` centre such as `center = median`. Rebuilding the fitted model on other data (a simulation design, a reloaded fit) needs these values, not ones re-resolved from that data. Both maps are keyed by name in sorted order:
+
+``` json
+"data_bindings": {
+  "levels": {
+    "PLACEBO": {
+      "labels": ["STUDY=1", "STUDY=2", "STUDY=3"],
+      "groups": [0, 0, 0],
+      "contrast": "sum_to_zero"
+    }
+  },
+  "covariate_stats": {
+    "WT": { "median": 71.475, "mean": 71.73333333333332, "min": 55.55,
+            "max": 90.2, "mode": 55.55, "levels": [55.55, 61.3, 70.85, 72.1, 80.4, 90.2] }
+  }
+}
+```
+
+`contrast` is the DSL token: `"sum_to_zero"`, `"sum_to_zero_within"`, `"ref"` or `"none"` (`"auto"` is accepted on read, as sum-to-zero). `groups` is parallel to `labels`. Floats are written exactly, so a reloaded binding is bit-identical. The key is absent when the model has no data-derived binding, which loads with empty bindings. Edited bindings that list a level twice are refused when a design is bound against them.
+
+### `reader_settings` and `population_fingerprint`
+
+How the fit read its data, and a fingerprint of the population it was given ([\#1685](https://github.com/FeRx-NLME/ferx-core/issues/1685)):
+
+``` json
+"reader_settings": {
+  "column_map": [["DV", "CONC"]],
+  "covariate_decls": null,
+  "fallback_columns": null,
+  "iov_column": "OCC",
+  "ignore_exprs": ["TIME > 24"],
+  "accept_exprs": [],
+  "ignore_subjects": ["3"]
+},
+"population_fingerprint": { "scheme": 1, "covariate_names": ["WT"], "subjects": [ ... ] }
+```
+
+`reader_settings` holds the `[data]` renames, the `[covariates]` declarations (or the explicit covariate columns), the occasion column and the `[data_selection]` clauses, with any a caller added to the model file’s. It is present when the fit was launched from a data file. `population_fingerprint` is written by every fit; treat it as opaque. `run_sir` and `run_covariance` re-read `data_path` with the settings and refuse a population that does not match the fingerprint.
+
+### `iov_occasion`
+
+The IOV occasion rule the fit ran under ([\#1783](https://github.com/FeRx-NLME/ferx-core/issues/1783)): `"column"`, `"per_dose"` or `{"time_windows": [24.0, 48.0]}`. It is the rule of the options the fit ran with; a file entry point takes those from its caller, not from the model file’s `[fit_options]`. `run_sir` and `run_covariance` derive the population’s occasions with it, as `fit()` did. Written by every fit.
+
+### `packed_estimate`
+
+The outer optimizer’s parameter vector at the estimate, in its own packed space (`ln θ`, the log-diagonal Cholesky factor of Ω, `ln σ`, then Ω_IOV, any `[mixture]` override and the `block_sigma` correlations; [\#1815](https://github.com/FeRx-NLME/ferx-core/issues/1815)). It lets `run_covariance` on a reloaded fit unpack the same Cholesky factor the inline covariance step used, and so repeat that step bit for bit; re-decomposing the stored `omega` instead lands on a factor a few ULP away, which the finite-difference Hessian amplifies. It also carries a `[mixture]` fit’s fitted override values. Elements are full-precision floats, non-finite as `null`.
+
+It is written by FOCE, FOCEI, Laplace, Gauss-Newton and VI fits, and absent for SAEM, IMP and Bayes, which load it as `None`. A VI fit reports the estimate its vector unpacks to, so it is reused like the others — except under a FIX, where VI keeps each FIXed value exactly as declared and a reloaded fit takes the fallback. Before [\#2187](https://github.com/FeRx-NLME/ferx-core/issues/2187) VI’s stored Ω could sit one ULP off its own vector depending on where the fit stopped ([\#1847](https://github.com/FeRx-NLME/ferx-core/issues/1847)). Consumers use it only when it unpacks bit-for-bit to the bundle’s `theta`, `omega`, `sigma`, Ω_IOV, correlations and, when the bundle has that key, `mixture_overrides` under the supplied model. An edited bundle, or a model with another layout of the same length, falls back to the stored estimates; a `[mixture]` fit with an override then reads its override values from `mixture_overrides`, and is refused only when that key is absent too. The format version did not change.
+
+### `mixture_overrides`
+
+The fitted values of a `[mixture]` model’s per-class Ω/Σ overrides (`omega(k)` / `sigma(k)` in `[mixture]`; [\#1765](https://github.com/FeRx-NLME/ferx-core/issues/1765)), on the natural scale: one class **variance** per Ω override, then one class σ per Σ override, each in declaration order:
+
+``` json
+"mixture_overrides": [0.09724885350038842]
+```
+
+The base `omega` / `sigma` rebuild every class entry that is not overridden, so this is the only part of a mixture fit’s parameters no other key records. With it, `run_sir`, `run_covariance` and `simulate_with_uncertainty` on a reloaded fit rebuild the class matrices the fit had, without `packed_estimate` — which is how an SAEM mixture fit (no packed vector) reloads and repeats its in-fit SIR and covariance step bit for bit. It is read ahead of `packed_estimate`, and refused when it does not hold one non-negative finite value per declared override (zero is legal: `sigma(2) EPS ~ 0 FIX`). SAEM does not estimate Σ overrides — it holds them at their initial values and treats them as fixed — so on a fit whose method chain ran SAEM the rebuilt Σ overrides are fixed too, and the standalone steps leave them out of the covariance and SIR exactly as the in-fit ones did.
+
+It is written by every estimator that fits a `[mixture]` model with at least one override, and absent for a model without overrides, which loads it as `None`.
+
+### `vi`
+
+The variational-inference result of a `method = vi` fit ([\#2058](https://github.com/FeRx-NLME/ferx-core/issues/2058)), in the layout of the `vi:` section of the fit YAML:
+
+``` json
+"vi": {
+  "neg_two_elbo": -12.5, "data_term": 3.25, "kl_term": 0.125,
+  "family": "full_rank", "n_iterations": 300, "n_mc_samples": 4,
+  "kl": "analytic", "n_kl_fallback_subjects": 0, "converged": true,
+  "n_fd_subjects": 0, "elbo_tightness_ratio": 1.02,
+  "elbo_trace": [/* per-iteration -2·ELBO */],
+  "eta_names": ["ETA_CL", "ETA_V"],
+  "eta_posterior": [
+    { "id": "1", "mean": [0.1, -0.2], "cov": [[0.05, 0.01], [0.01, 0.04]] }
+  ]
+}
+```
+
+`superseded_by` is written only when a later stage re-estimated the parameters, `objective_trace` only when covariate-NN regularization made it differ from `elbo_trace`, and an `eta_posterior` entry’s `kappa_means` (one row per occasion) only for a model with IOV. Entries are in `ebes.csv` row order, and each `id` must name the subject on that row; a bundle where they disagree is refused as corrupt. The block is absent for every other method, which loads `vi` as `None`.
+
+A VI fit under the default `vi_final_ofv = none` has no likelihood, so its `ofv` (and, for a fit with priors, `ofv_data`) are `NaN`, written as `null` like any other non-finite float. Its `aic` and `bic` are absent (`None`), and so are a SAEM fit’s under the default `saem_ofv = saem` (#2973); both are written as `null`. A bundle written before they became optional stores plain numbers, and reads unchanged.
+
+## `ebes.csv`
+
+    ID,ETA_CL,ETA_V,ETA_KA,ofv_contribution,n_obs
+    1,0.027974420148319645,0.06614967166052502,0.4822913599410782,-27.117019931625446,11
+    2,0.015436836841694453,-0.06290220762098092,-0.2994881644065366,-33.181514844609865,11
+
+- `ID` — subject identifier as a string (matches `Population.subjects[i].id`).
+- ETA columns — named after `omega.names` from `fit.json`.
+- `ofv_contribution` — the subject’s contribution to the total OFV. For `foce`, `focei`, `laplace` and AGQ fits they sum to it; for other objectives (`bayes`, mixtures, SAEM and IMP readouts) it is the post-hoc FOCE/FOCEI score, which need not.
+- `n_obs_discrete` — the subject’s `predictions_discrete.csv` rows, after `n_obs`. Present exactly when that entry is.
+- `n_obs_tte` — the subject’s `predictions_tte.csv` rows, after `n_obs_discrete` (or after `n_obs` when there is none). Present exactly when that entry is.
+
+Subject rows appear in fit order. A mixture fit appends `MIXEST` and `PMIX_1..K`.
+
+## `ebes_kappa.csv`
+
+Present only when the model uses IOV (block kappa).
+
+    ID,OCC,kappa_CL,kappa_V
+    1,1,0.012,-0.004
+    1,2,0.020,0.008
+
+`OCC` is 1-based occasion index per subject.
+
+## `conddist.csv`
+
+Present only when the fit ran the SAEM conditional-distribution pass (`[fit_options] conddist = true`, SAEM-only, \#257) — the shrinkage-unbiased `p(η_i | y_i; θ̂)` estimate, the analogue of Monolix’s Conditional Distribution task / saemix’s `conddist.saemix`.
+
+    ID,ETA,COND_MEAN,COND_SD,COND_MODE
+    1,eta_CL,0.11,0.05,0.098
+    1,eta_V,-0.19,0.06,-0.175
+
+- `COND_MEAN` / `COND_SD` — mean and SD of the retained MCMC draws for that subject/eta.
+- `COND_MODE` — the EBE (same value as `ebes.csv`), included for direct comparison against the conditional mean. The loader checks that it reads back as the same value as the `ebes.csv` cell, whatever its spelling.
+- One row per (subject, eta), subject rows contiguous in fit order.
+
+The retained draws themselves (`saem_conddist_keep_samples = true`) and per-eta shrinkage are **not** bundled — draws live only in the sidecar `{model}-conddist-samples.csv` written alongside the `.fitrx`, and shrinkage is recomputed on load from `COND_MEAN` and `omega` (same formula the SAEM pass itself uses) rather than stored redundantly.
+
+## `predictions.csv`
+
+    ID,TIME,DV,PRED,IPRED,CWRES,IWRES[,NPDE,NPD,EPRED,PWRES],EBE_OFV,N_OBS[,CENS[,OCC]]
+    1,0.5,5.3653,3.9165677732979756,5.354088670487155,0.8369821497673978,0.19482332597649954,-27.117019931625446,11
+
+- `ID` — subject string identifier.
+- One row per observation (MDV=0). Subject rows are contiguous and in the same observation order as the underlying data.
+- `N_OBS` is required on every row and must equal the subject’s `n_obs` in `ebes.csv`: two subjects may share an ID, so it is what catches blocks written out of order.
+- `CENS` and `OCC` columns are present only when at least one subject in the population has censoring or occasions, respectively.
+- `NPDE`, `NPD`, `EPRED` and `PWRES` are present only when the fit ran with `npde_nsim > 0`. A file written before `EPRED`/`PWRES` existed loads with them empty. (`EWRES` is written to the sdtab only, as a second name for `PWRES`.)
+- NaN values (e.g. CWRES/IWRES for censored observations) are written as empty fields, not as `"NaN"`.
+
+## `predictions_discrete.csv`
+
+Present only when the fit has binary-endpoint records. These are the rows `SubjectResult::discrete_rows` holds, which a sdtab appends after its Gaussian rows.
+
+    ID,CMT,TIME,DV,PRED,IPRED,IWRES
+    1,3,24.0,1.0,0.41,0.52,0.96
+
+- One block per subject, in `ebes.csv` order, sized by that subject’s `n_obs_discrete`. The row `ID` is a check: two subjects may share an ID, so it cannot place a row.
+- `PRED` and `IPRED` are `P(Y = 1)` at η = 0 and at the EBE. `IWRES` is the Pearson residual, empty at a degenerate `p`.
+
+Every build reads and re-saves this entry, including one without the `survival` feature, which cannot compute these rows.
+
+## `predictions_tte.csv`
+
+Present only when the fit has time-to-event records ([\#911](https://github.com/FeRx-NLME/ferx-core/issues/911)). These are the rows `SubjectResult::tte_rows` holds, which a sdtab appends after its discrete rows, so the sdtab of a reloaded fit equals the live one.
+
+    ID,CMT,TIME,DV,COXSNELL,MARTINGALE,DEVIANCE,PIT
+    1,2,96.0,1.0,0.43,0.57,0.74,0.65
+
+- One block per subject, in `ebes.csv` order, sized by that subject’s `n_obs_tte`. The row `ID` is a check, as in `predictions_discrete.csv`.
+- `DV` is the event indicator, empty for an interval-censored record. The four residual columns are the sdtab’s, named from the same list. As in every bundle CSV, `NaN` is an empty cell and `±∞` is `inf` / `-inf`, so an event scored with `ΔH = 0` has `DEVIANCE` `inf` here where the sdtab leaves the cell empty.
+
+When some record carries a simulation-based npde ([\#1889](https://github.com/FeRx-NLME/ferx-core/issues/1889), a fit with `npde_nsim > 0`), the entry has a ninth column, `NPDE`, empty for a record with no score:
+
+    ID,CMT,TIME,DV,COXSNELL,MARTINGALE,DEVIANCE,PIT,NPDE
+    1,2,96.0,1.0,0.43,0.57,0.74,0.65,-0.31
+
+A fit with no such score writes the eight columns above, byte for byte what it wrote before the column existed. A reader accepts exactly these two headers and reports any other as corrupt. A build from before \#1889 accepts the eight-column header only, so it cannot load a bundle that carries a score.
+
+The entry needs the `survival` feature. A build without it loads the bundle and ignores the entry and the column, and so does a ferx older than \#911 (a ferx-r whose lock is behind). A bundle either one saves again has neither: a later load in a current `survival` build then has no TTE rows, and its sdtab is refused.
+
+A bundle written before \#911 has no entry. It still loads, with no TTE rows, and sdtab of its fit is refused when the model declares a time-to-event endpoint. Loading it and saving it again does not help, because the rows were never in it: refit, or save the live fit again.
+
+## `covtab.csv`
+
+Present only when the model declares a `[covariates]` block. One row per input record, dose rows included, as in the `{model}-covtab.csv` a run writes, but with exact doubles.
+
+    ID,TIME,EVID,WT,AGE,SEX
+    1,0.0,1,70.5,,1.0
+
+The columns after `EVID` are the covariates in declaration order. A missing value is an empty cell. `fit.json:covariate_types` gives each one’s kind. On load the entry becomes `FitResult::covariate_table`.
+
+## `trace.csv`
+
+Present only when the fit ran with `optimizer_trace = true`. It is the trace file’s text as the fit left it, header-only for a run with no iterations, and loads as `FitResult::trace_csv`. `fit.json:trace_path` still names the file the fit wrote, which was temporary and need not exist any more.
+
+## `interface_extras.json`
+
+Data only an interface understands, such as the R package’s call settings, and objects a user added alongside a fit. Set it on `FitResult::interface_extras` as JSON text.
+
+Core stores and returns the text byte for byte and never reads it: key order, number spelling and whitespace survive, and `load_fit` does not look inside. `save_fit` refuses text that is not well-formed JSON, because the entry’s name promises JSON to every other reader. It is a separate entry so that `fit.json` stays the engine’s own.
+
+## `warnings.txt`
+
+Plain text, one warning per line. Same content as `fit.json:warnings` — duplicated for grep-friendliness.
+
+## `data.csv`
+
+A verbatim copy of the input NONMEM CSV. Only present when the writer was asked to embed data (`--include-data` on the CLI, or `SaveFitOptions::include_data = Some(path)` via the Rust API). The bytes must match the fit’s `data_hash`: a file edited since the fit is refused.
+
+`load_fit` re-reads it into `LoadedFit::population`. On a bundle that records `reader_settings` and a `population_fingerprint`, it reads with those settings (row filters included), writes the level index columns from `data_bindings`, and checks the result against the fingerprint. On a mismatch the bundle still loads its estimates, with `population = None` and a warning naming the first subject that differs, since a later change to how ferx reads a CSV should not make a saved bundle unloadable. On a bundle with no fingerprint it reads with the model’s `[data]` renames only, unverified.
+
+## Versioning
+
+The `format_version` string in `manifest.json` is the source of truth. A loader must:
+
+1.  Reject any value it does not recognise.
+2.  Tolerate unknown JSON keys within `fit.json` (forward-compatible additions within the same version).
+
+When the on-disk format changes in a way that breaks readers, `format_version` is incremented.
+
+There is no migration between versions. `load_fit` refuses any other `format_version` with `FitrxError::UnsupportedVersion`, before it reads anything else, so a bundle written by an older ferx has to be refitted. That includes one named by `[priors] from_fit`.
+
+Version `2` ([\#2695](https://github.com/FeRx-NLME/ferx-core/issues/2695)) added `predictions_discrete.csv`, `covtab.csv`, `trace.csv` and `interface_extras.json`, and the `fit.json` keys `stalled_at_init`, `estimate_near_boundary`, `max_abs_correlation`, `cov_fixed`, `covariate_types`, `bayes`, `importance_sampling`, `impmap_trace` and `exclusions`. `ofv_data` and `ofv_prior` are now written for every fit, and the keys that used to default for an older file are required. Version `1` kept the first three verdicts and `cov_fixed` under `r_extras` in bundles ferx-r wrote; a reader of those keys has to move to the top-level ones.
+
+Version `2` later gained `predictions_tte.csv` and the `ebes.csv` column `n_obs_tte` ([\#911](https://github.com/FeRx-NLME/ferx-core/issues/911)) without a version change: a reader that predates them ignores both, since entries are read by name and `ebes.csv` columns past the ETAs by header.
