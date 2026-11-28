@@ -17,6 +17,17 @@ categories = ["command-line-utilities", "science", "simulation"]
 name = "ferx"
 path = "src/main.rs"
 
+[features]
+# The eight model-search subcommands (`covsearch`, `allometry`, `modelsearch`,
+# `ruvsearch`, `iivsearch`, `iovsearch`, `amd`, `globalsearch`). Off, the binary
+# still knows their names and says it was built without search (#3187).
+#
+# Every CI and preflight command that covers this crate passes
+# `--no-default-features`, which turns this off too, so each of them names
+# `ferx-cli/search` explicitly; `tests/preflight_owns_the_fast_gates.rs` pins that.
+default = ["search"]
+search = ["dep:ferx-search"]
+
 [dependencies]
 # `default-features = false` is load-bearing, not tidiness: without it a
 # member-scoped or `--workspace` command resolves `ferx-core` to
@@ -27,8 +38,9 @@ path = "src/main.rs"
 # `default = []`; `survival` is slated to become default-on).
 ferx-core = { path = "../..", version = "0.4.0", default-features = false }
 ferx-tools = { path = "../ferx-tools", version = "0.4.0" }
-# Unconditional for now; an optional, default-on `search` feature is #3187.
-ferx-search = { path = "../ferx-search", version = "0.4.0" }
+# Optional behind the default-on `search` feature (#3187). LGPL-3.0-or-later
+# (#3183): a build with it links LGPL code, which `ferx --licenses` covers.
+ferx-search = { path = "../ferx-search", version = "0.4.0", optional = true }
 indicatif = "0.18.4"
 # The binary's global allocator (`src/main.rs`): an estimation allocates many small,
 # short-lived buffers per subject per evaluation. A binary-level choice; the `ferx-core`

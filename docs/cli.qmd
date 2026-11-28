@@ -538,8 +538,9 @@ That last split decides which error you get when the argument resolves to
 nothing:
 
 ```bash
-$ ferx covsearch run1.ferxsearch      # on a build without covsearch
-Error: tool `covsearch` not recognized.
+$ ferx covsearh run1.ferxsearch       # a tool this build does not have
+Error: tool `covsearh` not recognized.
+Did you mean `covsearch`?
 Available tools: check, summary, bootstrap, gam, ...
 To fit a model, give its file path: ferx run1.ferx --data data.csv
 
@@ -549,6 +550,15 @@ Error: the model `run1.ferx` was not found at this location. Please check folder
 
 A tool name within two edits of a real one also gets a `Did you mean ...?`
 line. Both cases exit `1`.
+
+A binary built without model search (see [Building](#building)) still knows
+the eight search tool names, and says what is missing instead (exit `1`):
+
+```bash
+$ ferx covsearch run1.ferxsearch
+Error: `covsearch` is a model-search tool, and this ferx was built without the `search` feature.
+Rebuild ferx-cli with its default features (or `--features search`) to use it.
+```
 
 A path the filesystem cannot answer for — an unreadable parent directory, a
 symlink loop — is not reported as missing: it goes to the fit path, which
@@ -579,4 +589,10 @@ cargo build --release -p ferx-cli
 
 # Run directly via cargo
 cargo run --release -p ferx-cli -- model.ferx --data data.csv
+
+# Without the model-search tools (covsearch, allometry, modelsearch, ruvsearch,
+# iivsearch, iovsearch, amd, globalsearch) and their ferx-search dependency
+cargo build --release -p ferx-cli --no-default-features
 ```
+
+Model search is the `search` feature of `ferx-cli`, on by default.

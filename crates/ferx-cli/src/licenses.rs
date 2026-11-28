@@ -15,7 +15,9 @@ ferx {version}: licenses and notices
 This program is built from four crates of https://github.com/FeRx-NLME/ferx-core:
 
   ferx-core, ferx-tools, ferx-cli   MIT License (text below)
-  ferx-search                       GNU LGPL, version 3 or later (texts below)
+  ferx-search                       GNU LGPL, version 3 or later (texts below);
+                                    linked unless built without the default
+                                    `search` feature
 
 ferx-search notice:
   Copyright (c) 2026 the FeRx core developer team (the ferx contributors).

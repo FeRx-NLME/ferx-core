@@ -60,7 +60,7 @@ export RUSTUP_TOOLCHAIN="${RUSTUP_TOOLCHAIN:-nightly}"
 # current user's numeric group IDs, and it wins. The first draft used it and
 # every group name silently became a GID — `unknown group 'check' — expected one
 # of: 20 12 61 ...`.
-ALL_GROUPS=(changelog licenses fmt check clippy rustdoc docs patterns public-api debug-assertions release-semantics)
+ALL_GROUPS=(changelog licenses fmt check clippy rustdoc docs patterns public-api debug-assertions release-semantics no-search)
 
 # Groups that are NOT in the default selection.
 #
@@ -87,9 +87,13 @@ ALL_GROUPS=(changelog licenses fmt check clippy rustdoc docs patterns public-api
 # any more. Both directions are pinned in
 # `tests/preflight_owns_the_fast_gates.rs`.
 #
+# `no-search` (#3187) is the third, and not part of the pair: it RUNS the `ferx-cli`
+# tests on the build without model search, and asserts that build's dependency graph.
+# Its compile and lint halves sit in `check` and `clippy`, which are default.
+#
 # `--help` and `--list` still enumerate them, and that test pins this array, so an
 # opt-in group cannot quietly become a group that nothing ever runs.
-OPT_IN_GROUPS=(debug-assertions release-semantics)
+OPT_IN_GROUPS=(debug-assertions release-semantics no-search)
 
 is_opt_in() {
   local candidate="$1" g
@@ -141,9 +145,13 @@ one thing under a live guard and another without it. CI runs this one as
 NOT covered by the DEFAULT set: the test jobs. \`cargo check --tests\` COMPILES
 the test targets but runs nothing, so \`Tests + coverage (core)\` can still go red
 after a green preflight. The default set gates compilation and lint, not
-behaviour. Four exceptions: \`docs\` and \`patterns\`, whose gates ARE their test
+behaviour. Exceptions: \`docs\` and \`patterns\`, whose gates ARE their test
 runs (a walk over \`docs/\`, and a parse of the test code against
-\`tools/lint-rules/\` — not a fit), and the two opt-in suites above.
+\`tools/lint-rules/\` — not a fit), and the opt-in suites above.
+
+\`no-search\` RUNS the \`ferx-cli\` tests on the binary built without its
+\`search\` feature (#3187), and asserts that build does not depend on
+\`ferx-search\`. CI runs it as \`No-search build\`.
 
 \`changelog\` compiles nothing: it validates the \`changelog.d/\` fragments
 (#1545). Whether a PR needs one is \`tools/changelog.sh require\`, run in CI by
@@ -322,7 +330,16 @@ group_check() {
   # contains this feature". Qualified this way it resolves to the SAME feature set
   # as the lines above, so the members link the rlib already built instead of
   # forcing a second `ferx-core` compile under a different feature hash.
-  run cargo check -p ferx-tools -p ferx-search -p ferx-cli --tests --no-default-features --features ferx-core/ci
+  #
+  # `ferx-cli/search` by name: `--no-default-features` reaches every selected package,
+  # so without it the eight search subcommands and their tests drop out of this line
+  # with the line still green (#3187).
+  run cargo check -p ferx-tools -p ferx-search -p ferx-cli --tests --no-default-features --features ferx-core/ci,ferx-cli/search
+
+  # The other side of that feature: the binary built WITHOUT model search (#3187), so a
+  # search-only import or helper left ungated in `ferx-cli` fails here, not in the first
+  # downstream build that turns `search` off. Same `ferx-core/ci` hash as above.
+  run cargo check -p ferx-cli --tests --no-default-features --features ferx-core/ci
 }
 
 group_clippy() {
@@ -427,8 +444,14 @@ group_clippy() {
   # from cargo's docs. Verified by injecting an unused import into each crate on its
   # own: ferx-tools alone and ferx-cli alone each give `error: unused import` and
   # exit 101 from this exact command.
+  # `ferx-cli/search` for the reason given in `group_check` (#3187).
   run cargo clippy -p ferx-tools -p ferx-search -p ferx-cli --tests --no-default-features \
-    --features ferx-core/ci,ferx-core/markov,ferx-core/nn -- -Dunused
+    --features ferx-core/ci,ferx-core/markov,ferx-core/nn,ferx-cli/search -- -Dunused
+
+  # The no-search binary (#3187). `-Dunused` is the point: an item read only by a search
+  # subcommand is dead here, and `-Dunused` is per feature set, so the line above cannot
+  # see it. `ferx-core/ci` alone shares the `--lib` line's ferx-core build.
+  run cargo clippy -p ferx-cli --tests --no-default-features --features ferx-core/ci -- -Dunused
 }
 
 group_docs() {
@@ -504,7 +527,7 @@ group_rustdoc() {
   # a workspace-root `cargo doc` documents only the root package, so
   # `ferx-tools`, `ferx-search` and `ferx-cli` would be gated by nothing.
   run env RUSTDOCFLAGS=-Dwarnings cargo doc -p ferx-tools -p ferx-search -p ferx-cli --no-deps \
-    --no-default-features --features ferx-core/ci,ferx-core/markov,ferx-core/nn
+    --no-default-features --features ferx-core/ci,ferx-core/markov,ferx-core/nn,ferx-cli/search
 }
 
 group_public_api() {
@@ -612,6 +635,23 @@ group_release_semantics() {
   # second copy of the coverage jobs with every test still green.
   run env FERX_REQUIRE_NO_DEBUG_ASSERTIONS=1 cargo test --lib --profile ci-fast \
     --no-default-features --features ci,markov,nn
+}
+
+group_no_search() {
+  CI_JOB="No-search build"
+  # `ferx-cli` with its default-on `search` feature OFF (#3187). The compile and lint
+  # halves are in `check` and `clippy`; this group holds what they cannot show.
+  #
+  # The graph first: an unconditional `ferx-search` edge (or a member feature that turns
+  # it back on) builds and passes every test below while the binary still carries the
+  # whole search layer.
+  run tools/no-search-tree.sh
+
+  # The CLI tests on that build: the search names still dispatch, to the
+  # built-without-search error, and every other tool behaves as in the default build.
+  # The dev profile: the fits these tests run are small (the whole run is ~2 s locally),
+  # so an optimised build would cost more compile than it saves.
+  run cargo test -p ferx-cli --no-default-features --features ferx-core/ci
 }
 
 # ── Drive ───────────────────────────────────────────────────────────────────
