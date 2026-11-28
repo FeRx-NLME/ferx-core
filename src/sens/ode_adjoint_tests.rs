@@ -402,6 +402,62 @@ fn adjoint_matches_reconverged_finite_differences_of_the_objective() {
     assert!(worst < 5e-6, "worst relative difference {worst:.2e}");
 }
 
+/// #3151, #3173: `(central/V)^GAMMA` with an estimated `GAMMA` reads `0^(GAMMA−1) = ∞` (below 1)
+/// and `ln 0` from the state that is 0 at the dose time; the reverse pass multiplied them by an
+/// exactly-zero sensitivity (`0·∞ = NaN`) and the subject left the adjoint's scope, at the
+/// gradient (`GAMMA < 1`) and at the covariance Hessian (any `GAMMA`). `fd_oracle` and
+/// `hessian_gaps` panic on a declined subject, so reaching the comparison is the scope check.
+#[test]
+fn a_live_exponent_at_a_zero_base_stays_in_adjoint_scope() {
+    let hill = r"
+[parameters]
+  theta TVCL(4.0, 0.1, 100.0)
+  theta TVV(30.0, 1.0, 500.0)
+  theta TVKA(1.2, 0.05, 20.0)
+  theta TVGAMMA(START, 0.1, 5.0)
+  omega ETA_CL ~ 0.09
+  omega ETA_V ~ 0.06
+  sigma ADD_ERR ~ 0.1 (sd)
+[individual_parameters]
+  CL = TVCL * exp(ETA_CL)
+  V = TVV * exp(ETA_V)
+  KA = TVKA
+  GAMMA = TVGAMMA
+[structural_model]
+  ode(states=[depot, central, effect])
+[odes]
+  d/dt(depot) = -KA * depot
+  d/dt(central) = KA * depot - (CL/V) * central
+  d/dt(effect) = 0.3 * ((central/V)^GAMMA / (2^GAMMA + (central/V)^GAMMA) - effect)
+[scaling]
+  y = 1 + 5 * effect
+[error_model]
+  DV ~ additive(ADD_ERR)
+";
+    // `TVGAMMA` starts at 0.8 (the oracle's point, `moved_params`, is 0.73: the slope is infinite
+    // at a zero base, #3151) and at 1.6 (1.46: the path that was never broken). Measured on
+    // Linux x86_64: gradient vs `fd_oracle` 1.2e-8 and 8.0e-9, covariance Hessian vs
+    // `hessian_gaps` 3.3e-10 and 1.1e-10 (macOS arm64 agrees to the printed digits, TeunP's
+    // review of #3170); the bounds are 40x and 30x over those. The Hessian is the second-order
+    // pass through the `tangent` arm and the exponent's `ln 0` (#3173): per PR only at 0.8.
+    let model_at = |start: &str| {
+        with_tol(parse_model_string(&hill.replace("START", start)).unwrap(), 1e-12, 1e-14)
+    };
+    let subject_of = |model: &CompiledModel| {
+        subject(model, vec![DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0)], &TIMES, &[0.1, -0.05])
+    };
+    for start in ["0.8", "1.6"] {
+        let model = model_at(start);
+        let worst = fd_oracle(&model, &subject_of(&model), true);
+        assert!(worst < 5e-7, "GAMMA {start}: worst relative difference {worst:.2e}");
+    }
+    for start in oracle_cells(vec!["0.8", "1.6"], &[0]) {
+        let model = model_at(start);
+        let (gap, _) = hessian_gaps(&model, &subject_of(&model), true);
+        assert!(gap < 1e-8, "GAMMA {start}: covariance Hessian vs FD {gap:.2e}");
+    }
+}
+
 /// The cells of a reconverged-FD case table that run: all of them under `slow-tests`, and per
 /// PR only `per_pr` (indices into `cases`). Every cell is a full oracle (four EBE re-solves per
 /// packed coordinate), so a nine-cell table cost minutes of the per-PR coverage shard; the
