@@ -144,6 +144,7 @@ impl core::default::Default for ferx_core::AdaptiveSummaryOptions
 pub fn ferx_core::AdaptiveSummaryOptions::default() -> Self
 #[non_exhaustive] pub struct ferx_core::api::AdaptiveSummaryRow
 pub ferx_core::api::AdaptiveSummaryRow::draw: usize
+pub ferx_core::api::AdaptiveSummaryRow::mc_se: core::option::Option<f64>
 pub ferx_core::api::AdaptiveSummaryRow::metric: ferx_core::AdaptiveSummaryMetric
 pub ferx_core::api::AdaptiveSummaryRow::n_missing: usize
 pub ferx_core::api::AdaptiveSummaryRow::n_runs: usize
@@ -4978,6 +4979,7 @@ impl core::default::Default for ferx_core::AdaptiveSummaryOptions
 pub fn ferx_core::AdaptiveSummaryOptions::default() -> Self
 #[non_exhaustive] pub struct ferx_core::AdaptiveSummaryRow
 pub ferx_core::AdaptiveSummaryRow::draw: usize
+pub ferx_core::AdaptiveSummaryRow::mc_se: core::option::Option<f64>
 pub ferx_core::AdaptiveSummaryRow::metric: ferx_core::AdaptiveSummaryMetric
 pub ferx_core::AdaptiveSummaryRow::n_missing: usize
 pub ferx_core::AdaptiveSummaryRow::n_runs: usize

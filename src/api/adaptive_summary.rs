@@ -21,6 +21,7 @@
 //! `⌈1 / min(p, 1 − p)⌉ − 1` values (19 for 5 % / 95 %, 1 for the median); below that
 //! it is `None` rather than an interpolation between the two most extreme values.
 
+use super::adaptive_decomposition::jackknife;
 use super::AdaptiveSimulationResult;
 use crate::diagnostics::EngineError;
 use crate::sim::adaptive::AdaptiveSubjectMetrics;
@@ -227,6 +228,14 @@ pub struct AdaptiveSummaryRow {
     pub n_runs: usize,
     /// Runs in the draw that carry no value for the metric (skipped, never imputed).
     pub n_missing: usize,
+    /// The Monte Carlo standard error of `value` (#3215): the delete-one jackknife over the
+    /// draw's sims that carry the metric, a sim being the independent replicate (each
+    /// subject's η and mixture class are drawn once per sim and shared by its `n_reps`
+    /// replicates, so runs within one sim are correlated). With `S` such sims, read it with
+    /// a t on `S − 1` degrees of freedom. `None` for `Median` (the delete-one jackknife is
+    /// inconsistent for a quantile) and with fewer than two such sims (so also when `value`
+    /// is `None`); otherwise `NaN` when `value` is.
+    pub mc_se: Option<f64>,
 }
 
 /// Whether a band could be formed.
@@ -324,8 +333,7 @@ pub fn summarize_adaptive(
     result: &AdaptiveSimulationResult, opts: &AdaptiveSummaryOptions,
 ) -> Result<AdaptivePopulationSummary, EngineError> {
     check_summary_options(opts, "summarize_adaptive")?;
-    let values = run_values(result).map(|(run, metric, v)| (run.draw, metric, v));
-    Ok(summarize_values(&runs_per_draw(result), values, opts))
+    Ok(summarize_values(&runs_per_draw(result), run_values(result), opts))
 }
 
 /// Refuse summary options a summary cannot use, naming the entry `who`.
@@ -357,19 +365,19 @@ pub(super) fn runs_per_draw(result: &AdaptiveSimulationResult) -> BTreeMap<usize
 }
 
 /// The summary kernel: per-draw statistics, bands and prediction intervals of `values`
-/// (`(draw, metric, value)`, at most one per run and metric) over `runs` runs per draw.
+/// (`(run, metric, value)`, at most one per run and metric) over `runs` runs per draw.
 /// [`summarize_adaptive`] feeds it one arm's values; the contrast feeds it the paired
 /// differences of two arms.
-pub(super) fn summarize_values(
+pub(super) fn summarize_values<'a>(
     runs: &BTreeMap<usize, usize>,
-    values: impl Iterator<Item = (usize, AdaptiveSummaryMetric, f64)>,
+    values: impl Iterator<Item = (RunKey<'a>, AdaptiveSummaryMetric, f64)>,
     opts: &AdaptiveSummaryOptions,
 ) -> AdaptivePopulationSummary {
-    // The values present per (metric, draw).
-    let mut by_metric: BTreeMap<AdaptiveSummaryMetric, BTreeMap<usize, Vec<f64>>> =
+    // The values present per (metric, draw), each with its run's sim.
+    let mut by_metric: BTreeMap<AdaptiveSummaryMetric, BTreeMap<usize, Vec<(usize, f64)>>> =
         AdaptiveSummaryMetric::SCALARS.iter().map(|m| (m.clone(), BTreeMap::new())).collect();
-    for (draw, metric, v) in values {
-        by_metric.entry(metric).or_default().entry(draw).or_default().push(v);
+    for (run, metric, v) in values {
+        by_metric.entry(metric).or_default().entry(run.draw).or_default().push((run.sim, v));
     }
     let mut values = by_metric;
 
@@ -408,8 +416,9 @@ pub(super) fn summarize_values(
         for &statistic in &stats {
             let mut across: Vec<f64> = Vec::with_capacity(n_draws);
             for (&draw, &n_runs) in runs {
-                let vals = by_draw.get(&draw).map_or(&[][..], Vec::as_slice);
-                let value = draw_statistic(vals, statistic);
+                let cell = by_draw.get(&draw).map_or(&[][..], Vec::as_slice);
+                let vals: Vec<f64> = cell.iter().map(|&(_, v)| v).collect();
+                let value = draw_statistic(&vals, statistic);
                 across.extend(value);
                 out.rows.push(AdaptiveSummaryRow {
                     draw,
@@ -418,6 +427,7 @@ pub(super) fn summarize_values(
                     value,
                     n_runs,
                     n_missing: missing(n_runs, vals.len()),
+                    mc_se: mc_se(cell, statistic),
                 });
             }
             let n_draws_present = across.len();
@@ -433,7 +443,7 @@ pub(super) fn summarize_values(
                 },
             });
         }
-        let mut pooled: Vec<f64> = by_draw.values().flatten().copied().collect();
+        let mut pooled: Vec<f64> = by_draw.values().flatten().map(|&(_, v)| v).collect();
         let n_present = pooled.len();
         out.prediction_intervals.push(AdaptivePredictionInterval {
             metric: metric.clone(),
@@ -487,6 +497,44 @@ fn missing(n_runs: usize, present: usize) -> usize {
     n_runs.checked_sub(present).expect("more values than runs: one analyte recorded twice")
 }
 
+/// The delete-one jackknife standard error of a `Mean` or `FractionAtLeast` over the sims
+/// of `cell` (`(sim, value)`, one draw's values), each sim one unit: a smooth statistic is
+/// a ratio `T / N` of per-sim sums, so a replicate leaving sim `u` out is
+/// `(T − t_u) / (N − n_u)`, with the statistic's own per-run [`score`]. Only sims carrying
+/// a value are units. `None` for `Median` and below two units; otherwise `NaN` if any value
+/// is not finite, like the statistic itself (`≥` alone would score a `NaN` as 0).
+fn mc_se(cell: &[(usize, f64)], statistic: AdaptiveSummaryStatistic) -> Option<f64> {
+    let mut per_sim: BTreeMap<usize, (f64, f64)> = BTreeMap::new();
+    for &(sim, v) in cell {
+        let unit = per_sim.entry(sim).or_default();
+        unit.0 += score(v, statistic)?;
+        unit.1 += 1.0;
+    }
+    let units: Vec<(f64, f64)> = per_sim.into_values().collect();
+    if units.len() < 2 {
+        return None;
+    }
+    if cell.iter().any(|(_, v)| !v.is_finite()) {
+        return Some(f64::NAN);
+    }
+    let (t, n) = units.iter().fold((0.0, 0.0), |(t, n), u| (t + u.0, n + u.1));
+    let ratio = |drop: Option<usize>| {
+        vec![Some(drop.map_or(t / n, |u| (t - units[u].0) / (n - units[u].1)))]
+    };
+    jackknife(units.len(), ratio)[0]
+}
+
+/// One run's score under a smooth statistic, whose value is the mean score: the value
+/// itself for `Mean`, the indicator `v ≥ a` for `FractionAtLeast(a)`. `None` for `Median`,
+/// which is not a mean. The one definition behind [`draw_statistic`] and [`mc_se`].
+fn score(v: f64, statistic: AdaptiveSummaryStatistic) -> Option<f64> {
+    match statistic {
+        AdaptiveSummaryStatistic::Mean => Some(v),
+        AdaptiveSummaryStatistic::FractionAtLeast(a) => Some(if v >= a { 1.0 } else { 0.0 }),
+        AdaptiveSummaryStatistic::Median => None,
+    }
+}
+
 /// One statistic over the values one draw's runs carry; `None` if there are none. A
 /// non-finite value makes it `NaN` rather than being dropped (`≥` and `max` would discard
 /// a `NaN`; the sum and the quantile do not).
@@ -499,14 +547,11 @@ fn draw_statistic(vals: &[f64], statistic: AdaptiveSummaryStatistic) -> Option<f
     }
     let n = vals.len() as f64;
     Some(match statistic {
-        AdaptiveSummaryStatistic::Mean => vals.iter().sum::<f64>() / n,
         AdaptiveSummaryStatistic::Median => {
             let mut v = vals.to_vec();
             v.sort_by(f64::total_cmp);
             quantile_sorted(&v, 0.5)
         }
-        AdaptiveSummaryStatistic::FractionAtLeast(a) => {
-            vals.iter().filter(|&&v| v >= a).count() as f64 / n
-        }
+        _ => vals.iter().map(|&v| score(v, statistic)).sum::<Option<f64>>()? / n,
     })
 }

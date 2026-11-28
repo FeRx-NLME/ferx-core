@@ -232,7 +232,9 @@ fn layers(units: &[Unit], (d, s, r): (usize, usize, usize), drop: Option<usize>)
 
 /// The delete-one jackknife standard error of each of `full`'s estimates over `n` outer
 /// units; `None` for an estimate some replicate cannot form.
-fn jackknife(n: usize, est: impl Fn(Option<usize>) -> Vec<Option<f64>>) -> Vec<Option<f64>> {
+pub(super) fn jackknife(
+    n: usize, est: impl Fn(Option<usize>) -> Vec<Option<f64>>,
+) -> Vec<Option<f64>> {
     let reps: Vec<Vec<Option<f64>>> = (0..n).map(|u| est(Some(u))).collect();
     let k = est(None).len();
     (0..k)

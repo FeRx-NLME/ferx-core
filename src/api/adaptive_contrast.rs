@@ -108,9 +108,10 @@ pub fn decompose_contrast(
 
 /// The population summary ([`super::summarize_adaptive`]) of both arms and of the
 /// controller's effect (#946): `difference` is the summary of the per-run paired
-/// differences adaptive − reference, so its `Mean` row is the mean effect per draw, its
-/// band the parameter uncertainty of that effect, and its prediction interval the spread
-/// of one patient's effect. A run whose metric is missing in either arm is missing in the
+/// differences adaptive − reference, so its `Mean` row is the mean effect per draw (with
+/// a paired Monte Carlo SE, `mc_se`: its jackknife leaves one sim out of both arms at
+/// once), its band the parameter uncertainty of that effect, and its prediction interval
+/// the spread of one patient's effect. A run whose metric is missing in either arm is missing in the
 /// difference.
 ///
 /// A threshold in `opts` applies to each summary's own values. On `difference` its
@@ -133,7 +134,7 @@ pub fn summarize_contrast(
         run_values(reference).map(|(run, metric, v)| ((run, metric), v)).collect();
     let paired = run_values(adaptive).filter_map(|(run, metric, v)| {
         let w = *reference_values.get(&(run, metric.clone()))?;
-        Some((run.draw, metric, v - w))
+        Some((run, metric, v - w))
     });
     Ok(AdaptiveContrast {
         labels: labels.clone(),
