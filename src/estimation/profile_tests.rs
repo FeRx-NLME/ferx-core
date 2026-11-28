@@ -2250,6 +2250,39 @@ fn profile_solve_from_a_previous_solve_starts_at_its_mode() {
     );
 }
 
+/// #2899: a subject with no observations, whose mode is exactly zero, is multi-started by the
+/// cold start solve and not again by one warm from a previous solve (#2691's `Solved`); before,
+/// its zero read as the cold placeholder at every start solve (on F1 with one such subject,
+/// 47 multi-starts in a fit against 14).
+#[test]
+fn profile_start_solve_takes_a_solved_zero_mode_as_warm() {
+    use crate::estimation::inner_optimizer::record_inner_solves;
+    use crate::estimation::inner_optimizer::test_helpers::on_one_thread;
+    let mut p = prep(F1, F1_DATA, Some(2), |t| t);
+    let empty = p.population.subjects.len() - 1;
+    let s = &mut p.population.subjects[empty];
+    s.id = "EMPTY".into();
+    s.obs_times.clear();
+    s.observations.clear();
+    s.obs_cmts.clear();
+    s.cens.clear();
+    s.occasions.clear();
+    let layout = layout_of(&p);
+    let o = options(&p);
+    let c = ctx(&p, &layout, &o);
+    let runs = |warm: &ProfileWarm, at: &ModelParameters| {
+        let (s, rec) = on_one_thread(|| {
+            record_inner_solves(|| c.solve(at, warm).expect("the solve converges"))
+        });
+        let n = rec.multistarts.iter().filter(|id| *id == "EMPTY").count();
+        (s, n)
+    };
+    let (first, cold) = runs(&ProfileWarm::from_template(&layout, &p.init_params), &p.init_params);
+    let (_, warm) = runs(&ProfileWarm::from_solve(&layout, &first), &first.params);
+    assert!(cold > 0, "the cold start solve multi-starts it");
+    assert_eq!(warm, 0, "a start solve warm from its zero mode does not");
+}
+
 /// The profiled covariance step handed the fit's (η̂, κ̂) — what `fit()` and `run_covariance`
 /// both hand it — starts its re-profiling pass there. Every later re-solve warm-starts from a
 /// mode an earlier solve of the same subject returned, κ̂ included: the re-profiling solves
@@ -6270,7 +6303,7 @@ fn floor_warning(f: &crate::FitResult) -> Option<&String> {
 
 /// T4. F2, two studies, unprofiled, `inner_maxiter = 1` (#2629): the first L-BFGS run puts
 /// TVE0 on the floor, the floor escape restarts it, and the restart stops at 42.788001 with
-/// EMAX = 3.309e-10 — 1.197 ln-units above the floor, so not on it, where raising EMAX to
+/// EMAX = 3.298e-10 — 1.193 ln-units above the floor, so not on it, where raising EMAX to
 /// its probe point 0.008 still drops the OFV by 0.021. The optimum is 22.139638. Before the
 /// fix this was reported `converged: true` with the restart's success warning. The
 /// re-scored reported point is the same 42.788001 at any inner budget, so the budget is not
@@ -6284,8 +6317,8 @@ fn a_restart_left_just_above_the_floor_is_not_reported_converged() {
     assert!(!trapped.converged, "{:?}", trapped.warnings);
     let w = floor_warning(&trapped).expect("a floor-escape warning");
     assert!(
-        w.contains("but stopped with EMAX below 1/1000 of its start (EMAX = 3.309e-10)")
-            && w.contains("(OFV 42.766729 with it at EMAX = 8.000e-3, against 42.788001")
+        w.contains("but stopped with EMAX below 1/1000 of its start (EMAX = 3.298e-10)")
+            && w.contains("(OFV 42.766730 with it at EMAX = 8.000e-3, against 42.788001")
             && w.contains("the fit is not reported as converged")
             && !w.contains("on the floor again")
             && !w.contains("TVE0 just above"),

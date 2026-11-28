@@ -1531,7 +1531,7 @@ fn seed_inits_writes_a_collapsed_variance_verbatim() {
     // does *not* floor: a floor here would make the written model disagree
     // with the `-fit.yaml` beside it, and the search that cannot start a
     // child from a collapsed parent floors the *fit* it seeds from instead
-    // (`ferx_tools::search::seed_from`).
+    // (`ferx_search::search::seed_from`).
     let fit = fit_with(
         &["TVCL"],
         &[0.35],

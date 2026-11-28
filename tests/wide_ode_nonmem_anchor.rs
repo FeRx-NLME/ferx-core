@@ -21,7 +21,7 @@
 //! - **Data** (`wide_ode_myelo_sim.ctl`): DV comes from **NONMEM's own
 //!   `$SIMULATION`**, not from ferx; `wide_ode_myelo_from_sim.py` turns its table into
 //!   `wide_ode_myelo.csv`, which both engines fit.
-//! - **Reference** (`results/wide_ode_myelo.{lst,ext,phi}`): NONMEM 7.5.1 FOCEI
+//! - **Reference** (`results/wide_ode_myelo.{nm.json,ext,phi}`): NONMEM 7.5.1 FOCEI
 //!   (`INTERACTION`, ADVAN13 `TOL=10`) from starts deliberately off the truth.
 //!
 //! ## Result

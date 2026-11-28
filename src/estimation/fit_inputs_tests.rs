@@ -1480,6 +1480,7 @@ fn off_default_scoring() -> ScoringSettings {
         inner_restarts: 4,
         inner_screen: 7,
         inner_twin_seed: false,
+        inner_kick: true, // off-default (default is false)
         mu_referencing: false,
         n_agq: 5,
         inner_optimizer: InnerOptimizer::Lbfgs,
@@ -1519,6 +1520,7 @@ fn scoring_record_fills_each_field_the_caller_left_default() {
         inner_restarts: 5,
         inner_screen: 8,
         inner_twin_seed: false,
+        inner_kick: true, // off-default (non-default caller keeps its value)
         mu_referencing: false,
         n_agq: 6,
         inner_optimizer: InnerOptimizer::NelderMead,
@@ -1539,6 +1541,7 @@ fn scoring_record_fills_each_field_the_caller_left_default() {
         inner_restarts: _,
         inner_screen: _,
         inner_twin_seed: _,
+        inner_kick: _,
         mu_referencing: _,
         n_agq: _,
         inner_optimizer: _,
@@ -1566,6 +1569,7 @@ fn scoring_record_fills_each_field_the_caller_left_default() {
     field!(inner_restarts);
     field!(inner_screen);
     field!(inner_twin_seed);
+    field!(inner_kick);
     field!(mu_referencing);
     field!(n_agq);
     field!(inner_optimizer);
@@ -1604,7 +1608,7 @@ fn gradient_method_record_is_the_union_with_the_caller() {
 }
 
 /// #1860 review r1 #2: `ScoringSettings` is serialised inside `FitResult` itself (the fit JSON
-/// `read_fit_estimates` reads, the ferx-tools search journal), not only through the `.fitrx`
+/// `read_fit_estimates` reads, the ferx-search journal), not only through the `.fitrx`
 /// wire. A `FitResult` written before #1835 has no `gradient_method` in either record and must
 /// still deserialise, reading `Auto` in both. The fixture records `Fd`, so a key that was
 /// silently not written cannot pass as the default. Mutation: drop
@@ -1679,6 +1683,7 @@ fn overwrite_replaces_every_field_where_with_scoring_record_keeps_the_callers() 
         inner_restarts: _,
         inner_screen: _,
         inner_twin_seed: _,
+        inner_kick: _,
         mu_referencing: _,
         n_agq: _,
         inner_optimizer: _,

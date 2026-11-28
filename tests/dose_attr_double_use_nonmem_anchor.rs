@@ -63,7 +63,7 @@
 //! (`nonmem_anchor/results/analytical_dose_attr_double_use_{A,B}.tab`) — `B/A =
 //! 0.5 = F1` at every point, digit-for-digit the same table `ADVAN13`'s
 //! `F1`-in-the-flux run produced. NONMEM again reports nothing: B completes with
-//! `#OBJV = 646.654` against A's `656.358`, and the two `.lst` warning blocks are
+//! `#OBJV = 646.654` against A's `656.358`, and the two listings' warning blocks were
 //! byte-identical (the NM-TRAN population/ETA boilerplate both runs emit).
 //!
 //! Note `S1 = V/F` *is* the standard apparent-volume convention when `F1` is **not**

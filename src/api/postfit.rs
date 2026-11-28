@@ -586,6 +586,9 @@ pub(crate) fn cov_diagnostics(cov: Option<&DMatrix<f64>>) -> (Option<Vec<f64>>, 
 /// OFV) for every subject the fit assigned to another class. For the same reason
 /// the subject's Ω and Σ are its class's (`mixture::class_params`), not the base.
 ///
+/// `agq` is the published objective's `(n_agq, anchor)` when it is a quadrature one: the
+/// OFV contribution is then that objective's term ([`ContributionSource`]).
+///
 /// # Parallel over subjects, and why the stats come back as a value (#1329)
 ///
 /// Each subject is independent — one prediction sweep, no cross-subject term and
@@ -610,7 +613,7 @@ pub(crate) fn compute_subject_results(
     model: &CompiledModel, population: &Population, params: &ModelParameters,
     eta_hats: &[DVector<f64>], h_matrices: &[DMatrix<f64>],
     kappas_per_subject: &[Vec<DVector<f64>>], interaction: bool, mixest: Option<&[usize]>,
-    collect_solver_stats: bool,
+    agq: Option<(usize, crate::types::HessianAnchor)>, collect_solver_stats: bool,
 ) -> (Vec<SubjectResult>, crate::ode::solver::OdeSolverStats) {
     let per_subject: Vec<(SubjectResult, crate::ode::solver::OdeSolverStats)> =
         crate::par::map(population.subjects.len(), |i| {
@@ -805,8 +808,19 @@ pub(crate) fn compute_subject_results(
                 }
             };
 
-            // OFV contribution
-            let ofv_i = if !kappas.is_empty() {
+            // OFV contribution: the quadrature objective's own term when it has one (#3149),
+            // so the contributions sum to its OFV; else the FOCE/FOCEI marginal.
+            let ofv_i = if let Some((n_agq, anchor)) = agq {
+                crate::estimation::agq::agq_subject_term(
+                    model,
+                    subject,
+                    params,
+                    eta.as_slice(),
+                    kappas,
+                    n_agq,
+                    anchor,
+                )
+            } else if !kappas.is_empty() {
                 match &iov_lin {
                     Some(lin) => foce_subject_nll_iov_linearized(
                         model,
@@ -1344,7 +1358,7 @@ const BOUNDARY_REL_TOL: f64 = 1e-3;
 /// absolute gap. An identity-packed theta (lower bound `< 0`) is judged by
 /// its distance to **each bound on that bound's own scale**, never by its
 /// position as a fraction of the declared range: the two are the same thing
-/// for `(-1, 1)` and very different for PsN's `scm` defaults `(-100, 1e6)`,
+/// for `(-1, 1)` and very different for the `[covariate_model]` defaults `(-100, 1e6)`,
 /// where a range fraction would call every estimate below ~900 "at the lower
 /// bound" — which is what every `[covariate_model]` power / exponential θ
 /// carries, and what excluded every candidate of the first covsearch run
@@ -2118,7 +2132,7 @@ fn sorted_indices(hits: &[(usize, f64, bool)]) -> Vec<usize> {
 /// diverged. An `Err(String)` carries one line of prose and deletes the rest.
 /// Nor is the sentinel case an error in any useful sense: a repelled fit has
 /// real, finite parameter estimates and is exactly the "scored but rejected"
-/// candidate `ferx-tools`' model-space search expects from
+/// candidate `ferx-search`'s model-space search expects from
 /// [`crate::model_selection::Strictness::require_converged`] — turning it into
 /// an exception would abort a search instead of stepping past one candidate.
 /// The place to *error* on this population is the front door, where
@@ -2359,16 +2373,17 @@ pub(crate) struct ContributionTerm {
 /// What `SubjectResult::ofv_contribution` is, relative to the objective
 /// `W_NONFINITE_OBJECTIVE` gated (#2267).
 ///
-/// `compute_subject_results` always scores the post-hoc FOCE or FOCEI marginal
-/// (`foce_subject_nll_cov` / the IOV form), under the fitted class for a mixture. The
-/// published objective is classified by what it *is*, not by the estimator's name: FOCE,
-/// FOCEI, both Gauss–Newton methods, SAEM, IMP, IMPMAP (estimating or `imp_eval_only`
-/// standalone) and VI's `vi_final_ofv = laplace` all publish `2·pop_nll` — the sum of
-/// these same scores at the same EBEs. Only three objectives are something else, and
-/// can be unusable while every score is usable or the reverse:
+/// `compute_subject_results` scores a quadrature objective — `laplace` at any `n_agq`,
+/// `focei` with `n_agq > 1`, an `agq_eval_only` readout included — with its own term
+/// (`agq_subject_term`, #3149), and every other one with the post-hoc FOCE or FOCEI
+/// marginal (`foce_subject_nll_cov` / the IOV form), under the fitted class for a
+/// mixture. The published objective is classified by what it *is*, not by the
+/// estimator's name: FOCE, FOCEI, both Gauss–Newton methods, SAEM, IMP, IMPMAP
+/// (estimating or `imp_eval_only` standalone) and VI's `vi_final_ofv = laplace` all
+/// publish `2·pop_nll` — the sum of these same scores at the same EBEs. Only two
+/// objectives are something else, and can be unusable while every score is usable or
+/// the reverse:
 ///
-/// * quadrature — `laplace` at any `n_agq` (its exact-Hessian anchor already differs
-///   at one node) and `focei` with `n_agq > 1`, including an `agq_eval_only` readout;
 /// * `bayes`, whose `ofv` is `2·Σ` joint NLL at the posterior mean, not a marginal;
 /// * a mixture, whose objective is the class-marginal.
 ///
@@ -2377,8 +2392,8 @@ pub(crate) struct ContributionTerm {
 /// objective, a population-level term no subject carries.
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) struct ContributionSource {
-    /// `"FOCE"` or `"FOCEI"`: the marginal each contribution scores.
-    pub(crate) score: &'static str,
+    /// `"FOCE"`, `"FOCEI"` or the quadrature objective's name: what each contribution scores.
+    pub(crate) score: String,
     /// The objective's name when the contributions are not its terms, else `None`.
     pub(crate) objective: Option<String>,
     /// The parameter-prior penalty in the gated objective (`ofv_prior`; `0` unpriored).
@@ -2392,26 +2407,26 @@ impl ContributionSource {
     pub(crate) fn of(
         method: EstimationMethod, options: &FitOptions, mixture: bool, prior: f64,
     ) -> Self {
-        let score = if options.interaction { "FOCEI" } else { "FOCE" };
         let agq = FitOptions::agq_nodes_for(method, options.n_agq);
-        let same = agq.is_none()
-            && method != EstimationMethod::Bayes
+        let mut name = method.label().to_string();
+        if let Some(n) = agq.filter(|&n| n > 1) {
+            name = format!("{name} (n_agq = {n})");
+        }
+        if method == EstimationMethod::Bayes {
+            name.push_str(" posterior-mean");
+        }
+        if mixture {
+            name.push_str(" mixture");
+        }
+        // A non-mixture quadrature objective is scored with its own term (#3149).
+        if agq.is_some() && !mixture {
+            return Self { score: name, objective: None, prior };
+        }
+        let same = method != EstimationMethod::Bayes
             && !mixture
             && crate::types::interaction_for(method, options.interaction) == options.interaction;
-        let objective = (!same).then(|| {
-            let mut name = method.label().to_string();
-            if let Some(n) = agq.filter(|&n| n > 1) {
-                name = format!("{name} (n_agq = {n})");
-            }
-            if method == EstimationMethod::Bayes {
-                name.push_str(" posterior-mean");
-            }
-            if mixture {
-                name.push_str(" mixture");
-            }
-            name
-        });
-        Self { score, objective, prior }
+        let score = if options.interaction { "FOCEI" } else { "FOCE" }.to_string();
+        Self { score, objective: (!same).then_some(name), prior }
     }
 }
 
@@ -2586,8 +2601,8 @@ fn count_and_first(it: impl Iterator<Item = usize>) -> (usize, Option<usize>) {
 /// same cutoff, and shown as its raw `nll`: a raw term of `6e13` makes a `1.2e14`
 /// contribution and is named.
 ///
-/// The contributions are always the post-hoc FOCE/FOCEI score (`source`). When the
-/// objective is not their sum (see [`ContributionSource`]), the sentence says so after
+/// The contributions are the post-hoc FOCE/FOCEI score, or a quadrature objective's own
+/// term (`source`). When the objective is not their sum (see [`ContributionSource`]), the sentence says so after
 /// the list. An unusable parameter-prior penalty — a population-level term no subject
 /// carries — is named after the list too. And when no subject qualifies, the warning
 /// says why rather than ending silently (#2267), in the first of these that holds:
@@ -2737,9 +2752,11 @@ pub(crate) fn name_nonfinite_subjects(
     // largest contributions are where it comes from (#2265).
     let mut largest: Vec<&SubjectResult> = Vec::new();
     let full = if named.is_empty() {
-        let score = source.score;
+        let score = &source.score;
+        // A quadrature objective's contributions are its own terms, not a post-hoc score.
+        let post_hoc = if matches!(score.as_str(), "FOCE" | "FOCEI") { "post-hoc " } else { "" };
         let lead = format!(
-            "{msg} No subject can be named: every subject's post-hoc {score} contribution \
+            "{msg} No subject can be named: every subject's {post_hoc}{score} contribution \
              at these estimates is usable"
         );
         let prior = source.prior;
@@ -3563,6 +3580,20 @@ impl SolverStatsPhase {
         }
     }
 
+    /// What a wrongly integrated pass returns, as the object of "… and return …" (#3196
+    /// review): only a fit has an OFV.
+    fn wrong_result(self) -> &'static str {
+        match self {
+            Self::PostfitPredictions => "a wrong OFV",
+            Self::Predict => "wrong predictions",
+            #[cfg(feature = "survival")]
+            Self::PredictSurvival => "wrong predictions",
+            Self::Simulate | Self::SimulateAdaptive | Self::SimulateUncertainty => {
+                "wrong simulated trajectories"
+            }
+        }
+    }
+
     /// What paid for a discarded escalation *and* the re-solve that replaced it, as the
     /// subject of "… paid for both solves".
     ///
@@ -3847,7 +3878,19 @@ pub(crate) fn ode_ofv_not_settled_warning(
 /// The typed `W_ODE_OFV_SETTLEMENT_UNCHECKED` warning for a tolerance check that applied but
 /// could not run (#2994 review r1): the scope carrying the tighter tolerance could not be built.
 pub(crate) fn ode_ofv_not_checked_warning(reason: &str) -> (String, WarningEntry) {
-    let msg = crate::estimation::ode_tolerance_check::not_checked_warning(reason);
+    unchecked_entry(crate::estimation::ode_tolerance_check::not_checked_warning(reason), reason)
+}
+
+/// The typed `W_ODE_OFV_SETTLEMENT_UNCHECKED` warning for a tolerance check the fit's own
+/// options switched off (`ode_ofv_check = false`, #3157).
+pub(crate) fn ode_ofv_check_off_warning() -> (String, WarningEntry) {
+    unchecked_entry(
+        crate::estimation::ode_tolerance_check::check_off_warning(),
+        "ode_ofv_check = false",
+    )
+}
+
+fn unchecked_entry(msg: String, reason: &str) -> (String, WarningEntry) {
     let details = serde_json::json!({ "reason": reason });
     let entry = warning_entry(WarningCode::OdeSolver, msg.clone(), Some(details));
     (msg, entry)
@@ -4056,10 +4099,15 @@ pub(crate) fn ode_solver_diagnostics_warning(
             "{ODE_SOLVER_INFO_TOKEN}: ode_method = auto escalated {escalated} integration \
              segment(s) to a stiff stepper {at}; every other segment used \
              {explicit}, no escalation was rejected, and no step clamped at the minimum step \
-             size.{switched_info_clause} {provenance} Informational — set ode_method = \
-             {explicit} to pin the explicit stepper, or name a stiff method to pin the other \
-             half.",
+             size.{switched_info_clause} {provenance} Informational. The escalated \
+             segments are the ones the stiffness probe judged stiff, a verdict that can be wrong \
+             on a model that is not stiff. To skip the probe, name a stiff method (ode_method = \
+             rodas5p or rodas4), which then runs every segment. Pin {explicit} only if those \
+             segments are not stiff: on a stiff system it can exhaust its step budget, \
+             freeze-pad them and return {wrong}, which W_ODE_SOLVER_DIAGNOSTICS reports. \
+             Compare the results against a stiff method before keeping it.",
             explicit = crate::ode::OdeMethod::EXPLICIT_FALLBACK.as_str(),
+            wrong = phase.wrong_result(),
             at = phase.at_label(),
             provenance = phase.provenance(),
         );

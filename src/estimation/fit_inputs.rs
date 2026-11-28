@@ -872,6 +872,10 @@ pub struct ScoringSettings {
     /// twin seed, so a post-hoc step re-scores it without one.
     #[serde(default)]
     pub inner_twin_seed: bool,
+    /// `inner_kick`: the inner solves' kick restarts (#3159). `#[serde(default)]`: absent
+    /// from a record written before #3159 reads `false` — the old behaviour.
+    #[serde(default)]
+    pub inner_kick: bool,
     /// `mu_referencing`: the EBE warm start from μ-referenced typical values.
     pub mu_referencing: bool,
     /// `n_agq`: quadrature nodes of the scored marginal.
@@ -897,7 +901,7 @@ pub struct ScoringSettings {
     /// else `Auto`. A post-hoc step resolves it as a union with the caller's: either `Fd`
     /// wins (#1835).
     ///
-    /// Absent from a `FitResult` serialised before #1835 (the fit JSON, the ferx-tools search
+    /// Absent from a `FitResult` serialised before #1835 (the fit JSON, the ferx-search
     /// journal), which reads `Auto`: such a fit takes the caller's route, as it did then.
     #[serde(default)]
     pub gradient_method: GradientMethod,
@@ -925,6 +929,7 @@ impl ScoringSettings {
             inner_restarts: options.inner_restarts,
             inner_screen: options.inner_screen,
             inner_twin_seed: options.inner_twin_seed,
+            inner_kick: options.inner_kick,
             mu_referencing: options.mu_referencing,
             n_agq: options.n_agq,
             inner_optimizer: options.inner_optimizer,
@@ -974,6 +979,7 @@ impl ScoringSettings {
             inner_restarts,
             inner_screen,
             inner_twin_seed,
+            inner_kick,
             mu_referencing,
             n_agq,
             inner_optimizer,
@@ -996,6 +1002,7 @@ impl ScoringSettings {
             inner_restarts,
             inner_screen,
             inner_twin_seed,
+            inner_kick,
             mu_referencing,
             n_agq,
             inner_optimizer,
@@ -1147,6 +1154,7 @@ pub(crate) fn with_scoring_record(
         inner_restarts,
         inner_screen,
         inner_twin_seed,
+        inner_kick,
         mu_referencing,
         n_agq,
         inner_optimizer,
@@ -1174,6 +1182,7 @@ pub(crate) fn with_scoring_record(
     recorded!(inner_restarts);
     recorded!(inner_screen);
     recorded!(inner_twin_seed);
+    recorded!(inner_kick);
     recorded!(mu_referencing);
     recorded!(n_agq);
     recorded!(inner_optimizer);

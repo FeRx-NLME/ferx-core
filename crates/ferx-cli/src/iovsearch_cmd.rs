@@ -1,15 +1,15 @@
 //! `ferx iovsearch` — inter-occasion variability search (#1183).
 //!
 //! Thin by construction (#1114 A5): parse flags, load the `.ferxsearch`
-//! file, call [`ferx_tools::iovsearch::run_iovsearch`], print the model
+//! file, call [`ferx_search::iovsearch::run_iovsearch`], print the model
 //! table, pick an exit code.
 
 use std::path::PathBuf;
 
-use ferx_tools::iovsearch::{
+use ferx_search::iovsearch::{
     default_dir, render_summary, run_iovsearch, IovsearchEvent, IovsearchOptions, IovsearchRun,
 };
-use ferx_tools::search::SearchConfig;
+use ferx_search::search::SearchConfig;
 
 use crate::covsearch_cmd::{flag, parse_threads, scan_args, value};
 
@@ -163,8 +163,8 @@ fn run_iovsearch_command(args: &[String]) -> Result<i32, String> {
     }
     eprintln!(
         "Model table written to {}; final model to {}",
-        ferx_tools::iovsearch::models_path(&dir).display(),
-        ferx_tools::iovsearch::final_model_path(&dir).display()
+        ferx_search::iovsearch::models_path(&dir).display(),
+        ferx_search::iovsearch::final_model_path(&dir).display()
     );
     Ok(if result.cancelled { 130 } else { 0 })
 }

@@ -241,7 +241,7 @@ pub(crate) struct ImpliedDose {
     pub(crate) gov_time: f64,
 }
 
-/// The derived rendering minus `evid4` and `implied`: ferx-tools' search journal hashes
+/// The derived rendering minus `evid4` and `implied`: ferx-search's journal hashes
 /// `{doses:?}` into its data fingerprint, and printing either would move every such digest
 /// and refuse every resume. `evid4` labels a record for a warning without changing what
 /// any fit sees. `implied` is derived from the same file, so it names no change of data.
@@ -1559,7 +1559,8 @@ impl Subject {
     /// scores it (the likelihood scores transitions), so a two-record Markov subject counts
     /// two for one scored transition. Measured on the
     /// Gaussian observations alone, a binary-only or time-to-event-only subject counted as
-    /// having none, so its unconverged EBE was never counted and never warned about.
+    /// having none, so its unconverged EBE was never counted and never warned about. The reader's
+    /// "emptied by `[data_selection]`" test reads it too (#3148).
     pub(crate) fn n_scored_rows(&self) -> usize {
         self.observations.len() + self.obs_records.len()
     }
@@ -1806,8 +1807,7 @@ impl Subject {
     /// decides whether a non-`SS` dose at exactly the observation's time is
     /// the most recent dose (`true`, NONMEM record order) or is skipped so the
     /// observation reads from the dose before it (`false`, Pharmpy's
-    /// `get_doseid`). An `SS` dose at the observation's time counts under both
-    /// (Pharmpy: "no swap for SS dosing").
+    /// `get_doseid`). An `SS` dose at the observation's time counts under both.
     fn data_tad_at(&self, obs_t: f64, same_time_counts: bool) -> f64 {
         let last_eff = self
             .doses
@@ -2367,7 +2367,7 @@ pub struct CovariateRelation {
 
 impl CovariateRelation {
     /// Whether this relation still needs data-derived statistics before it can
-    /// be desugared — a symbolic `center`/`ref`, or a form whose PsN default
+    /// be desugared — a symbolic `center`/`ref`, or a form whose default
     /// bounds are functions of the covariate's median/min/max.
     ///
     /// An unresolved relation is **not** desugared into the expression, and
@@ -2579,10 +2579,20 @@ impl OmegaMatrix {
             None => {
                 // Taken from `m`, before the regularisation below touches it (#1605).
                 let sim_chol = structural_zero_factor(&m);
-                let eig = m.clone().symmetric_eigen();
-                let min_eig = eig.eigenvalues.min();
-                let reg = if min_eig < 0.0 { -min_eig + 1e-8 } else { 1e-8 };
-                let m_reg = &m + DMatrix::identity(n, n) * reg;
+                // Structural zeros alone made Ω singular: the floor goes on their diagonals and
+                // nowhere else, so a `0 FIX` placeholder that stays no longer adds `1e-8` to the
+                // other ηs' variances (#3150). Any other failure takes the eigenvalue floor.
+                let m_reg = if sim_chol.is_some() {
+                    let mut floored = m.clone();
+                    for (i, _) in zero_rows(&m).iter().enumerate().filter(|(_, &z)| z) {
+                        floored[(i, i)] = 1e-8;
+                    }
+                    floored
+                } else {
+                    let min_eig = m.clone().symmetric_eigen().eigenvalues.min();
+                    let reg = if min_eig < 0.0 { -min_eig + 1e-8 } else { 1e-8 };
+                    &m + DMatrix::identity(n, n) * reg
+                };
                 let c = m_reg.clone().cholesky().expect("Regularized matrix must be PD");
                 (m_reg, c.l(), c.inverse(), sim_chol)
             }
@@ -2772,13 +2782,17 @@ impl OmegaMatrix {
 /// caller would supply on purpose; that test also pins a supplied `3e-8` as honoured.
 const SIM_ZERO_RECOVERY_CEILING: f64 = 2e-8;
 
+/// Which rows of `m` are structural zeros: the whole row and column exactly `0`.
+fn zero_rows(m: &DMatrix<f64>) -> Vec<bool> {
+    let n = m.nrows();
+    (0..n).map(|i| (0..n).all(|j| m[(i, j)] == 0.0 && m[(j, i)] == 0.0)).collect()
+}
+
 /// [`OmegaMatrix::sim_chol`] for an input `m` whose Cholesky failed: `Some` when
 /// `m` has structural zeros (diagonal exactly `0`, whole row and column exactly
 /// `0`) and the rest factors on its own; `None` otherwise (#1605).
 fn structural_zero_factor(m: &DMatrix<f64>) -> Option<DMatrix<f64>> {
-    let n = m.nrows();
-    let zeros: Vec<bool> =
-        (0..n).map(|i| (0..n).all(|j| m[(i, j)] == 0.0 && m[(j, i)] == 0.0)).collect();
+    let zeros = zero_rows(m);
     if !zeros.iter().any(|&z| z) {
         return None;
     }
@@ -5358,6 +5372,13 @@ pub struct CompiledModel {
     /// models to FD. (Structured replacement for matching the "conditional
     /// parameter" `parse_warnings` string.)
     pub has_conditional_eta_params: bool,
+    /// True when the prediction has a kink an inner search can stall at: an `if`, `min`, `max`,
+    /// `clamp`, `abs`, `floor`, `ceil` or `round` whose condition or operand depends on a
+    /// random effect or a state, in `[individual_parameters]` or a `[scaling]` `y` readout. Set by
+    /// the parser (#3210). It turns the inner stall escape on by default on an ODE model (a
+    /// closed-form model has no stall stop; [`FitOptions::inner_kick`] turns it on everywhere). `[odes]` switches and η-moved event
+    /// times are kinks it does not detect.
+    pub prediction_has_kink: bool,
     /// Per-ETA transformation metadata derived from the `[individual_parameters]`
     /// expressions at parse time. Length ≤ n_eta (only ETAs whose expression was
     /// classified are present). Forwarded into `FitResult`.
@@ -5579,6 +5600,19 @@ pub(crate) fn absorption_twin_decline_reason(model: &CompiledModel) -> Option<&s
         .find(|w| w.contains("W_ABSORPTION_TWIN_DECLINED"))
         .and_then(|w| w.split_once(TWIN_DECLINE_REASON_MARKER))
         .map(|(_, reason)| reason)
+}
+
+/// The parse note that lists the `omega NAME ~ 0 FIX` placeholder ηs a model dropped (#3150),
+/// and the token `parse_warning_to_code` keys on. It carries no `classify_warning` arm, so it is
+/// an ordinary warning. Like the twin-decline reason it lives in
+/// [`CompiledModel::parse_warnings`], not in a field of its own.
+pub(crate) const ZERO_FIX_ETA_TOKEN: &str = "W_ZERO_FIX_ETA_DROPPED";
+
+/// The [`ZERO_FIX_ETA_TOKEN`] note of `model`, if it dropped any placeholder η. An input sized
+/// for the declared Ω (a supplied Ω, a table of η) is refused for its shape; this is what the
+/// refusal quotes so the user sees which ηs are gone.
+pub(crate) fn dropped_zero_eta_note(model: &CompiledModel) -> Option<&str> {
+    model.parse_warnings.iter().map(String::as_str).find(|w| w.starts_with(ZERO_FIX_ETA_TOKEN))
 }
 
 /// FREM (Full Random Effects Model) configuration.
@@ -6995,6 +7029,9 @@ pub struct SubjectResult {
     /// See [`crate::stats::npde::SubjectNpde::pwres`].
     #[serde(default)]
     pub pwres: Vec<f64>,
+    /// The subject's term of the published objective: its quadrature term under `laplace` and
+    /// AGQ (#3149), else the post-hoc FOCE/FOCEI score at its EBEs, which sums to the OFV only
+    /// for those marginals (not `bayes`, a mixture, or SAEM/IMP readouts of another objective).
     pub ofv_contribution: f64,
     pub cens: Vec<i8>,
     /// Number of observations for this subject (MDV=0 rows).
@@ -8900,6 +8937,17 @@ pub struct FitResult {
     /// Hessian / SIR-fallback proposal construction), in seconds. `0.0` when
     /// the covariance step was not run (#713).
     pub covariance_wall_time_secs: f64,
+    /// Wall-clock time spent on the post-fit OFV tolerance check (`W_ODE_OFV_NOT_SETTLED`,
+    /// #2994), in seconds: two inner-loop passes over every subject, one a decade tighter.
+    /// `0.0` when it did not run (no ODE integration, `ode_ofv_check = false`, or out of scope)
+    /// and for a fit restored from a `.fitrx` bundle (#3157).
+    #[serde(default)]
+    pub ofv_settlement_wall_time_secs: f64,
+    /// Wall-clock time spent building the per-subject results (IPRED, PRED, the CWRES
+    /// linearisation) after the estimates, in seconds. `0.0` for a fit restored from a `.fitrx`
+    /// bundle (#3157).
+    #[serde(default)]
+    pub subject_results_wall_time_secs: f64,
     /// Model name (from the `.ferx` file or "Unnamed").
     pub model_name: String,
     /// ferx-core library version (from Cargo.toml at compile time).
@@ -9629,17 +9677,35 @@ pub struct FitOptions {
     /// unaffected — an alternate seed that reconverges to the same mode is not
     /// accepted — so `0` and the untriggered subjects stay bit-identical.
     pub inner_restarts: usize,
+    /// Restart every inner EBE solve from a small kick of each informative coordinate and keep a
+    /// lower mode (`[fit_options] inner_kick`, #3159). **Default `false`.** A clipped prediction
+    /// (`if (x - TH < 0) 0 else x - TH`) makes a second local minimum of a subject's individual
+    /// objective a barrier away from the first, which no descent from the first reaches; the
+    /// kicks do (at most 16 coordinates, two descents of at most 12 iterations each, per
+    /// subject and solve). A subject with one mode ends where it started. The search's solves
+    /// kick too: kicked in the final pass only, the #833 recovery reported the search's unkicked
+    /// EBEs, which score lower on OFV. The kicks run whether or not the model has a kink
+    /// (measured 2-20× on four fast ODE examples without one), so turn it on only for a model
+    /// with a clipped or thresholded prediction. It also turns on the stall escape for every
+    /// model: a stall at ‖∇‖ ≥ 1 is checked by gradient sampling, and left along the valley when
+    /// the sampled gradients' hull excludes zero. Without it the escape runs only on a model whose
+    /// prediction has a kink ([`CompiledModel::prediction_has_kink`], #3210), since a smooth ODE
+    /// objective stalls there too.
+    pub inner_kick: bool,
     /// Size of the inner multi-start's quasi-random screen (`[fit_options] inner_screen`,
     /// default `100`; set `0` to disable, #2013). Runs inside the cold multi-start
     /// [`inner_restarts`](Self::inner_restarts) gates, before its per-coordinate scan, so it
     /// runs only on the same cold solves and `inner_restarts = 0` disables it too. Each
     /// subject scores `inner_screen` Sobol points drawn from `N(0, 4Ω)` on its individual
-    /// objective, descends from the 3 lowest, and keeps a result only when it is lower
+    /// objective, descends from up to 3 of its 32 lowest, lowest first, each more than 0.5 from
+    /// those before it in the Ω⁻¹ metric (#2863), and keeps a result only when it is lower
     /// than the mode it already has and more than 0.5 from it in the Ω⁻¹ metric. A per-
     /// coordinate scan cannot reach a mode that is off every axis — the flip-flop twin of
     /// a one-compartment oral subject, where `CL`, `V` and `KA` move together — and this
     /// can. The stream is keyed by the subject's ID, so a subject screens the same points
-    /// whatever the thread count or its position in the data. The IOV inner solve has no
+    /// whatever the thread count or its position in the data. A larger screen is not
+    /// guaranteed to reach a mode a smaller one does: on the #2863 repro, 2000 points
+    /// reach the lower mode that 400 do, but 4000 do not. The IOV inner solve has no
     /// multi-start and runs no screen.
     pub inner_screen: usize,
     /// Seed the inner multi-start with the subject's flip-flop twin (`[fit_options]
@@ -9729,6 +9795,13 @@ pub struct FitOptions {
     /// Setting it to `false` restores one method per segment, chosen at its start. Copied onto
     /// `OdeSpec::solver_opts` via [`CompiledModel::sync_ode_solver_opts`].
     pub ode_auto_switch: bool,
+    /// Whether an ODE fit re-scores its OFV one decade tighter after the estimates and warns
+    /// with `W_ODE_OFV_NOT_SETTLED` when it moves (`[fit_options] ode_ofv_check`, #2994).
+    /// Default `true`. The check re-finds every subject's EBEs twice, so on a run that only
+    /// scores a model at given estimates (`maxiter = 0`) it can cost as much as the
+    /// evaluation. With `false` the fit says so (`W_ODE_OFV_SETTLEMENT_UNCHECKED`) instead of
+    /// leaving a silent gap. Read from the stage that owns the published OFV (#3157).
+    pub ode_ofv_check: bool,
     pub run_covariance_step: bool,
     /// When `true` (the default) and the model is in analytic-covariance scope, the
     /// covariance R-matrix is the **exact analytic Hessian** of the FOCE/FOCEI marginal
@@ -10512,6 +10585,7 @@ impl Default for FitOptions {
             // One Ω-scaled restart pass; only accepts a strictly-lower mode. See
             // `FitOptions::inner_restarts`.
             inner_restarts: 1,
+            inner_kick: false,
             // #2013; see `FitOptions::inner_screen`.
             inner_screen: 100,
             // #2095; see `FitOptions::inner_twin_seed`.
@@ -10524,6 +10598,7 @@ impl Default for FitOptions {
             ode_method: crate::ode::OdeMethod::Auto,
             ode_stiff_abort_after: None,
             ode_auto_switch: true,
+            ode_ofv_check: true,
             run_covariance_step: true,
             fd_hessian_step: 1e-2,
             fd_hessian_step_set: false,
@@ -11636,6 +11711,7 @@ pub(crate) fn ode_solver_keys() -> &'static [&'static str] {
         "ode_method",
         "ode_stiff_abort_after",
         "ode_auto_switch",
+        "ode_ofv_check",
     ]
 }
 
@@ -11705,6 +11781,7 @@ pub fn framework_keys() -> &'static [&'static str] {
         "ode_method",
         "ode_stiff_abort_after",
         "ode_auto_switch",
+        "ode_ofv_check",
         // Checkpoint / restart (#755): method-independent.
         "checkpoint",
         "checkpoint_interval_secs",
@@ -11720,6 +11797,7 @@ pub fn method_specific_keys(m: EstimationMethod) -> &'static [&'static str] {
             "inner_maxiter",
             "inner_tol",
             "inner_restarts",
+            "inner_kick",
             "inner_screen",
             "inner_twin_seed",
             "inner_optimizer",
@@ -11741,6 +11819,7 @@ pub fn method_specific_keys(m: EstimationMethod) -> &'static [&'static str] {
             "inner_maxiter",
             "inner_tol",
             "inner_restarts",
+            "inner_kick",
             "inner_screen",
             "inner_twin_seed",
             "inner_optimizer",
@@ -11763,6 +11842,7 @@ pub fn method_specific_keys(m: EstimationMethod) -> &'static [&'static str] {
             "inner_maxiter",
             "inner_tol",
             "inner_restarts",
+            "inner_kick",
             "inner_screen",
             "inner_twin_seed",
             "inner_optimizer",
@@ -11782,6 +11862,7 @@ pub fn method_specific_keys(m: EstimationMethod) -> &'static [&'static str] {
             "inner_maxiter",
             "inner_tol",
             "inner_restarts",
+            "inner_kick",
             "inner_screen",
             "inner_twin_seed",
             "inner_optimizer",
@@ -11793,6 +11874,7 @@ pub fn method_specific_keys(m: EstimationMethod) -> &'static [&'static str] {
             "inner_maxiter",
             "inner_tol",
             "inner_restarts",
+            "inner_kick",
             "inner_screen",
             "inner_twin_seed",
             "inner_optimizer",

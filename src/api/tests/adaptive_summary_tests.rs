@@ -73,6 +73,11 @@ fn result_of(
         decisions,
         metrics,
         parameters: vec![],
+        manifest: AdaptiveRunManifest {
+            seed: Some(946),
+            point_parameters: model("omega ETA_CL ~ 0.09").default_params,
+            decision_times: vec![0.0, 24.0, 48.0],
+        },
         warnings: vec![],
     }
 }
@@ -286,9 +291,88 @@ fn bad_probabilities_and_thresholds_are_refused() {
     });
     assert_eq!(code, "E_ADAPTIVE_OPTIONS");
     assert!(
-        msg.contains("summarize_adaptive: the threshold for NDoses is inf; it must be finite"),
+        msg.contains("summarize_adaptive: the threshold for N_DOSES is inf; it must be finite"),
         "{msg}"
     );
+    let signal = M::Signal { analyte: "conc".into(), decision_idx: 3 };
+    let (_, msg) = refuse(AdaptiveSummaryOptions {
+        thresholds: vec![(signal, f64::NAN)],
+        ..Default::default()
+    });
+    assert!(
+        msg.contains(
+            "summarize_adaptive: the threshold for SIGNAL (analyte 'conc', decision 3) is NaN; \
+             it must be finite"
+        ),
+        "{msg}"
+    );
+}
+
+/// The labels are ferx-r's column names and tokens, one per variant, unique per enum
+/// (ferx-r#779 review finding 4). The `match`es without a wildcard stop compiling when a
+/// variant is added; for the metric, that `match` is the expected-label table and the
+/// variant list sits under it, and `SCALARS` is checked against that list, not built from
+/// it, so a metric added to the enum but not to `SCALARS` fails here (#3213 r1 row 2).
+///
+/// Mutations: any label changed or duplicated; a metric dropped from `SCALARS`;
+/// `from_label` not matching a scalar, or matching `"SIGNAL"`.
+#[test]
+fn every_metric_and_statistic_has_a_unique_stable_label() {
+    let expected = |m: &M| match m {
+        M::CumulativeDose => "CUM_DOSE",
+        M::NDoses => "N_DOSES",
+        M::NIncreases => "N_INCREASES",
+        M::NDecreases => "N_DECREASES",
+        M::NHolds => "N_HOLDS",
+        M::NNotDue => "N_NOT_DUE",
+        M::Discontinued => "DISCONTINUED",
+        M::SignalMin => "SIGNAL_MIN",
+        M::SignalMax => "SIGNAL_MAX",
+        M::SignalMean => "SIGNAL_MEAN",
+        M::PctReadingsInWindow => "PCT_READINGS_IN_WINDOW",
+        M::AucTargetAttainment => "AUC_TARGET_ATTAINMENT",
+        M::Signal { .. } => "SIGNAL",
+    };
+    // Every variant, one per arm above, scalars in output order.
+    let scalars = [
+        M::CumulativeDose,
+        M::NDoses,
+        M::NIncreases,
+        M::NDecreases,
+        M::NHolds,
+        M::NNotDue,
+        M::Discontinued,
+        M::SignalMin,
+        M::SignalMax,
+        M::SignalMean,
+        M::PctReadingsInWindow,
+        M::AucTargetAttainment,
+    ];
+    let signal = M::Signal { analyte: "conc".into(), decision_idx: 0 };
+    assert_eq!(M::SCALARS, scalars);
+    let mut labels = std::collections::BTreeSet::new();
+    for m in scalars.iter().chain(std::iter::once(&signal)) {
+        assert_eq!(m.label(), expected(m), "{m:?}");
+        assert!(labels.insert(m.label()), "{m:?}: label repeated");
+    }
+    for m in &scalars {
+        assert_eq!(M::from_label(m.label()), Some(m.clone()), "{m:?}");
+    }
+    assert_eq!(M::from_label("SIGNAL"), None);
+    assert_eq!(M::from_label("cum_dose"), None);
+
+    let _exhaustive = |s: &S| match s {
+        S::Mean | S::Median | S::FractionAtLeast(_) => (),
+    };
+    let stats = [S::Mean, S::Median, S::FractionAtLeast(0.8)].map(|s| s.label());
+    assert_eq!(stats, ["mean", "median", "fraction_at_least"]);
+
+    let _exhaustive = |b: &AdaptiveBandStatus| match b {
+        AdaptiveBandStatus::NotDrawn | AdaptiveBandStatus::Quantiles(_) => (),
+    };
+    let q = AdaptiveQuantiles { probs: [0.05, 0.5, 0.95], values: [None; 3] };
+    let bands = [AdaptiveBandStatus::NotDrawn, AdaptiveBandStatus::Quantiles(q)].map(|b| b.label());
+    assert_eq!(bands, ["not_drawn", "quantiles"]);
 }
 
 /// Review r1 row 2: the signal rows read `latent`, not the assay-noised `value` the
@@ -409,6 +493,97 @@ fn signal_thresholds_with_no_reading_give_rows_and_repeats_give_one() {
         .filter(|b| b.metric == M::NDoses && b.statistic == S::FractionAtLeast(1.0))
         .count();
     assert_eq!(n, 1);
+}
+
+// ── the Monte Carlo SE (#3215) ──────────────────────────────────────────────────────────
+
+/// One `signal_mean` value per run, `cells[sim]` = the values of that sim's runs (subjects
+/// "a", "b", …), `None` a run that carries none. Draw 1.
+fn signal_mean_runs(cells: &[&[Option<f64>]]) -> AdaptiveSimulationResult {
+    let mut rows = Vec::new();
+    for (k, cell) in cells.iter().enumerate() {
+        for (j, v) in cell.iter().enumerate() {
+            let id = ((b'a' + j as u8) as char).to_string();
+            rows.push(AdaptiveSubjectMetrics {
+                signal_mean: *v,
+                ..metrics_row(1, k + 1, &id, 0.0)
+            });
+        }
+    }
+    result_of(rows, vec![])
+}
+
+fn mc_se_of(r: &AdaptiveSimulationResult, stat: S) -> Option<f64> {
+    let opts =
+        AdaptiveSummaryOptions { thresholds: vec![(M::SignalMean, 4.0)], ..Default::default() };
+    row(&summary(r, &opts), &M::SignalMean, stat, 1).mc_se
+}
+
+/// The delete-one jackknife over sims, by hand. Sims [1, 4], [5, 7], [6, missing]: per-sim
+/// (sum, count) (5, 2), (12, 2), (6, 1), T = 23, N = 5. The 4 sits on the threshold.
+/// - Mean: replicates 18/3 = 6, 11/3, 17/4; mean 167/36; deviations 49/36, −35/36,
+///   −14/36; SE² = (2/3)·3822/1296 = 637/324, SE = 7√13/18.
+/// - FractionAtLeast(4): indicators [0, 1], [1, 1], [1] (the tie counts), value 4/5;
+///   replicates 3/3 = 1, 2/3, 3/4; mean 29/36; deviations 7/36, −5/36, −2/36;
+///   SE² = (2/3)·78/1296 = 13/324, SE = √13/18.
+/// - Median: `None`.
+///
+/// Mutations: the run as the unit (iid over the five runs: SE = √(5.3/5) ≈ 1.03); the
+/// `(n − 1)/n` factor dropped or replaced by `1/n`; the third sim's count taken as two;
+/// the median given a jackknife SE; `≥` read as `>` (the tie drops: value 3/5, SE √13/9).
+#[test]
+fn the_mc_se_is_the_jackknife_over_sims_by_hand_and_none_for_the_median() {
+    let r =
+        signal_mean_runs(&[&[Some(1.0), Some(4.0)], &[Some(5.0), Some(7.0)], &[Some(6.0), None]]);
+    let close = |got: Option<f64>, want: f64| {
+        let g = got.expect("an SE");
+        assert!((g - want).abs() < 1e-14, "{g} vs {want}");
+    };
+    close(mc_se_of(&r, S::Mean), 7.0 * 13f64.sqrt() / 18.0);
+    close(mc_se_of(&r, S::FractionAtLeast(4.0)), 13f64.sqrt() / 18.0);
+    assert_eq!(mc_se_of(&r, S::Median), None);
+    let opts =
+        AdaptiveSummaryOptions { thresholds: vec![(M::SignalMean, 4.0)], ..Default::default() };
+    let s = summary(&r, &opts);
+    assert_eq!(row(&s, &M::SignalMean, S::FractionAtLeast(4.0), 1).value, Some(0.8));
+}
+
+/// The gate on the number of sims, both sides: one sim (however many runs) gives no SE,
+/// two give one. A metric no run carries has `value = None` and so no SE.
+///
+/// Mutations: the `< 2` gate removed (one sim → `Some(NaN)`, the replicate 0/0) or raised
+/// to `< 3` (two sims → `None`).
+#[test]
+fn one_sim_has_no_mc_se_two_have_one_and_a_missing_value_has_none() {
+    let one = signal_mean_runs(&[&[Some(1.0), Some(3.0), Some(8.0)]]);
+    let two = signal_mean_runs(&[&[Some(1.0), Some(3.0)], &[Some(8.0)]]);
+    for stat in [S::Mean, S::FractionAtLeast(4.0)] {
+        assert_eq!(mc_se_of(&one, stat), None, "{stat:?}");
+        assert!(mc_se_of(&two, stat).is_some_and(|se| se > 0.0), "{stat:?}");
+    }
+    let none = signal_mean_runs(&[&[None], &[None]]);
+    let s = summary(&none, &AdaptiveSummaryOptions::default());
+    let r = row(&s, &M::SignalMean, S::Mean, 1);
+    assert_eq!((r.value, r.mc_se), (None, None));
+}
+
+/// A non-finite value makes the SE `NaN`, like the value, for `Mean` and for
+/// `FractionAtLeast`, whose `≥` alone would read a `NaN` as 0 and give a finite SE. The
+/// two-sim gate comes first: one sim with a `NaN` has no SE.
+///
+/// Mutations: the non-finite gate removed (the fraction's SE is finite); the non-finite
+/// gate moved before the sim gate (one sim → `Some(NaN)`).
+#[test]
+fn a_non_finite_value_makes_the_mc_se_nan() {
+    let r = signal_mean_runs(&[&[Some(1.0), Some(f64::NAN)], &[Some(5.0), Some(7.0)]]);
+    for stat in [S::Mean, S::FractionAtLeast(4.0)] {
+        assert!(mc_se_of(&r, stat).is_some_and(f64::is_nan), "{stat:?}");
+    }
+    assert_eq!(mc_se_of(&r, S::Median), None);
+    let one = signal_mean_runs(&[&[Some(1.0), Some(f64::NAN)]]);
+    for stat in [S::Mean, S::FractionAtLeast(4.0)] {
+        assert_eq!(mc_se_of(&one, stat), None, "{stat:?}");
+    }
 }
 
 // ── engine fixtures ────────────────────────────────────────────────────────────────────

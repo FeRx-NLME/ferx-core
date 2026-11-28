@@ -9,7 +9,7 @@ description-meta: "Stepwise covariate modelling in ferx — PsN scm forward / fo
 
 `ferx covsearch` is stepwise covariate modelling: PsN's `scm` in its forward
 and forward-then-backward forms, Pharmpy's `covsearch`. It is the first
-model-space search tool of `ferx-tools`, and the one the
+model-space search tool of `ferx-search`, and the one the
 [`[covariate_model]` block](../model-file/covariate-model.qmd) was built for —
 one relation per line, so a candidate is the parent model plus one line, and
 the rest of the file is invariant.
@@ -93,7 +93,7 @@ stays 0, so check for this in a scripted run.
 
 **Between steps** each child starts from its parent's final estimates
 (Pharmpy's `update_initial_estimates`); the new relation's θ takes the
-block's PsN default init and bounds for its form.
+block's default init and bounds for its form.
 
 ### Adaptive scope reduction (SCM+)
 
@@ -108,8 +108,8 @@ phase, `adaptive`, in the step table.
 ### What the effects become
 
 An MFL effect is one `[covariate_model]` line, centred as PsN's `scm`
-centres it and with the θ left to the block's defaults, which are PsN's
-inits and bounds verbatim:
+centres it and with the θ left to the block's
+[default inits and bounds](../model-file/covariate-model.qmd):
 
 | MFL | `[covariate_model]` line |
 |---|---|
@@ -189,8 +189,8 @@ dataset (`data/two_cpt_oral_cov.csv`, 30 subjects), the same base model
 (two-compartment oral, η on CL and V1, FOCEI) and the same four test
 relations — `CL` and `V1` against `WT` and `CRCL`, PsN `valid_states = 1,5`
 (none / power) — were run through PsN 5.7.1 with NONMEM 7.6 and through ferx,
-forward then backward at `p = 0.05` in both directions. The inputs and PsN's
-`scmlog.txt` are committed under `crates/ferx-tools/tests/psn/scm_anchor/`,
+forward then backward at `p = 0.05` in both directions. The inputs and the
+numbers PsN reported (`results.csv`) are committed under `crates/ferx-search/tests/psn/scm_anchor/`,
 and `tests/covsearch_psn_anchor.rs` replays the comparison.
 
 | step | candidate | NONMEM OFV | ferx OFV | ΔOFV | p | PsN | ferx |
@@ -290,8 +290,8 @@ scaled model and leaves the comparison to the caller.
 ## From Rust
 
 ```rust
-use ferx_tools::covsearch::{run_covsearch, CovsearchRun};
-use ferx_tools::search::SearchConfig;
+use ferx_search::covsearch::{run_covsearch, CovsearchRun};
+use ferx_search::search::SearchConfig;
 
 let cfg = SearchConfig::load("warfarin.ferxsearch")?;
 let base = cfg.load_base()?;
@@ -308,5 +308,5 @@ println!("{}", result.final_model.render());
 
 `CovsearchRun` also takes a `threads` override, a `CancelFlag` that stops the
 search between candidates with what it has, and a progress callback
-(`CovsearchEvent`). Besides its step events, the callback receives a `CandidateFinished` event as each candidate's fit completes — its step, id, features, OFV, criterion and, when it cannot be ranked, the failed gate (`ferx_tools::search::CandidateFinished`, #2512). `ferx_tools::allometry::run_allometry` is the library
+(`CovsearchEvent`). Besides its step events, the callback receives a `CandidateFinished` event as each candidate's fit completes — its step, id, features, OFV, criterion and, when it cannot be ranked, the failed gate (`ferx_search::search::CandidateFinished`, #2512). `ferx_search::allometry::run_allometry` is the library
 form of `ferx allometry`.

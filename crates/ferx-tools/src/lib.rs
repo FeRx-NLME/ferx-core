@@ -3,9 +3,11 @@
 //! # Boundary rule
 //!
 //! > **`ferx-core`** = one model, one dataset, one fit.
-//! > **`ferx-tools`** = many fits, resampling, model-space search.
+//! > **`ferx-tools`** = many fits of a given model: resampling and screening.
+//! > **`ferx-search`** = many fits over a space of models.
 //!
-//! If it calls `fit()` more than once, it belongs here. Statistical kernels
+//! If it calls `fit()` more than once, it belongs here or in `ferx-search`, which
+//! builds on this crate (#3185) and which this crate never depends on. Statistical kernels
 //! (npde, CWRES, shrinkage, covariance/SE, SIR, FREM, VPC statistics) stay in
 //! `ferx-core`; only the *orchestration* of repeated fits lives in this crate.
 //!
@@ -18,7 +20,7 @@
 //! crossed the line (A2).
 //!
 //! First inhabitant: [`bootstrap`] (#1140), the non-parametric case bootstrap
-//! at `PsN::bootstrap` feature parity. It is the boundary rule made concrete —
+//! modelled on `PsN::bootstrap`. It is the boundary rule made concrete —
 //! 200+ calls to [`ferx_core::fit`] over resampled data, and no numerics of its
 //! own.
 
@@ -54,13 +56,6 @@ mod tests {
         }
         let _ = assert_default::<crate::bootstrap::BootstrapOptions>();
         let _ = assert_default::<crate::gam::GamOptions>();
-        let _ = assert_default::<crate::search::RunOptions>();
-        let _ = assert_default::<crate::modelsearch::ModelsearchOptions>();
-        let _ = assert_default::<crate::ruvsearch::RuvsearchOptions>();
-        let _ = assert_default::<crate::iivsearch::IivsearchOptions>();
-        let _ = assert_default::<crate::iovsearch::IovsearchOptions>();
-        let _ = assert_default::<crate::amd::AmdOptions>();
-        let _ = assert_default::<crate::globalsearch::GlobalsearchOptions>();
     }
 
     #[test]
@@ -79,15 +74,6 @@ mod tests {
     }
 }
 
-pub mod allometry;
-pub mod amd;
 pub mod bootstrap;
-pub mod covsearch;
 pub mod gam;
-pub mod globalsearch;
-pub mod iivsearch;
-pub mod iovsearch;
-pub(crate) mod lanes;
-pub mod modelsearch;
-pub mod ruvsearch;
-pub mod search;
+pub mod lanes;

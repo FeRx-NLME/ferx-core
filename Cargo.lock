@@ -531,9 +531,10 @@ checksum = "9f1f227452a390804cdb637b74a86990f2a7d7ba4b7d5693aac9b4dd6defd8d6"
 
 [[package]]
 name = "ferx-cli"
-version = "0.4.0"
+version = "0.5.0"
 dependencies = [
  "ferx-core",
+ "ferx-search",
  "ferx-tools",
  "indicatif",
  "mimalloc",
@@ -543,7 +544,7 @@ dependencies = [
 
 [[package]]
 name = "ferx-core"
-version = "0.4.0"
+version = "0.5.0"
 dependencies = [
  "approx",
  "argmin",
@@ -571,19 +572,33 @@ dependencies = [
 ]
 
 [[package]]
-name = "ferx-tools"
-version = "0.4.0"
+name = "ferx-search"
+version = "0.5.0"
 dependencies = [
  "csv",
  "ferx-core",
+ "ferx-tools",
  "libc",
+ "nalgebra",
+ "rand 0.10.3",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "toml",
+]
+
+[[package]]
+name = "ferx-tools"
+version = "0.5.0"
+dependencies = [
+ "csv",
+ "ferx-core",
  "nalgebra",
  "rand 0.10.3",
  "rayon",
  "serde",
  "serde_json",
  "tempfile",
- "toml",
 ]
 
 [[package]]

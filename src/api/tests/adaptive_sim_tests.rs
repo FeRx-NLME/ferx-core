@@ -8814,14 +8814,11 @@ fn non_iov_trough_before_a_cotimed_base_dose_stays_pre_dose_2532() {
 
 #[test]
 fn constant_path_trough_at_a_derived_break_agrees_with_predict_2532() {
-    // #2532 review r1: the dose rule moved only on the time-varying walk. On the constant
-    // path the frozen replay is the static engine, which stays band-only (first break) with
-    // its dual / state twins (#2534), so the driver must too — this pins the two together.
-    // An infusion of 2.96 at RATE 1 from 5.1 ends at `5.1 + 2.96`, one ULP below 8.06: a
-    // derived break with the reader's nudged trough on it, and the bolus at 8.06 inside its
-    // band. Handing the constant driver the real next break fires that bolus one break later
-    // than the replay does, and the verifier refuses the run. Agreement, not a value: when
-    // #2534 moves the static engine, both sides move together.
+    // #2532 review r1: on the constant path the frozen replay is the static engine, so the
+    // driver must fire each dose at the break the engine does, or the verifier refuses the
+    // run. An infusion of 2.96 at RATE 1 from 5.1 ends at `5.1 + 2.96`, one ULP below 8.06:
+    // a derived break with the reader's nudged trough on it, and the bolus at 8.06 inside
+    // its band. Since #2534 both fire that bolus at its own break; this pins the two together.
     let csv = "ID,TIME,DV,EVID,AMT,RATE,CMT,MDV
 1,0,0,1,100,0,1,1
 1,5.1,0,1,2.96,1,1,1

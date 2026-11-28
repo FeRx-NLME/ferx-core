@@ -60,6 +60,7 @@ Notes for language models and coding agents:
 ## Optional
 
 - [FAQ](https://ferx-nlme.org/ferx-core/faq.html): comparisons with NONMEM and nlmixr2
+- [License](https://ferx-nlme.org/ferx-core/license.html): which parts are MIT and which LGPL-3.0, `ferx --licenses`, and rebuilding with a modified ferx-search
 - [Rust API](https://ferx-nlme.org/ferx-core/api/index.html): calling ferx-core as a library
 - [Development](https://ferx-nlme.org/ferx-core/development/index.html): contributing to ferx-core
 - [Docs lint](https://ferx-nlme.org/ferx-core/development/docs-lint.html): how these pages are kept chunked for retrieval

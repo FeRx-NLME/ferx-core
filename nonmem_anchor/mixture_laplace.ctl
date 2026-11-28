@@ -3,7 +3,7 @@ $PROBLEM 2-class CL mixture, 1-cpt IV, LAPLACIAN (#3025 ferx Laplace mixture anc
 ; clearance, constant mixing fraction, OMEGA / SIGMA fixed at the data-generating values)
 ; under NONMEM's Laplacian conditional estimation. ferx: `method = laplace`.
 ; Data: mixture_iv.csv next to this file (a copy of tests/nonmem/mixture_iv.csv). Run with
-; NONMEM 7.5.1 (nmfe75); outputs in results/mixture_laplace.{lst,ext}, compared with the
+; NONMEM 7.5.1 (nmfe75); outputs in results/mixture_laplace.{nm.json,ext}, compared with the
 ; ferx twin mixture_laplace.ferx in tests/mixture_laplace_nonmem_anchor.rs.
 $INPUT ID TIME DV AMT EVID CMT WT
 $DATA mixture_iv.csv IGNORE=@

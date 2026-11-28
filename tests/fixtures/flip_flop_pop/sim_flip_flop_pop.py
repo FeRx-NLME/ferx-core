@@ -28,7 +28,7 @@ import os
 import random
 import sys
 
-SEED = 2096
+SEED = 21
 N_SUBJECTS = 80
 DOSE = 100.0
 TVCL, TVV, TVKA = 1.0, 10.0, 0.2

@@ -11,7 +11,7 @@
 //!   file order.
 //!
 //! The control streams are the drafts NONMEM 7.6.0 ran (`nonmem:7.6.0-anchor`, `METHOD=0
-//! MAXEVAL=0`), identical to each `.lst`'s echo; @TeunP ran them on PR #1875 and posted the
+//! MAXEVAL=0`), identical to each run's echo (`control_stream_as_run`); @TeunP ran them on PR #1875 and posted the
 //! `results/` files and the `_fit.ferx` twins. The comparison is `PRED` (η = 0) against the
 //! `.tab`, printed to 11 significant figures, so the `$ESTIMATION` method does not enter.
 //! On the merge-base `9a12c915`, TeunP measured the worst `PRED` error as 3.90, 4.00 and 2.47,
@@ -29,7 +29,7 @@
 //!   an explicit dose governs, after the implied one (13) or tied with it (14). Each case
 //!   is multi-dose, so each implied dose lands on residual drug. The analytic and ODE twins
 //!   run against the same `.tab`. NONMEM 7.5.1, `METHOD=0 MAXEVAL=0`, `.tab` at 17
-//!   significant figures. The control stream equals the `.lst`'s echo up to layout. A
+//!   significant figures. The control stream equals the run's echo up to layout. A
 //!   closed form outside both engines, a sum of exponentials over the records,
 //!   reproduces the `.tab` to rounding under this rule. Under the parent-row rule it
 //!   reproduces ferx before the fix: a worst error of 2.34 (30 %, ID 9 at `TIME 30`).

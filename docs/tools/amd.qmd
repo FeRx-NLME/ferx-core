@@ -389,8 +389,8 @@ they are produced — each tool has its own NONMEM-driven Pharmpy anchor.
 ## From Rust
 
 ```rust
-use ferx_tools::amd::{run_amd, AmdRun};
-use ferx_tools::search::SearchConfig;
+use ferx_search::amd::{run_amd, AmdRun};
+use ferx_search::search::SearchConfig;
 
 let config = SearchConfig::load("amd_start.ferxsearch")?;
 let base = config.load_base()?;
