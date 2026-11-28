@@ -7160,20 +7160,21 @@ pub fn parse_full_model_with(
     // moved into the unnamed `scaling` block by `apply_algebraic_structural`, and with no doses
     // there is no dose-attribute carve-out. Endpoint-only models (no `pk(...)`, no `[odes]`, no
     // compartment-free block) are skipped: no `[individual_parameters]` block, and their params
-    // live in named `[event_model LABEL]` blocks, which the census does not tokenize.
+    // live in named `[event_model LABEL]` blocks.
     //
     // A raw-text census (not resolution against parsed ASTs) covers *every* block uniformly,
     // including ones whose references are not retained as walkable ASTs (`[output]`, `[scaling]`),
-    // so it cannot false-positive by overlooking a usage site. It iterates `blocks.values()` = the
-    // *unnamed* blocks only. `[covariate_nn NAME]` blocks reference thetas/etas/covariates, never
-    // indiv params. A named `[event_model LABEL]` / `[binary_model LABEL]` predictor CAN read an
-    // individual parameter (`restrict_and_validate_indiv_stmts` keeps the statements it reads) and
-    // is not tokenised here, so a parameter read *only* by a named endpoint block is reported dead:
-    // a known false positive (also for compartment-free models since #1443), tracked in #1455.
+    // so it cannot false-positive by overlooking a usage site. It reads the unnamed blocks and the
+    // named endpoint ones: a named `[event_model LABEL]` / `[binary_model LABEL]` predictor can read
+    // an individual parameter (`restrict_and_validate_indiv_stmts` keeps the statements it reads),
+    // and a parameter read only there was reported dead with advice to remove it (#1455). A named
+    // `[covariate_nn NAME]` reads thetas, etas and covariates, never an individual parameter, so it
+    // is skipped: its output names, often the individual parameters', would hide a dead one.
     if !pk_param_map.is_empty() || is_ode || is_algebraic {
         let mut token_counts: std::collections::HashMap<String, usize> =
             std::collections::HashMap::new();
-        for lines in blocks.values() {
+        let census_blocks = every_block_body(&extracted).filter(|(ty, _, _)| *ty != "covariate_nn");
+        for (_, _, lines) in census_blocks {
             for line in lines {
                 for tok in line.split(|c: char| !(c.is_ascii_alphanumeric() || c == '_')) {
                     if tok.starts_with(|c: char| c.is_ascii_alphabetic() || c == '_') {
