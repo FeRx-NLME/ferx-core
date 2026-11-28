@@ -61,7 +61,7 @@ fn warfarin_tail_rate_banded(rule: &str, seed: u64, band: Option<&str>) -> f64 {
         .expect("warfarin data loads");
     let mut opts = FitOptions {
         method: EstimationMethod::Saem,
-        saem_n_exploration: N_EXPLORE,
+        saem_n_exploration: Some(N_EXPLORE),
         saem_n_convergence: N_CONVERGE,
         // The issue's measurement was taken at the *default* proposal count,
         // not the example file's `n_mh_steps = 3`.

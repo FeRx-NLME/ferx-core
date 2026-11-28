@@ -72,18 +72,24 @@ impl SaemObjAccumulator {
         Self { enabled, last_only, max: vec![f64::NEG_INFINITY; n], sum: vec![0.0; n], n: 0 }
     }
 
-    /// One draw per subject: `nll[i]` is `−log p(y_i, η_i)` (no constants), the joint NLL.
+    /// One draw per subject and chain: `nll[c·N + i]` is `−log p(y_i, η_i)` (no constants) of
+    /// chain `c`'s draw for subject `i` (`N` the data subjects, #2986). Chains are pooled per
+    /// subject — each update adds `n_chains` draws to every subject's mean, as NONMEM averages
+    /// its `ISAMPLE` samples — so with one chain this is the per-subject update it always was.
     pub(crate) fn update(&mut self, nll: &[f64]) {
         if !self.enabled {
             return;
         }
+        let n_subj = self.max.len();
         if self.last_only {
-            self.max = nll.iter().map(|v| -v).collect();
-            self.sum = vec![1.0; nll.len()];
+            // Nothing is sampled, so every chain's value is the same: read the first.
+            self.max = nll[..n_subj].iter().map(|v| -v).collect();
+            self.sum = vec![1.0; n_subj];
             self.n = 1;
             return;
         }
-        for (i, &v) in nll.iter().enumerate() {
+        for (j, &v) in nll.iter().enumerate() {
+            let i = j % n_subj;
             let x = -v;
             if x > self.max[i] {
                 // Rescale the running sum to the new maximum (exp(-inf) = 0 on first use).
@@ -93,7 +99,7 @@ impl SaemObjAccumulator {
                 self.sum[i] += (x - self.max[i]).exp();
             }
         }
-        self.n += 1;
+        self.n += (nll.len() / n_subj.max(1)) as u64;
     }
 
     /// `−2 Σ_i log mean`, `None` before the first draw or when a subject's draws diverged.

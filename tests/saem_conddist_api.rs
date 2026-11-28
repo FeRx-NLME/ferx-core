@@ -75,7 +75,7 @@ fn simulate_into(model: &ferx_core::types::CompiledModel, template: &Population)
 fn short_saem_opts() -> FitOptions {
     let mut opts = FitOptions::default();
     opts.method = EstimationMethod::Saem;
-    opts.saem_n_exploration = 8;
+    opts.saem_n_exploration = Some(8);
     opts.saem_n_convergence = 8;
     opts.saem_omega_burnin = 4;
     opts.saem_seed = Some(11);

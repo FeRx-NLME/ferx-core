@@ -419,7 +419,7 @@ fn in_fit_sir_scores_under_the_stage_record_saem_focei_control() {
         with_sir(FitOptions {
             methods: vec![EstimationMethod::Saem, EstimationMethod::FoceI],
             inner_tol: 1e-7,
-            saem_n_exploration: 2,
+            saem_n_exploration: Some(2),
             saem_n_convergence: 2,
             ..quiet(EstimationMethod::Saem)
         }),

@@ -169,7 +169,7 @@ fn logit_mu_ref_drives_the_saem_closed_form_m_step() {
     let opts = FitOptions {
         method: EstimationMethod::Saem,
         // Minimal budget: this asserts which M-step branch runs, not convergence.
-        saem_n_exploration: 2,
+        saem_n_exploration: Some(2),
         saem_n_convergence: 1,
         run_covariance_step: false,
         verbose: false,
@@ -256,7 +256,7 @@ fn saem_two_logit_etas_on_one_theta_route_to_the_numerical_mstep() {
         .expect("fixture data must load");
     let opts = FitOptions {
         method: EstimationMethod::Saem,
-        saem_n_exploration: 2,
+        saem_n_exploration: Some(2),
         saem_n_convergence: 1,
         run_covariance_step: false,
         verbose: false,
@@ -306,7 +306,7 @@ fn saem_log_packed_logit_theta_routes_to_numerical_mstep_with_advisory() {
         .expect("fixture data must load");
     let opts = FitOptions {
         method: EstimationMethod::Saem,
-        saem_n_exploration: 2,
+        saem_n_exploration: Some(2),
         saem_n_convergence: 1,
         run_covariance_step: false,
         verbose: false,

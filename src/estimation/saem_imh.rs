@@ -147,6 +147,8 @@ pub(crate) struct ImhCounters {
     /// and Jacobian costs are priced — all measured on the same subjects, in
     /// the same run, under the same machine contention.
     imh_nll_ns: AtomicU64,
+    /// `imh_steps` calls, for the sampled timing of `imh_nll_ns`.
+    timing_calls: AtomicU64,
 }
 
 /// A snapshot of [`ImhCounters`], for differencing.
@@ -162,6 +164,9 @@ pub(crate) struct ImhSnapshot {
     pub map_jac_ns: u64,
     pub imh_nll_ns: u64,
 }
+
+/// One IMH call in this many has its NLL time measured (see `imh_steps`).
+const IMH_TIMING_STRIDE: u64 = 16;
 
 fn bump(c: &AtomicU64, by: u64) {
     c.fetch_add(by, Ordering::Relaxed);
@@ -808,13 +813,19 @@ pub(crate) fn imh_steps(
     // Accumulated locally and folded into the shared counters once per call, so
     // the rayon workers do not contend on the atomics per proposal.
     let mut nll_ns: u64 = 0;
+    // The NLL time is sampled — one call in `IMH_TIMING_STRIDE` timed, its time counted that
+    // many times — so `imh_nll_ns / proposals` stays an unbiased per-NLL cost without two
+    // clock reads per proposal (#2986: ~1.7 % of a pk2_big stand-in fit).
+    let timed = counters.timing_calls.fetch_add(1, Ordering::Relaxed) % IMH_TIMING_STRIDE == 0;
 
     for _ in 0..n_steps {
         prop.draw_into(rng, &mut z, &mut eta_prop);
-        let t0 = std::time::Instant::now();
+        let t0 = timed.then(std::time::Instant::now);
         let nll_prop =
             scratch.score(model, subject, theta, &eta_prop, omega, sigma_values, schedule);
-        nll_ns += t0.elapsed().as_nanos() as u64;
+        if let Some(t0) = t0 {
+            nll_ns += IMH_TIMING_STRIDE * t0.elapsed().as_nanos() as u64;
+        }
         let log_q_prop = prop.log_q(&eta_prop);
         let log_alpha = (nll - nll_prop) + (log_q_cur - log_q_prop);
         let log_u: f64 = rng.random::<f64>().ln();

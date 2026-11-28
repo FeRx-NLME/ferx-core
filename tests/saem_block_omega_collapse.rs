@@ -149,7 +149,7 @@ fn assert_no_rank1_collapse(kernel: ferx_core::types::SaemKernel, label: &str) {
 
     let mut opts = FitOptions::default();
     opts.method = EstimationMethod::Saem;
-    opts.saem_n_exploration = 400;
+    opts.saem_n_exploration = Some(400);
     opts.saem_n_convergence = 400;
     opts.saem_seed = Some(12345);
     opts.run_covariance_step = false;

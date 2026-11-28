@@ -5997,27 +5997,18 @@ pub(crate) fn analytic_eta_nll_value_gradient_with_schedule(
         }
         ruv_grad += ruv_term; // 0 unless `iiv_on_ruv`
         if value_ok {
-            // The objective's own row term (`individual_nll_into_prepared_with_schedule_frozen`):
-            // the same variance, the same expression.
-            let f_var = frozen_var_preds.map_or(obs.f, |f0| f0[j]);
-            let v_resid = match mult.and_then(|m| m.get(j)).map(Vec::as_slice) {
-                Some(m) => model.error_spec.variance_at_scaled(
-                    err_keys[j],
-                    f_var,
-                    sigma,
-                    residual_cov.pairs,
-                    m,
-                ),
-                None => model.error_spec.variance_at_with_correlations(
-                    err_keys[j],
-                    f_var,
-                    sigma,
-                    residual_cov.pairs,
-                ),
-            } * ruv_scale;
-            let v = v_resid + p.map_or(0.0, |p| p.f);
-            let resid = subject.observations[j] - obs.f;
-            data_ll += resid * resid / v + v.ln();
+            data_ll += gaussian_row_value(
+                model,
+                err_keys[j],
+                subject.observations[j],
+                obs.f,
+                frozen_var_preds.map_or(obs.f, |f0| f0[j]),
+                sigma,
+                residual_cov,
+                mult.and_then(|m| m.get(j)).map(Vec::as_slice),
+                ruv_scale,
+                p.map_or(0.0, |p| p.f),
+            );
         }
     }
     if let Some(r) = ruv_idx {
@@ -6039,6 +6030,32 @@ pub(crate) fn analytic_eta_nll_value_gradient_with_schedule(
     let result = Some(add_nongaussian(grad));
     *obs_grad_recycle = sens;
     result
+}
+
+/// One Gaussian row's term of the objective (`individual_nll_into_prepared_with_schedule_frozen`):
+/// `ε²/v + ln v`, with `v` the same residual variance at `f_var` (scaled by the magnitude
+/// multiplier `mult` and `iiv_on_ruv`'s `ruv_scale`) plus an SDE row's `p`, the same expression.
+#[allow(clippy::too_many_arguments)]
+#[inline]
+fn gaussian_row_value(
+    model: &CompiledModel, err_key: usize, y: f64, f: f64, f_var: f64, sigma: &[f64],
+    residual_cov: crate::stats::residual_error::ResidualCov<'_>, mult: Option<&[f64]>,
+    ruv_scale: f64, p: f64,
+) -> f64 {
+    let v_resid = match mult {
+        Some(m) => {
+            model.error_spec.variance_at_scaled(err_key, f_var, sigma, residual_cov.pairs, m)
+        }
+        None => model.error_spec.variance_at_with_correlations(
+            err_key,
+            f_var,
+            sigma,
+            residual_cov.pairs,
+        ),
+    } * ruv_scale;
+    let v = v_resid + p;
+    let resid = y - f;
+    resid * resid / v + v.ln()
 }
 
 /// Dense-`R` (`block_sigma`, #627) analytic inner η-gradient — the correlated-residual
@@ -6262,6 +6279,39 @@ pub(crate) fn analytic_eta_nll_gradient_iov_frozen(
         frozen_var_preds,
         obs_grad_recycle,
         None,
+    )
+}
+
+/// [`analytic_eta_nll_gradient_iov`] that also reports the IOV objective's **value** through
+/// `value_out`, from the same pass (value/gradient fusion, as
+/// [`analytic_eta_nll_value_gradient_with_schedule`] does without IOV): the predictions the
+/// gradient is built from are the ones `individual_nll_iov_frozen_in` scores, so the value
+/// costs a few flops where the native objective re-predicts the whole subject. The SAEM
+/// gradient kernels read it at every proposal (#2986). `*value_out` is `Some(l)` only for a
+/// plain Gaussian row sum on one IOV level — no nested levels, dense `R`, censored or FREM
+/// row, SDE variance or non-Gaussian record — with a finite value; `None` otherwise (the
+/// caller takes the native objective there).
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn analytic_eta_nll_value_gradient_iov(
+    model: &CompiledModel, subject: &Subject, theta: &[f64], stacked_true: &[f64],
+    omega_bsv: &crate::types::OmegaMatrix, omega_iov: &crate::types::OmegaMatrix, sigma: &[f64],
+    mult: Option<&[Vec<f64>]>, obs_grad_recycle: &mut Vec<crate::sens::provider::ObsGrad>,
+    value_out: Option<&mut Option<f64>>,
+) -> Option<Vec<f64>> {
+    let layout = crate::stats::stacked_layout::StackedLayout::sens_of_cached(model, subject)?;
+    analytic_eta_nll_value_gradient_iov_frozen(
+        model,
+        subject,
+        &layout,
+        theta,
+        stacked_true,
+        omega_bsv,
+        omega_iov,
+        sigma,
+        mult,
+        None,
+        obs_grad_recycle,
+        value_out,
     )
 }
 

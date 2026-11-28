@@ -166,7 +166,7 @@ fn saem_takes_the_same_route_for_both_forms() {
     // Tier-2: a few SAEM iterations, never a convergence loop.
     let opts = FitOptions {
         method: ferx_core::types::EstimationMethod::Saem,
-        saem_n_exploration: 3,
+        saem_n_exploration: Some(3),
         saem_n_convergence: 3,
         // The route under test is the M-step; nothing below reads the covariance step.
         run_covariance_step: false,

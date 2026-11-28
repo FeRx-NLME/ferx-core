@@ -2817,7 +2817,11 @@ fn kjit_run(
     if plan.n_out() != n_obs {
         return None;
     }
-    let mut out = PredLanes::new(vec![0.0; n_obs * (1 + eta.len())], eta.len(), false);
+    // From this thread's pool: the consumers hand `du` back (`scratch::give`), so a steady
+    // state allocates nothing per gradient (#2986).
+    let mut du: Vec<f64> = crate::scratch::take();
+    du.resize(n_obs * (1 + eta.len()), 0.0);
+    let mut out = PredLanes::new(du, eta.len(), false);
     if !plan.run(theta, eta, &mut out.du) {
         return None;
     }

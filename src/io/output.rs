@@ -2874,6 +2874,24 @@ pub fn write_estimates_yaml(result: &FitResult, path: &str) -> Result<(), String
         writeln!(f, "  saem_n_subjects_hmc: {n_hmc}").map_err(|e| e.to_string())?;
         writeln!(f, "  saem_n_subjects_mh: {n_mh}").map_err(|e| e.to_string())?;
     }
+    if let Some(n) = result.saem_n_exploration_used {
+        writeln!(f, "  saem_n_exploration: {n}").map_err(|e| e.to_string())?;
+    }
+    if let Some(k) = &result.saem_kernels {
+        writeln!(f, "  saem_kernels: \"{k}\"").map_err(|e| e.to_string())?;
+    }
+    if let Some(g) = &result.saem_gradient_kernel {
+        writeln!(f, "  saem_gradient_transitions: {}", g.transitions).map_err(|e| e.to_string())?;
+        writeln!(f, "  saem_gradient_declined: {}", g.declined).map_err(|e| e.to_string())?;
+        writeln!(f, "  saem_gradient_divergences: {}", g.divergences).map_err(|e| e.to_string())?;
+        writeln!(f, "  saem_gradient_mean_leapfrog: {:.3}", g.mean_leapfrog)
+            .map_err(|e| e.to_string())?;
+        if let Some(a) = g.mean_accept {
+            writeln!(f, "  saem_gradient_mean_accept: {a:.4}").map_err(|e| e.to_string())?;
+        }
+        writeln!(f, "  saem_gradient_step_size: {:.4}", g.median_step_size)
+            .map_err(|e| e.to_string())?;
+    }
     // The numerical M-step optimizer `mstep_optimizer = auto` resolved to (SAEM / IMP / IMPMAP).
     if let Some(opt) = &result.mstep_optimizer_used {
         writeln!(f, "  mstep_optimizer: {opt}").map_err(|e| e.to_string())?;
@@ -3759,6 +3777,9 @@ mod tests {
             saem_mu_ref_m_step_evals_saved: None,
             saem_n_subjects_hmc: None,
             saem_mh_accept_tail: None,
+            saem_n_exploration_used: None,
+            saem_gradient_kernel: None,
+            saem_kernels: None,
             mstep_optimizer_used: None,
             gradient_method_inner: String::new(),
             gradient_method_outer: String::new(),
@@ -5141,6 +5162,9 @@ mod tests {
             saem_mu_ref_m_step_evals_saved: None,
             saem_n_subjects_hmc: None,
             saem_mh_accept_tail: None,
+            saem_n_exploration_used: None,
+            saem_gradient_kernel: None,
+            saem_kernels: None,
             mstep_optimizer_used: None,
             gradient_method_inner: String::new(),
             gradient_method_outer: String::new(),

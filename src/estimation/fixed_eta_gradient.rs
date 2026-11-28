@@ -593,7 +593,9 @@ pub(crate) fn obs_nll_subject_score_iov(
     let any_theta_free = (0..n_theta).any(|i| lower[i] != upper[i]);
     // The information needs a per-observation `∂f_j/∂θ` (the adjoint's, below) and no second
     // `∂V/∂θ` channel (a residual magnitude) nor an `NnGradPlan` θ.
-    let fisher_ok = want_fisher && nn_plan.is_none() && ruv_mult.is_none();
+    // A θ-free magnitude (#3064) is a per-observation constant: no second `∂V/∂θ` channel.
+    let magnitude_reads_theta = ruv_mult.is_some() && model.ruv_magnitude_reads_theta();
+    let fisher_ok = want_fisher && nn_plan.is_none() && !magnitude_reads_theta;
     let mut df_packed: Vec<Vec<f64>> = vec![Vec::new(); if fisher_ok { n } else { 0 }];
     let exact = !any_theta_free
         || exact_theta_score(
@@ -602,7 +604,7 @@ pub(crate) fn obs_nll_subject_score_iov(
             theta,
             &stacked,
             &d_nll_d_f,
-            ruv_mult.is_some().then_some(sigma_values),
+            magnitude_reads_theta.then_some(sigma_values),
             theta_packs_log_mask,
             lower,
             upper,
@@ -858,17 +860,20 @@ fn assemble_fisher(
     // coordinate keeps an all-zero row and column, which is what the caller's
     // linear solve drops.
     let mut fisher = vec![0.0f64; n * n];
-    // ∂V_j/∂x_a for every coordinate, so the σ and θ blocks assemble alike.
-    let dv: Vec<Vec<f64>> = (0..n)
+    // ∂V_j/∂x_a for every coordinate, so the σ and θ blocks assemble alike. The σ rows are
+    // the caller's, borrowed rather than copied per call.
+    let dv: Vec<std::borrow::Cow<'_, [f64]>> = (0..n)
         .map(|a| {
             if a < n_theta {
                 if df_packed[a].is_empty() {
-                    Vec::new()
+                    std::borrow::Cow::Borrowed(&[][..])
                 } else {
-                    (0..n_obs).map(|j| dv_df_obs[j] * df_packed[a][j]).collect()
+                    std::borrow::Cow::Owned(
+                        (0..n_obs).map(|j| dv_df_obs[j] * df_packed[a][j]).collect(),
+                    )
                 }
             } else {
-                dv_dlogsigma[a].clone()
+                std::borrow::Cow::Borrowed(dv_dlogsigma[a].as_slice())
             }
         })
         .collect();
@@ -900,6 +905,98 @@ fn assemble_fisher(
     }
 
     fisher
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Test switch: take the general path where [`sigma_only_score`] would serve, for the test
+    /// pinning the two bit for bit.
+    pub(crate) static SIGMA_ONLY_OFF: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// The most free σ the lean σ-only score ([`sigma_only_score`]) carries on the stack.
+const SIGMA_ONLY_MAX: usize = 8;
+
+/// The σ-only score of [`obs_nll_subject_grad_impl`] (#2986): with every θ pinned, the value,
+/// the σ gradient and the σ×σ information are residual arithmetic on the predictions. The
+/// same operations in the same order as the general path — each σ's gradient and each
+/// information entry summed over the observations in turn — so the same bits, without its
+/// per-θ rows, its per-call vectors or the `n×n` assembly. A σ-only SAEM M-step evaluates it
+/// at every Newton step on the memoized predictions. `None` (the general path runs) under a
+/// residual magnitude that reads θ (the general path withholds the information there), a
+/// `[covariate_nn]` θ plan, or more than [`SIGMA_ONLY_MAX`] free σ.
+#[allow(clippy::too_many_arguments)]
+fn sigma_only_score(
+    model: &CompiledModel, subject: &Subject, preds: &[f64], theta: &[f64], sigma_values: &[f64],
+    eta: &[f64], lower: &[f64], upper: &[f64], n_theta: usize, n_sigma: usize, want_fisher: bool,
+) -> Option<(f64, Vec<f64>, Option<Vec<f64>>)> {
+    let n = n_theta + n_sigma;
+    let free: Vec<usize> =
+        (0..n_sigma).filter(|&k| lower[n_theta + k] != upper[n_theta + k]).collect();
+    let m = free.len();
+    if m > SIGMA_ONLY_MAX || model.ruv_magnitude_reads_theta() {
+        return None;
+    }
+    let ruv_mult = model.ruv_obs_mult(subject, theta);
+    if NnGradPlan::build(model, subject, theta, n_theta).is_some() {
+        return None;
+    }
+    let frem_ov = crate::stats::likelihood::build_frem_r_override(
+        model.frem_config.as_ref(),
+        &subject.fremtype,
+        sigma_values,
+    );
+    let ruv_scale = model.residual_var_scale(eta);
+    let err_keys = model.error_spec.obs_keys(subject);
+    let mut nll = 0.0f64;
+    let mut g = [0.0f64; SIGMA_ONLY_MAX];
+    let mut info = [[0.0f64; SIGMA_ONLY_MAX]; SIGMA_ONLY_MAX];
+    let mut dv = [0.0f64; SIGMA_ONLY_MAX];
+    for (j, &f) in preds.iter().enumerate().take(subject.observations.len()) {
+        let cmt = err_keys[j];
+        let mult_j = ruv_mult.as_ref().map(|m| m[j].as_slice());
+        let frem_vj = frem_ov.as_ref().and_then(|o| o.get(j)).and_then(|x| *x);
+        let s = if frem_vj.is_some() { 1.0 } else { ruv_scale };
+        let v = match frem_vj {
+            Some(vv) => vv.max(1e-12),
+            None => crate::stats::residual_error::guard_variance(
+                model.residual_variance_at_scaled(cmt, f, sigma_values, mult_j) * s,
+            ),
+        };
+        let resid = subject.observations[j] - f;
+        nll += 0.5 * (v.ln() + resid * resid / v);
+        for (a, &k) in free.iter().enumerate() {
+            let ratio = obs_dvar_dlogsigma(model, cmt, k, f, sigma_values, mult_j, frem_vj) * s;
+            dv[a] = ratio;
+            g[a] += 0.5 * ratio * (1.0 / v - resid * resid / (v * v));
+        }
+        if want_fisher {
+            for a in 0..m {
+                for b in a..m {
+                    info[a][b] += 0.0 + 0.5 * dv[a] * dv[b] / (v * v);
+                }
+            }
+        }
+    }
+    if !nll.is_finite() {
+        return Some((SUBJECT_SENTINEL_NLL, vec![0.0; n], None));
+    }
+    let mut grad = vec![0.0f64; n];
+    for (a, &k) in free.iter().enumerate() {
+        grad[n_theta + k] = g[a];
+    }
+    let fisher = want_fisher.then(|| {
+        let mut fi = vec![0.0f64; n * n];
+        for (a, &ka) in free.iter().enumerate() {
+            for (b, &kb) in free.iter().enumerate().skip(a) {
+                let (ia, ib) = (n_theta + ka, n_theta + kb);
+                fi[ia * n + ib] = info[a][b];
+                fi[ib * n + ia] = info[a][b];
+            }
+        }
+        fi
+    });
+    Some((nll, grad, fisher))
 }
 
 /// The one body behind [`obs_nll_subject_grad`] and
@@ -1035,6 +1132,29 @@ fn obs_nll_subject_grad_impl(
             model, subject, theta, eta, pk_scratch, schedule,
         )
     });
+    // σ only (every θ pinned): the score and information are residual arithmetic on these
+    // predictions — the lean twin of the general path below (#2986).
+    #[cfg(test)]
+    let lean = !SIGMA_ONLY_OFF.with(|c| c.get());
+    #[cfg(not(test))]
+    let lean = true;
+    if lean && (0..n_theta).all(|i| lower[i] == upper[i]) {
+        if let Some(out) = sigma_only_score(
+            model,
+            subject,
+            &preds_base,
+            theta,
+            sigma_values,
+            eta,
+            lower,
+            upper,
+            n_theta,
+            n_sigma,
+            want_fisher,
+        ) {
+            return out;
+        }
+    }
 
     let mut nll_base = 0.0f64;
     let n_obs = subject.observations.len();
@@ -1129,7 +1249,9 @@ fn obs_nll_subject_grad_impl(
     // θ dependence (`dv_df = 0` above), and `obs_dvar_dlogsigma` gives the one
     // σ derivative it does have. Every term of `I_ab` below is then exact on
     // those rows too.
-    let fisher_ok = want_fisher && nn_plan.is_none() && ruv_mult.is_none();
+    // A θ-free magnitude (#3064) is a per-observation constant: no second `∂V/∂θ` channel.
+    let magnitude_reads_theta = ruv_mult.is_some() && model.ruv_magnitude_reads_theta();
+    let fisher_ok = want_fisher && nn_plan.is_none() && !magnitude_reads_theta;
     // `∂f_j/∂x_a` in PACKED coordinates, per free θ coordinate. Empty for a
     // pinned coordinate, for every σ coordinate (predictions do not depend on
     // σ), and for the whole subject when the information is out of scope.
@@ -1186,7 +1308,7 @@ fn obs_nll_subject_grad_impl(
             theta,
             eta,
             &d_nll_d_f,
-            ruv_mult.is_some().then_some(sigma_values),
+            magnitude_reads_theta.then_some(sigma_values),
             theta_packs_log_mask,
             lower,
             upper,

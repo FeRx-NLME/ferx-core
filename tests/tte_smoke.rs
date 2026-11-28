@@ -1184,7 +1184,7 @@ mod survival_smoke {
         let opts = FitOptions {
             methods: vec![EstimationMethod::FoceI, EstimationMethod::Saem],
             outer_maxiter: 3,
-            saem_n_exploration: 2,
+            saem_n_exploration: Some(2),
             saem_n_convergence: 2,
             saem_seed: Some(1),
             ..FitOptions::default()

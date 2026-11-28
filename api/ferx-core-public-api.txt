@@ -821,8 +821,11 @@ pub ferx_core::estimation::outer_optimizer::OuterResult::ofv: f64
 pub ferx_core::estimation::outer_optimizer::OuterResult::optimizer_stop: core::option::Option<alloc::string::String>
 pub ferx_core::estimation::outer_optimizer::OuterResult::packed_estimate: core::option::Option<alloc::vec::Vec<f64>>
 pub ferx_core::estimation::outer_optimizer::OuterResult::params: ferx_core::ModelParameters
+pub ferx_core::estimation::outer_optimizer::OuterResult::saem_gradient_kernel: core::option::Option<ferx_core::SaemGradientKernelStats>
+pub ferx_core::estimation::outer_optimizer::OuterResult::saem_kernels: core::option::Option<alloc::string::String>
 pub ferx_core::estimation::outer_optimizer::OuterResult::saem_mh_accept_tail: core::option::Option<f64>
 pub ferx_core::estimation::outer_optimizer::OuterResult::saem_mu_ref_m_step_evals_saved: core::option::Option<u64>
+pub ferx_core::estimation::outer_optimizer::OuterResult::saem_n_exploration_used: core::option::Option<usize>
 pub ferx_core::estimation::outer_optimizer::OuterResult::saem_n_subjects_hmc: core::option::Option<usize>
 pub ferx_core::estimation::outer_optimizer::OuterResult::saem_objective_value: core::option::Option<f64>
 pub ferx_core::estimation::outer_optimizer::OuterResult::sir_fallback_proposal: core::option::Option<nalgebra::base::alias::DMatrix<f64>>
@@ -3082,7 +3085,11 @@ pub enum ferx_core::types::RtteClock
 pub ferx_core::types::RtteClock::Forward
 pub ferx_core::types::RtteClock::Reset
 pub enum ferx_core::types::SaemKernel
+pub ferx_core::types::SaemKernel::Hmc
 pub ferx_core::types::SaemKernel::Imh
+pub ferx_core::types::SaemKernel::Mala
+pub ferx_core::types::SaemKernel::Nonmem
+pub ferx_core::types::SaemKernel::Nuts
 pub ferx_core::types::SaemKernel::RandomWalk
 pub enum ferx_core::types::SaemMstepSolver
 pub ferx_core::types::SaemMstepSolver::Bobyqa
@@ -3615,16 +3622,29 @@ pub ferx_core::types::FitOptions::saem_conddist: bool
 pub ferx_core::types::FitOptions::saem_conddist_burnin: usize
 pub ferx_core::types::FitOptions::saem_conddist_keep_samples: bool
 pub ferx_core::types::FitOptions::saem_conddist_nsamp: usize
+pub ferx_core::types::FitOptions::saem_exploration_max: usize
+pub ferx_core::types::FitOptions::saem_exploration_min: usize
+pub ferx_core::types::FitOptions::saem_iaccept: f64
 pub ferx_core::types::FitOptions::saem_imh_defensive: f64
 pub ferx_core::types::FitOptions::saem_imh_min_obs_per_eta: f64
 pub ferx_core::types::FitOptions::saem_imh_proposals: usize
 pub ferx_core::types::FitOptions::saem_imh_refresh: usize
+pub ferx_core::types::FitOptions::saem_isample_hmc: core::option::Option<usize>
+pub ferx_core::types::FitOptions::saem_isample_imh: core::option::Option<usize>
+pub ferx_core::types::FitOptions::saem_isample_m1: core::option::Option<usize>
+pub ferx_core::types::FitOptions::saem_isample_m1b: core::option::Option<usize>
+pub ferx_core::types::FitOptions::saem_isample_m2: core::option::Option<usize>
+pub ferx_core::types::FitOptions::saem_isample_m3: core::option::Option<usize>
+pub ferx_core::types::FitOptions::saem_isample_mala: core::option::Option<usize>
+pub ferx_core::types::FitOptions::saem_isample_nuts: core::option::Option<usize>
 pub ferx_core::types::FitOptions::saem_kernel: ferx_core::SaemKernel
+pub ferx_core::types::FitOptions::saem_mceta: usize
 pub ferx_core::types::FitOptions::saem_mstep_damping: core::option::Option<f64>
 pub ferx_core::types::FitOptions::saem_mstep_draws: usize
 pub ferx_core::types::FitOptions::saem_mstep_solver: ferx_core::SaemMstepSolver
+pub ferx_core::types::FitOptions::saem_n_chains: usize
 pub ferx_core::types::FitOptions::saem_n_convergence: usize
-pub ferx_core::types::FitOptions::saem_n_exploration: usize
+pub ferx_core::types::FitOptions::saem_n_exploration: core::option::Option<usize>
 pub ferx_core::types::FitOptions::saem_n_leapfrog: usize
 pub ferx_core::types::FitOptions::saem_n_mh_steps: usize
 pub ferx_core::types::FitOptions::saem_ofv: ferx_core::SaemOfv
@@ -3635,6 +3655,7 @@ pub ferx_core::types::FitOptions::saem_omega_burnin: usize
 pub ferx_core::types::FitOptions::saem_scale_adaptation: ferx_core::ScaleAdaptation
 pub ferx_core::types::FitOptions::saem_scale_deadband: core::option::Option<(f64, f64)>
 pub ferx_core::types::FitOptions::saem_seed: core::option::Option<u64>
+pub ferx_core::types::FitOptions::saem_smoothing_exponent: f64
 pub ferx_core::types::FitOptions::scale_params: bool
 pub ferx_core::types::FitOptions::sir: bool
 pub ferx_core::types::FitOptions::sir_df: f64
@@ -3782,8 +3803,11 @@ pub ferx_core::types::FitResult::reader_settings: core::option::Option<ferx_core
 pub ferx_core::types::FitResult::residual_correlation_fixed: alloc::vec::Vec<bool>
 pub ferx_core::types::FitResult::residual_correlations: alloc::vec::Vec<ferx_core::ResidualCorrelation>
 pub ferx_core::types::FitResult::restored_from_checkpoint: bool
+pub ferx_core::types::FitResult::saem_gradient_kernel: core::option::Option<ferx_core::SaemGradientKernelStats>
+pub ferx_core::types::FitResult::saem_kernels: core::option::Option<alloc::string::String>
 pub ferx_core::types::FitResult::saem_mh_accept_tail: core::option::Option<f64>
 pub ferx_core::types::FitResult::saem_mu_ref_m_step_evals_saved: core::option::Option<u64>
+pub ferx_core::types::FitResult::saem_n_exploration_used: core::option::Option<usize>
 pub ferx_core::types::FitResult::saem_n_subjects_hmc: core::option::Option<usize>
 pub ferx_core::types::FitResult::saem_objective: core::option::Option<ferx_core::SaemObjective>
 pub ferx_core::types::FitResult::saem_seed: core::option::Option<u64>
@@ -4059,6 +4083,13 @@ pub fn ferx_core::RuvMagnitude::has_exponent(&self) -> bool
 pub fn ferx_core::RuvMagnitude::is_active(&self) -> bool
 impl core::fmt::Debug for ferx_core::RuvMagnitude
 pub fn ferx_core::RuvMagnitude::fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+pub struct ferx_core::types::SaemGradientKernelStats
+pub ferx_core::types::SaemGradientKernelStats::declined: u64
+pub ferx_core::types::SaemGradientKernelStats::divergences: u64
+pub ferx_core::types::SaemGradientKernelStats::mean_accept: core::option::Option<f64>
+pub ferx_core::types::SaemGradientKernelStats::mean_leapfrog: f64
+pub ferx_core::types::SaemGradientKernelStats::median_step_size: f64
+pub ferx_core::types::SaemGradientKernelStats::transitions: u64
 pub struct ferx_core::types::SaemObjective
 pub ferx_core::types::SaemObjective::foce_ofv: f64
 pub ferx_core::types::SaemObjective::kind: ferx_core::SaemOfv
@@ -4700,7 +4731,11 @@ pub enum ferx_core::RtteClock
 pub ferx_core::RtteClock::Forward
 pub ferx_core::RtteClock::Reset
 pub enum ferx_core::SaemKernel
+pub ferx_core::SaemKernel::Hmc
 pub ferx_core::SaemKernel::Imh
+pub ferx_core::SaemKernel::Mala
+pub ferx_core::SaemKernel::Nonmem
+pub ferx_core::SaemKernel::Nuts
 pub ferx_core::SaemKernel::RandomWalk
 pub enum ferx_core::SaemMstepSolver
 pub ferx_core::SaemMstepSolver::Bobyqa
@@ -5512,16 +5547,29 @@ pub ferx_core::FitOptions::saem_conddist: bool
 pub ferx_core::FitOptions::saem_conddist_burnin: usize
 pub ferx_core::FitOptions::saem_conddist_keep_samples: bool
 pub ferx_core::FitOptions::saem_conddist_nsamp: usize
+pub ferx_core::FitOptions::saem_exploration_max: usize
+pub ferx_core::FitOptions::saem_exploration_min: usize
+pub ferx_core::FitOptions::saem_iaccept: f64
 pub ferx_core::FitOptions::saem_imh_defensive: f64
 pub ferx_core::FitOptions::saem_imh_min_obs_per_eta: f64
 pub ferx_core::FitOptions::saem_imh_proposals: usize
 pub ferx_core::FitOptions::saem_imh_refresh: usize
+pub ferx_core::FitOptions::saem_isample_hmc: core::option::Option<usize>
+pub ferx_core::FitOptions::saem_isample_imh: core::option::Option<usize>
+pub ferx_core::FitOptions::saem_isample_m1: core::option::Option<usize>
+pub ferx_core::FitOptions::saem_isample_m1b: core::option::Option<usize>
+pub ferx_core::FitOptions::saem_isample_m2: core::option::Option<usize>
+pub ferx_core::FitOptions::saem_isample_m3: core::option::Option<usize>
+pub ferx_core::FitOptions::saem_isample_mala: core::option::Option<usize>
+pub ferx_core::FitOptions::saem_isample_nuts: core::option::Option<usize>
 pub ferx_core::FitOptions::saem_kernel: ferx_core::SaemKernel
+pub ferx_core::FitOptions::saem_mceta: usize
 pub ferx_core::FitOptions::saem_mstep_damping: core::option::Option<f64>
 pub ferx_core::FitOptions::saem_mstep_draws: usize
 pub ferx_core::FitOptions::saem_mstep_solver: ferx_core::SaemMstepSolver
+pub ferx_core::FitOptions::saem_n_chains: usize
 pub ferx_core::FitOptions::saem_n_convergence: usize
-pub ferx_core::FitOptions::saem_n_exploration: usize
+pub ferx_core::FitOptions::saem_n_exploration: core::option::Option<usize>
 pub ferx_core::FitOptions::saem_n_leapfrog: usize
 pub ferx_core::FitOptions::saem_n_mh_steps: usize
 pub ferx_core::FitOptions::saem_ofv: ferx_core::SaemOfv
@@ -5532,6 +5580,7 @@ pub ferx_core::FitOptions::saem_omega_burnin: usize
 pub ferx_core::FitOptions::saem_scale_adaptation: ferx_core::ScaleAdaptation
 pub ferx_core::FitOptions::saem_scale_deadband: core::option::Option<(f64, f64)>
 pub ferx_core::FitOptions::saem_seed: core::option::Option<u64>
+pub ferx_core::FitOptions::saem_smoothing_exponent: f64
 pub ferx_core::FitOptions::scale_params: bool
 pub ferx_core::FitOptions::sir: bool
 pub ferx_core::FitOptions::sir_df: f64
@@ -5679,8 +5728,11 @@ pub ferx_core::FitResult::reader_settings: core::option::Option<ferx_core::Reade
 pub ferx_core::FitResult::residual_correlation_fixed: alloc::vec::Vec<bool>
 pub ferx_core::FitResult::residual_correlations: alloc::vec::Vec<ferx_core::ResidualCorrelation>
 pub ferx_core::FitResult::restored_from_checkpoint: bool
+pub ferx_core::FitResult::saem_gradient_kernel: core::option::Option<ferx_core::SaemGradientKernelStats>
+pub ferx_core::FitResult::saem_kernels: core::option::Option<alloc::string::String>
 pub ferx_core::FitResult::saem_mh_accept_tail: core::option::Option<f64>
 pub ferx_core::FitResult::saem_mu_ref_m_step_evals_saved: core::option::Option<u64>
+pub ferx_core::FitResult::saem_n_exploration_used: core::option::Option<usize>
 pub ferx_core::FitResult::saem_n_subjects_hmc: core::option::Option<usize>
 pub ferx_core::FitResult::saem_objective: core::option::Option<ferx_core::SaemObjective>
 pub ferx_core::FitResult::saem_seed: core::option::Option<u64>
@@ -6090,6 +6142,13 @@ pub fn ferx_core::RuvMagnitude::has_exponent(&self) -> bool
 pub fn ferx_core::RuvMagnitude::is_active(&self) -> bool
 impl core::fmt::Debug for ferx_core::RuvMagnitude
 pub fn ferx_core::RuvMagnitude::fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+pub struct ferx_core::SaemGradientKernelStats
+pub ferx_core::SaemGradientKernelStats::declined: u64
+pub ferx_core::SaemGradientKernelStats::divergences: u64
+pub ferx_core::SaemGradientKernelStats::mean_accept: core::option::Option<f64>
+pub ferx_core::SaemGradientKernelStats::mean_leapfrog: f64
+pub ferx_core::SaemGradientKernelStats::median_step_size: f64
+pub ferx_core::SaemGradientKernelStats::transitions: u64
 pub struct ferx_core::SaemObjective
 pub ferx_core::SaemObjective::foce_ofv: f64
 pub ferx_core::SaemObjective::kind: ferx_core::SaemOfv

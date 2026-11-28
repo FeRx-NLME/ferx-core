@@ -62,18 +62,25 @@ fn ext_last(name: &str) -> HashMap<String, f64> {
 }
 
 fn fit(model: &str) -> ferx_core::types::FitResult {
+    fit_with(model, |_| {})
+}
+
+fn fit_with(
+    model: &str, edit: impl FnOnce(&mut ferx_core::types::FitOptions),
+) -> ferx_core::types::FitResult {
     let prep = ferx_core::prepare_run(
         root().join("nonmem_anchor").join(model).to_str().unwrap(),
         Some(root().join("nonmem_anchor/saem_additive_mu.csv").to_str().unwrap()),
     )
     .expect("prepare");
-    let opts = ferx_core::types::FitOptions {
+    let mut opts = ferx_core::types::FitOptions {
         verbose: false,
         // NONMEM scored these estimates with FOCEI (`METHOD=1 MAXEVAL=0`), so the oracle is the
         // FOCE/Laplace readout, not the importance-sampled default of #2973.
         saem_ofv: ferx_core::types::SaemOfv::Focei,
         ..prep.parsed.fit_options.clone()
     };
+    edit(&mut opts);
     ferx_core::fit(&prep.parsed.model, &prep.population, &prep.init_params, &opts).expect("fit")
 }
 
@@ -101,7 +108,18 @@ fn saem_additive_mu_reference_reaches_the_mle_like_nonmem_mu() {
 
     let split = fit("saem_additive_mu.ferx");
     let inline = fit("saem_additive_mu_inline.ferx");
-    let shared = fit("saem_additive_mu_shared.ferx");
+    // The control runs the pre-#2986 E-step and schedule (the random-walk kernels, 150 + 250
+    // iterations, one chain), where the margins below were measured: it shows what
+    // mu-referencing buys at a fixed budget. At the current defaults (HMC, automatic
+    // exploration, 1000 accumulation iterations, two chains) the non-mu-referenced spelling
+    // also gets close (measured 166.12, MLE + 0.30), and HMC alone at the old schedule
+    // reaches MLE + 0.024 at the default seed (Linux CI).
+    let shared = fit_with("saem_additive_mu_shared.ferx", |o| {
+        o.saem_kernel = ferx_core::types::SaemKernel::RandomWalk;
+        o.saem_n_exploration = Some(150);
+        o.saem_n_convergence = 250;
+        o.saem_n_chains = 1;
+    });
     assert!(split.ofv.is_finite() && inline.ofv.is_finite() && shared.ofv.is_finite());
     // The realised gaps, so a passing run on another platform still records its digits.
     eprintln!(
@@ -140,16 +158,19 @@ fn saem_additive_mu_reference_reaches_the_mle_like_nonmem_mu() {
     );
 
     // #2544: the inline spelling is the split one's mu-reference, so SAEM takes the same
-    // path: the estimates are asserted bit for bit, and the bounds above then hold for
-    // the inline spelling against both NONMEM streams, which are bit-identical. The OFV
-    // sums the same terms in a different association for the two spellings, so it may
-    // differ in the last bit (measured: 1 ULP, 165.82613916088266 vs …263); it is held
-    // to 1e-12 relative, which a different chain path would exceed by many orders.
+    // path, and the bounds above then hold for the inline spelling against both NONMEM
+    // streams, which are bit-identical. The two spellings compile to plans that sum the
+    // same terms in a different association, so the OFV — and, since the default E-step
+    // moves along the AD gradient (#2986), the estimates — may differ in the last bit
+    // (measured: OFV 1 ULP, 165.82613916088266 vs …263; TVE0 1 ULP on Linux x86_64). They
+    // are held to 1e-12 relative, which a different chain path would exceed by many
+    // orders.
     for (what, a, b) in [
         ("TVE0", inline.theta[0], split.theta[0]),
         ("omega2", inline.omega[(0, 0)], split.omega[(0, 0)]),
     ] {
-        assert_eq!(a.to_bits(), b.to_bits(), "inline vs split {what}: {a} vs {b}");
+        let rel = (a - b).abs() / b.abs();
+        assert!(rel < 1e-12, "inline vs split {what}: {a} vs {b} (relative {rel:e})");
     }
     let ofv_rel = (inline.ofv - split.ofv).abs() / split.ofv.abs();
     assert!(
@@ -173,6 +194,8 @@ fn saem_additive_mu_reference_reaches_the_mle_like_nonmem_mu() {
     // 0.00034 above (macOS aarch64; the default seed matches Linux x86_64 CI to the
     // printed digit). 0.05 is 4.7x below the lowest control and ~150x above the highest
     // mu-referenced fit, so it still separates the shapes on every seed measured.
+    // The control runs main's former 150 + 250 single-chain schedule (pinned above), where
+    // these numbers were measured; at the #2986 defaults it reaches MLE + 0.30.
     assert!(
         shared.ofv > mle + 0.05,
         "shared BASE = TVE0 + PLAFIX + ETA_E0 with TVE0 read elsewhere must stay off the \

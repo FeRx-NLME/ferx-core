@@ -129,7 +129,7 @@ fn a_free_exponent_is_estimated_by_every_estimator() {
         let opts = FitOptions {
             method,
             outer_maxiter: 2,
-            saem_n_exploration: 4,
+            saem_n_exploration: Some(4),
             saem_n_convergence: 4,
             imp_samples: 40,
             run_covariance_step: false,

@@ -3269,7 +3269,7 @@ mod frozen_ebe_variance {
             outer_maxiter: 0,
             run_covariance_step: false,
             verbose: false,
-            saem_n_exploration: 2,
+            saem_n_exploration: Some(2),
             saem_n_convergence: 0,
             saem_n_mh_steps: 1,
             saem_seed: Some(7),
