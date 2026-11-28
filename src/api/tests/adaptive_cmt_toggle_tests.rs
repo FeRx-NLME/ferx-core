@@ -567,6 +567,124 @@ fn adaptive_dead_lagged_dose_does_not_turn_its_compartment_on() {
     assert!(worst < 1e-4, "worst rel {worst:e}: {got:?} vs {want:?}");
 }
 
+/// The infusion twin of `adaptive_dead_lagged_dose_does_not_turn_its_compartment_on` (#2910):
+/// a dead **infusion** does not turn its compartment on either. A bolus that wrongly lands
+/// shows twice (its amount and the turn-on); a dead infusion adds nothing at its arrival, and
+/// its rate is gated separately (`active_infusions`), so the turn-on is the only thing a
+/// missing gate in `apply_prescheduled_boluses_at` would change. It needs a compartment that
+/// something else feeds: `urine`, filled by elimination. (Into `depot`, which nothing else
+/// feeds, an on and an off compartment read the same 0, so the gate could not be seen.)
+///
+/// A lagged infusion into `urine` (10 at rate 20) is recorded at 1 (ALAG3 = 4, so it would run
+/// from 5 to 5.5); `urine` goes off at 3. It is dead twice: recorded before the `EVID=3` reset
+/// at 2, and still pending at the off row at 3 (`off_at`). Deleting either conjunct of
+/// `ResetGate::live` leaves it dead, so this pins the arrival gate's call, not which conjunct
+/// (the geometry cannot split them: a reset turns `urine` back on, so the off row has to come
+/// after it and before the arrival). A monitor at 6 reads 0. The straddle: the same subject
+/// with an on row at the arrival (5) reads what a turn-on there gives, elimination from 5 to 6,
+/// and is asserted well away from 0 and below the infusion's 10, so the fixture can tell on
+/// from off and a turn-on from a delivered infusion. The on row is added beside the dead
+/// infusion, not instead of it, so the two runs share every break.
+///
+/// The infusion ends at 1.5, before the reset. One still running at 2 would make the reader
+/// shift the reset past its end (`RESET_SEGMENT_GAP`), and with it every later row: the
+/// decision at 6 would then sit before the off row's new time and read an off `urine` whatever
+/// the gate does. The premise is asserted.
+///
+/// The live side is asserted too: recorded after the off row, the same infusion turns `urine`
+/// on at its arrival (7.5), not at its record (3.5), and its 10 lands there. `urine` is a sink,
+/// so the reading is elimination from 7.5 (an on-row twin without the infusion) plus exactly
+/// 10; a turn-on at the record reads 42.5 instead. No other test reaches an infusion's turn-on
+/// (measured below).
+///
+/// Mutations measured: `gate.live` forced true in `apply_prescheduled_boluses_at` reads the
+/// twin's value at the dead arrival (bit for bit), so this test dies at the monitor; the rate
+/// gate in `active_infusions` forced true alone leaves the monitor at 0 (`urine` is still off
+/// and held there), so that assertion isolates the turn-on, not the rate, and the mutation dies
+/// at the twin's upper bound instead (it delivers the dead 10 once `urine` is on, 14.08); no
+/// turn-on for an infusion in
+/// `turn_on_at_live_arrival` kills the live side here and no other test in `--lib`.
+#[test]
+fn adaptive_dead_lagged_infusion_does_not_turn_its_compartment_on() {
+    let m = parse_model_string(&GUT.replace("  V  = TVV\n", "  V  = TVV\n  ALAG3 = 4.0\n"))
+        .expect("parse");
+    // `on_at_arrival`: an on row for `urine` at the dead infusion's arrival.
+    let rows = |on_at_arrival: bool| {
+        let mut r = vec![
+            bolus(0.0, 100.0, 1),
+            (1.0, 1, 10.0, 3, 20.0),
+            (2.0, 3, 0.0, 1, 0.0),
+            bolus(2.5, 100.0, 1),
+            off(3.0, 3),
+            obs(4.0, 2),
+        ];
+        if on_at_arrival {
+            r.push(on(5.0, 3));
+        }
+        r.push(obs(8.0, 2));
+        r
+    };
+    let base = rows(false);
+    let pop = read_pop(&csv(&base), &[]);
+    assert_eq!(pop.subjects[0].reset_times, vec![2.0], "premise: the reset is not shifted");
+
+    let monitor_at = |t: f64, rows: &[Row]| {
+        let res = run(
+            &m,
+            rows,
+            &[t],
+            vec![MonitorSpec::new("U", 3, ObserveMode::Ipred)],
+            |_: &ControllerCtx| vec![DoseAction::Hold],
+        )
+        .expect("runs and passes the frozen replay");
+        (res.decisions[0].observed_signals[0].value, res)
+    };
+    let monitor_at_6 = |rows: &[Row]| monitor_at(6.0, rows);
+    let (u, res) = monitor_at_6(&base);
+    assert_eq!(u, 0.0, "urine stays off: the dead infusion's arrival at 5 turns nothing on");
+
+    let (turned_on, _) = monitor_at_6(&rows(true));
+    // Measured on macOS arm64: 4.0822. A wrongly turned-on `urine` reads this value. Below 10:
+    // the dead infusion's 10 must not reach an on `urine` either (its rate gate).
+    assert!(
+        turned_on.is_finite() && turned_on > 1.0 && turned_on < 10.0,
+        "the straddle: a turn-on at 5 and no dead infusion mass, {turned_on}"
+    );
+
+    // The live side: the same infusion recorded after the off row (at 3.5; one recorded
+    // before it, still pending at 3, is killed by that row) turns `urine` on at its arrival
+    // (7.5) and delivers its 10 there by 8. Its reference: an on row at 7.5 and no infusion,
+    // elimination alone. `urine` is a sink, so the two differ by exactly the 10.
+    let live_rows = |infusion: bool| {
+        let mut r = vec![bolus(0.0, 100.0, 1), bolus(2.5, 100.0, 1), off(3.0, 3)];
+        r.push(if infusion { (3.5, 1, 10.0, 3, 20.0) } else { on(7.5, 3) });
+        r.extend([obs(4.0, 2), obs(8.0, 2)]);
+        r.sort_by(|a, b| a.0.total_cmp(&b.0));
+        r
+    };
+    let (live, _) = monitor_at(8.0, &live_rows(true));
+    let (elimination, _) = monitor_at(8.0, &live_rows(false));
+    let delivered = live - elimination;
+    // Measured on macOS arm64: live 13.906, elimination 3.906, a gap of 3.6e-15 from 10 (the
+    // two runs share every break). 1e-9 is 3e5× that; a turn-on at the record (3.5) adds the
+    // elimination from 3.5 to 7.5, +28.6.
+    assert!(
+        elimination.is_finite() && elimination > 1.0 && (delivered - 10.0).abs() < 1e-9,
+        "a live infusion turns urine on at its arrival (7.5): {live} = {elimination} + {delivered}"
+    );
+
+    // `central` against `predict()`, with the band of the bolus twin above (same lagged,
+    // saturating geometry).
+    let want = static_preds(&m, &base, &res);
+    let got = ipreds(&res);
+    let worst = worst_rel(&got, &want);
+    eprintln!(
+        "dead lagged infusion: on-twin {turned_on:?}, live {live:?}, delivered {delivered:?}, \
+         worst rel {worst:e}"
+    );
+    assert!(worst < 1e-4, "worst rel {worst:e}: {got:?} vs {want:?}");
+}
+
 /// Oral 1-cpt `[odes]` model with CL on a time-varying `CRCL`, so a run takes the per-event
 /// path and its verifier is `adaptive_frozen_replay_tv`.
 const GUT_CRCL: &str = crate::test_models::ODE_2;
@@ -642,7 +760,8 @@ fn adaptive_off_row_inside_an_addl_train_passes_the_replay() {
 /// r1 #1): the same `ADDL` train into `depot`, cut by an off row at 6, with a per-occasion κ
 /// on CL and three decision windows. The replay's `Ok` is the assertion: with its arrival
 /// pass on the old hand-rolled loop it applied the doses at 8 and 12 and the verifier
-/// refused the run (measured in review: 60.77 against 84.64).
+/// refused the run at the observation at 9: `reactive=68.75, static=93.74` (measured on
+/// macOS arm64 at 47d197b46, the replay-only mutation on this fixture; #2910).
 ///
 /// There is no `predict()` twin here, as in `adaptive_cmt_toggle_under_iov_passes_the_replay`:
 /// the κ of each window is drawn inside the run. The uncut twin runs on the same seed, so

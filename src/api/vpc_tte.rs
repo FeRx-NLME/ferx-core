@@ -143,7 +143,7 @@ pub struct TteVpcStratum {
     /// The observed Kaplan–Meier curve with its Nelson–Aalen cumulative hazard.
     pub observed: KmCurve,
     pub grid: Vec<f64>,
-    /// The observed curve on the grid (`None` past its last time unless it reached 0).
+    /// The observed curve on the grid (`None` past its last time, also where it reached 0).
     pub obs_on_grid: Vec<Option<f64>>,
     pub lo: Vec<Option<f64>>,
     pub med: Vec<Option<f64>>,
@@ -162,7 +162,8 @@ pub struct TteVpc {
     pub probs: [f64; 3],
     pub censoring: VpcCensoring,
     pub strata: Vec<TteVpcStratum>,
-    /// The simulator's warnings (a degenerate hazard draw, a failed ODE solve, …).
+    /// The simulator's warnings (a degenerate hazard draw, a failed ODE solve, …), then
+    /// `W_VPC_EMPTY_STRATUM` per stratum with no band at any grid time.
     pub warnings: Vec<String>,
 }
 
@@ -244,11 +245,14 @@ pub(super) fn horizon_and_cut(rows: &mut [ObsRow], sim_horizon: Option<f64>) -> 
 /// the function the caller called. [`vpc_rtte`](super::vpc_rtte) shares the endpoint,
 /// record, strata and grid helpers below, and [`vpc_kmmc`](super::vpc_kmmc) also the
 /// observed rows, the horizon and its cut ([`horizon_and_cut`]) and the replicate loop.
+/// [`vpc_cif`](super::vpc_cif) shares the record, strata, grid and censoring helpers and
+/// the cut, but resolves its causes and reads its rows itself.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum Entry {
     Tte,
     Rtte,
     Kmmc,
+    Cif,
 }
 
 impl std::fmt::Display for Entry {
@@ -257,6 +261,7 @@ impl std::fmt::Display for Entry {
             Entry::Tte => "vpc_tte",
             Entry::Rtte => "vpc_rtte",
             Entry::Kmmc => "vpc_kmmc",
+            Entry::Cif => "vpc_cif",
         })
     }
 }
@@ -285,6 +290,48 @@ pub(super) fn replicate_censoring(
     }
 }
 
+/// How every replicate draw is censored: under [`VpcCensoring::Observed`] at the subject's
+/// censoring time from [`replicate_censoring`] (its stratum's `G`, a uniform keyed by
+/// `(seed, sim, row index)`), under [`VpcCensoring::Horizon`] not at all. The one
+/// implementation [`vpc_tte`], [`vpc_kmmc`](super::vpc_kmmc) and
+/// [`vpc_cif`](super::vpc_cif) share, so with one cause `vpc_cif` draws `vpc_tte`'s
+/// replicates bit for bit.
+pub(super) struct ReplicateCensor {
+    censoring: VpcCensoring,
+    rule: TteCensorRule,
+    seed: u64,
+    /// The censoring distribution of each stratum.
+    g: Vec<KmCurve>,
+    horizon: f64,
+}
+
+impl ReplicateCensor {
+    pub(super) fn new(
+        censoring: VpcCensoring, rule: TteCensorRule, seed: Option<u64>, rows: &[ObsRow],
+        n_strata: usize, horizon: f64,
+    ) -> Self {
+        let g = (0..n_strata)
+            .map(|k| censoring_curve(rows.iter().filter(|r| r.stratum == k)))
+            .collect();
+        let seed = seed.unwrap_or_else(rand::random);
+        ReplicateCensor { censoring, rule, seed, g, horizon }
+    }
+
+    /// Replicate `sim`'s (1-based) draw `(t, observed)` for the subject of observed row `i`.
+    pub(super) fn apply(
+        &self, sim: usize, i: usize, row: &ObsRow, t: f64, observed: bool,
+    ) -> (f64, bool) {
+        match self.censoring {
+            VpcCensoring::Observed => {
+                let u = censoring_uniform(self.seed, sim, i);
+                let c = replicate_censoring(self.rule, row, &self.g[row.stratum], u, self.horizon);
+                post_censor(t, observed, c)
+            }
+            VpcCensoring::Horizon => (t, observed),
+        }
+    }
+}
+
 /// One stratum of one replicate: the post-censored `(time, event)` of each simulated
 /// subject, and the index into the observed rows of the subject each came from.
 #[derive(Debug, Clone, Default)]
@@ -309,9 +356,7 @@ pub(super) fn simulate_replicates(
 
     let by_id: HashMap<&str, (usize, &ObsRow)> =
         rows.iter().enumerate().map(|(i, r)| (r.id.as_str(), (i, r))).collect();
-    let g: Vec<KmCurve> =
-        (0..n_strata).map(|k| censoring_curve(rows.iter().filter(|r| r.stratum == k))).collect();
-    let seed = opts.sim.seed.unwrap_or_else(rand::random);
+    let censor = ReplicateCensor::new(opts.censoring, rule, opts.sim.seed, rows, n_strata, horizon);
     let mut reps: Vec<Vec<RepStratum>> = vec![vec![RepStratum::default(); n_strata]; opts.n_sim];
     for SimulationResult { sim, id, cmt: rc, outcome, .. } in &out.results {
         let SimOutcome::Event { time, observed } = outcome else {
@@ -323,14 +368,7 @@ pub(super) fn simulate_replicates(
         let Some(&(i, row)) = by_id.get(id.as_str()) else {
             continue;
         };
-        let (t, e) = match opts.censoring {
-            VpcCensoring::Observed => {
-                let u = censoring_uniform(seed, *sim, i);
-                let c = replicate_censoring(rule, row, &g[row.stratum], u, horizon);
-                post_censor(*time, *observed, c)
-            }
-            VpcCensoring::Horizon => (*time, *observed),
-        };
+        let (t, e) = censor.apply(*sim, i, row, *time, *observed);
         let slot = &mut reps[sim - 1][row.stratum];
         slot.times.push(t);
         slot.events.push(e);
@@ -340,7 +378,7 @@ pub(super) fn simulate_replicates(
 }
 
 pub(super) fn refuse(message: String) -> EngineError {
-    super::entry_refusals::vpc_tte_input(message)
+    crate::entry_refusals::vpc_tte_input(message)
 }
 
 /// The option checks both entry points make: the band probabilities, enough
@@ -362,6 +400,12 @@ pub(super) fn check_band_options(
         )));
     }
     if let VpcGrid::Times(t) = grid {
+        // An empty grid would leave every stratum vacuously without a band (#2947).
+        if t.is_empty() {
+            return Err(refuse(format!(
+                "{who}: the grid is empty. Give at least one grid time, or use VpcGrid::Auto."
+            )));
+        }
         if let Some(bad) = t.iter().find(|t| !(t.is_finite() && **t >= 0.0)) {
             return Err(refuse(format!(
                 "{who}: grid time {bad} is not a finite, non-negative number."
@@ -380,11 +424,7 @@ pub(super) fn resolve_cmt(
     let tte = model.tte_cmts();
     let list = tte.iter().map(usize::to_string).collect::<Vec<_>>().join(", ");
     let c = match (cmt, tte.as_slice()) {
-        (_, []) => {
-            return Err(refuse(format!(
-                "{who}: the model declares no TTE endpoint ([event_model])."
-            )))
-        }
+        (_, []) => return Err(no_tte_endpoint(who)),
         (Some(c), _) if !tte.contains(&c) => {
             return Err(refuse(format!(
                 "{who}: `cmt = {c}` is not a TTE endpoint. The model's TTE endpoints are on \
@@ -399,13 +439,15 @@ pub(super) fn resolve_cmt(
                 Entry::Tte => {
                     " Under competing risks 1 − KM of one cause is not its cumulative \
                      incidence: the curve is that cause's survival with the other causes as \
-                     censoring."
+                     censoring. `vpc_cif` draws the cumulative incidence of every cause."
                 }
                 Entry::Kmmc => {
                     " Under competing risks the risk set of one cause holds the subjects \
-                     free of every cause, so the other causes act as censorings."
+                     free of every cause, so the other causes act as censorings. `vpc_cif` \
+                     draws the cumulative incidence of every cause."
                 }
-                Entry::Rtte => "",
+                // `vpc_cif` takes every TTE endpoint and never resolves one `cmt`.
+                Entry::Rtte | Entry::Cif => "",
             };
             return Err(refuse(format!(
                 "{who}: the model has TTE endpoints on cmt {list}; set `cmt` to the one to \
@@ -413,11 +455,7 @@ pub(super) fn resolve_cmt(
             )));
         }
     };
-    let repeated = matches!(
-        model.endpoints.get(&c),
-        Some(EndpointLikelihood::Tte { recurrence: TteRecurrence::Repeated { .. }, .. })
-    );
-    match (who, repeated) {
+    match (who, is_repeated(model, c)) {
         (Entry::Tte, true) => Err(refuse(format!(
             "{who}: cmt {c} is a repeated-events (RTTE) endpoint. Use `vpc_rtte` for its \
              Kaplan–Meier and mean-cumulative-function VPC."
@@ -433,6 +471,19 @@ pub(super) fn resolve_cmt(
         ))),
         _ => Ok(c),
     }
+}
+
+/// Whether `cmt` is a repeated-events (RTTE) endpoint of `model`.
+pub(super) fn is_repeated(model: &CompiledModel, cmt: usize) -> bool {
+    matches!(
+        model.endpoints.get(&cmt),
+        Some(EndpointLikelihood::Tte { recurrence: TteRecurrence::Repeated { .. }, .. })
+    )
+}
+
+/// The refusal for a model with no TTE endpoint.
+pub(super) fn no_tte_endpoint(who: Entry) -> EngineError {
+    refuse(format!("{who}: the model declares no TTE endpoint ([event_model])."))
 }
 
 /// The refusal for a subject id that is in the population twice.
@@ -474,6 +525,7 @@ pub(super) fn checked_record(
                 Entry::Tte => "A Kaplan–Meier curve needs",
                 Entry::Kmmc => "A Kaplan–Meier mean covariate needs",
                 Entry::Rtte => "The repeated-events curves need",
+                Entry::Cif => "A cumulative incidence curve needs",
             };
             Err(refuse(format!(
                 "{who}: subject {id} has an interval-censored record on cmt {cmt}. {needs} \
@@ -630,6 +682,68 @@ pub(super) fn stratum_grid<'a>(
     g
 }
 
+/// `W_VPC_EMPTY_STRATUM` when stratum `label` has no band at any grid time, else
+/// `None`. A band point is `None` exactly when fewer than `min_curves_for(probs)`
+/// replicate curves are defined there, so the gate is `max(n_used) < need`. `rep_times`
+/// holds one slice per replicate curve (the same argument [`stratum_grid`] takes), and
+/// `at_risk` is [`vpc_kmmc`](super::vpc_kmmc)'s `(n_subjects, min_at_risk)`.
+///
+/// The message names the first reason that applies: the at-risk floor, then every grid
+/// time past the last time of every replicate curve, then too few curves. "Past
+/// follow-up" is read from the replicate times, never from `n_used == 0`: a
+/// `vpc_kmmc` stratum has no curve defined inside follow-up once its risk sets fall
+/// below `min_at_risk` (#2947 plan, probe P3).
+pub(super) fn empty_stratum_warning<'a>(
+    who: Entry, label: &str, grid: &[f64], n_used: &[usize], probs: [f64; 3],
+    rep_times: impl Iterator<Item = &'a [f64]>, at_risk: Option<(usize, usize)>,
+) -> Option<String> {
+    let (need, most) = (min_curves_for(probs), n_used.iter().copied().max().unwrap_or(0));
+    if most >= need {
+        return None;
+    }
+    let (n_sim, latest) = rep_times
+        .fold((0, f64::NEG_INFINITY), |(n, l), t| (n + 1, t.last().map_or(l, |&x| l.max(x))));
+    // #3107: only a Kaplan–Meier curve ends on reaching 0.
+    let zero = if who == Entry::Tte {
+        " A Kaplan–Meier curve ends at its last time, also where it has reached 0."
+    } else {
+        ""
+    };
+    let why = match at_risk {
+        Some((n, m)) if n < m => format!(
+            " It has {n} subjects, fewer than `min_at_risk = {m}`, so no risk set reaches the \
+             at-risk floor. Lower `min_at_risk`, or use larger strata."
+        ),
+        // The grid is sorted (`stratum_grid`), so its first time is past `latest` only
+        // when every time is.
+        _ if grid.first().is_some_and(|&t| t > latest) => format!(
+            " Every grid time is past the last time of every replicate curve; the latest is \
+             {latest}.{zero} Grid times after {latest} can never have a band."
+        ),
+        _ => {
+            let floor = at_risk.map_or(String::new(), |(_, m)| {
+                format!(
+                    " A replicate curve counts at a time only while at least `min_at_risk = \
+                     {m}` subjects are at risk there."
+                )
+            });
+            format!(
+                " At most {most} of the {n_sim} replicate curves are defined at any grid time, \
+                 and a band point needs {need}.{zero}{floor}"
+            )
+        }
+    };
+    Some(format!("W_VPC_EMPTY_STRATUM: stratum `{label}` has no band at any grid time.{why}"))
+}
+
+/// The `W_VPC_EMPTY_STRATUM` entries of a result's warnings, for the three drivers'
+/// tests. The simulator drains a process-wide sink, so a test asserts on its own code,
+/// never on `is_empty()`.
+#[cfg(test)]
+pub(super) fn empty_stratum_warnings(w: &[String]) -> Vec<&str> {
+    w.iter().map(String::as_str).filter(|s| s.starts_with("W_VPC_EMPTY_STRATUM")).collect()
+}
+
 /// A Kaplan–Meier VPC for one single-event TTE endpoint.
 ///
 /// Simulates `opts.n_sim` replicates of `population` under `params` with one
@@ -658,7 +772,7 @@ pub fn vpc_tte(
     let horizon = horizon_and_cut(&mut rows, opts.sim.horizon);
 
     let n_strata = values.len();
-    let (reps, warnings) = simulate_replicates(
+    let (reps, mut warnings) = simulate_replicates(
         model,
         population,
         params,
@@ -687,6 +801,15 @@ pub fn vpc_tte(
             curves.iter().map(|c| c.time.as_slice()),
         );
         let band = vpc_band(&curves, &grid, probs).map_err(|e| refuse(format!("vpc_tte: {e}")))?;
+        warnings.extend(empty_stratum_warning(
+            Entry::Tte,
+            &label,
+            &grid,
+            &band.n_used,
+            probs,
+            curves.iter().map(|c| c.time.as_slice()),
+            None,
+        ));
         strata.push(TteVpcStratum {
             label,
             value,

@@ -294,10 +294,10 @@ fn simulate_surfaces_ss_nonconvergence_warning_when_no_steady_state() {
 }
 
 /// The blocking-bug regression (#874 review): `n_starts` defaults to `1`, so a plain `fit()` takes
-/// the single-start fast path — which must drain the SS non-convergence sink into
-/// `FitResult.warnings`, not just the multi-start arm. A couple of outer iterations run enough
-/// objective prediction passes to populate the sink; no convergence loop is needed (Tier-2), and
-/// covariance is off to keep it quick.
+/// the single-start fast path, which must report an SS non-convergence note in
+/// `FitResult.warnings`, not just the multi-start arm. A fit reports the notes of its pass at the
+/// estimates (#1522), so it is evaluated at the start, where `VMAX = 10` is below the mean input
+/// `100/8`; covariance is off to keep it quick.
 #[test]
 fn fit_surfaces_ss_nonconvergence_warning_for_over_capacity_dosing() {
     // Serialize against the other SS tests in this binary (#1113).
@@ -307,7 +307,7 @@ fn fit_surfaces_ss_nonconvergence_warning_for_over_capacity_dosing() {
         .expect("dataset loads");
 
     let mut opts = parsed.fit_options;
-    opts.outer_maxiter = 2;
+    opts.outer_maxiter = 0;
     opts.run_covariance_step = false;
 
     let result = fit(&model, &population, &model.default_params, &opts).expect("fit returns Ok");
@@ -316,6 +316,33 @@ fn fit_surfaces_ss_nonconvergence_warning_for_over_capacity_dosing() {
         result.warnings.iter().any(|w| w.contains("Steady-state (SS=1) equilibration")),
         "default single-start fit() must surface the SS non-convergence warning to \
          FitResult.warnings; got: {:?}",
+        result.warnings
+    );
+}
+
+/// The negative twin of the test above (#1522): the same model after two outer iterations. The
+/// search leaves the start, where `VMAX = 10` is below the mean input `100/8`, for estimates
+/// whose `VMAX` is above it, so they have a steady state and the fit reports no note, though
+/// the first probes of its search had none. Together the pair straddles the gate (start
+/// without a steady state, estimates with one); reporting the run's sink instead of the pass at
+/// the estimates fails this one. The `VMAX` assertion keeps the straddle from turning into a
+/// tautology if two iterations stop travelling that far.
+#[test]
+fn fit_reports_no_ss_note_when_its_estimates_have_a_steady_state() {
+    let parsed = parse_full_model(SS_MM_NO_STEADY_STATE_MODEL).expect("model parses");
+    let population = read_nonmem_csv(std::path::Path::new("data/ss_first_order.csv"), None, None)
+        .expect("dataset loads");
+    let mut opts = parsed.fit_options;
+    opts.outer_maxiter = 2;
+    opts.run_covariance_step = false;
+
+    let result = fit(&parsed.model, &population, &parsed.model.default_params, &opts)
+        .expect("fit returns Ok");
+
+    assert!(result.theta[0] > 100.0 / 8.0, "VMAX {} has no steady state", result.theta[0]);
+    assert!(
+        !has_ss_note(&result.warnings),
+        "the estimates have a steady state, so the fit reports none; got: {:?}",
         result.warnings
     );
 }
@@ -338,7 +365,7 @@ fn concurrent_fits_each_report_only_their_own_ss_notes() {
         .expect("dataset loads");
     let notes = |parsed: &ferx_core::types::ParsedModel| -> Vec<String> {
         let mut opts = parsed.fit_options.clone();
-        opts.outer_maxiter = 3;
+        opts.outer_maxiter = 0;
         opts.run_covariance_step = false;
         let r = fit(&parsed.model, &population, &parsed.model.default_params, &opts)
             .expect("fit returns Ok");

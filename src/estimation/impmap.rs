@@ -4902,7 +4902,7 @@ mod tests {
         let mu_k = compute_mu_k(&model, &p.theta, true);
         let sweep = |mode| {
             let opts = FitOptions { inner_optimizer: mode, ..Default::default() };
-            crate::api::with_fit_scope(&opts, || {
+            crate::pool::with_fit_scope(&opts, || {
                 run_map_multistart(&model, &pop, p, max_iter, tol, None, &mu_k, 0, 1, 0).3
             })
             .expect("the scope builds")

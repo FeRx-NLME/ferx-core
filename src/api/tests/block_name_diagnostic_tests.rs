@@ -361,3 +361,30 @@ fn a_quoted_line_cannot_claim_the_block_variance_only_code() {
         d.suggestion
     );
 }
+
+/// `ferx check` reports a dropped `0 FIX` placeholder under its own code, `W_ZERO_FIX_ETA_DROPPED`
+/// (#3150), and the same model written without the placeholder reports nothing of the kind.
+#[test]
+fn check_reports_a_dropped_zero_fix_placeholder() {
+    use std::io::Write;
+    let codes = |placeholder: &str| {
+        let src = format!(
+            "[parameters]\n  theta TVCL(4.0, 0.1, 100.0)\n  theta TVV(12.0, 1.0, 500.0)\n  \
+             omega ETA_CL ~ 0.15\n{placeholder}  sigma PROP ~ 0.1 (sd)\n[individual_parameters]\n  \
+             CL = TVCL * exp(ETA_CL{})\n  V = TVV\n[structural_model]\n  pk one_cpt_iv(cl=CL, v=V)\n\
+             [error_model]\n  DV ~ proportional(PROP)\n",
+            if placeholder.is_empty() { "" } else { " + ETA_Z" }
+        );
+        let mut f = tempfile::Builder::new().suffix(".ferx").tempfile().unwrap();
+        f.write_all(src.as_bytes()).unwrap();
+        let report = crate::api::validate_model_file(f.path().to_str().unwrap(), None);
+        report.diagnostics.into_iter().map(|d| (d.code, d.severity)).collect::<Vec<_>>()
+    };
+    let with = codes("  omega ETA_Z ~ 0.0 FIX\n");
+    assert!(
+        with.iter().any(|(c, s)| c == "W_ZERO_FIX_ETA_DROPPED" && *s == crate::Severity::Warning),
+        "{with:?}"
+    );
+    let without = codes("");
+    assert!(!without.iter().any(|(c, _)| c == "W_ZERO_FIX_ETA_DROPPED"), "{without:?}");
+}

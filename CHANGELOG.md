@@ -23,6 +23,5838 @@ section of the SDLC for the versioning policy).
 
 ## [Unreleased]
 
+## [0.5.0] - 2026-11-28
+
+**Licensing changes in this release** (#3181, #3183, #3184).
+
+- **ferx-search is new, and LGPL-3.0-or-later.** The model-search tools (`search`,
+  `modelsearch`, `covsearch`, `iivsearch`, `iovsearch`, `ruvsearch`, `allometry`, `amd`,
+  `globalsearch`) moved out of `ferx-tools` into the new `ferx-search` crate (#3185), which
+  is licensed LGPL-3.0-or-later from this, its first release (#3183). The crate follows
+  the behaviour of Pharmpy (LGPL-3.0-or-later); its `NOTICE` records the provenance audit.
+- **Everything else stays MIT.** `ferx-core` and `ferx-tools` (bootstrap, GAM screening,
+  `run_in_lanes`) are MIT and never depend on `ferx-search`, so they can be used and
+  embedded under MIT alone. The `ferx-cli` source is MIT too, but its default-on `search`
+  feature pulls in `ferx-search`, so the default `ferx` binary has an LGPL component (below).
+- **Earlier releases stay MIT.** The search code shipped under MIT inside `ferx-tools` up to
+  and including 0.4.0, and those releases keep that license. They are not yanked from
+  crates.io: yanking would not withdraw the grant and would break pinned builds.
+- **The `ferx` binary carries both.** It links `ferx-search` (unless built with
+  `--no-default-features`, #3187) and NLopt's LGPL-2.1 Luksan routines. `ferx --licenses`
+  prints every license text and third-party notice a copy must carry, and how to rebuild
+  it with a modified `ferx-search`. See the [License](https://ferx-nlme.org/ferx-core/license.html)
+  page.
+
+**Upgrading from 0.4.0.** Rust code calling the search tools now depends on `ferx-search`
+and imports them from `ferx_search::` (#3185). Other changes that can move results or stop
+existing code from compiling are flagged **breaking** in their entries below: the exact
+CV% for log-normal variances (#1858), adaptive-dosing outcome metrics scored on the latent
+signal (#946), and `fit()` honouring `FitOptions::bloq_method` (#1824). Model files that
+parsed before may now be refused where ferx used to ignore part of them; `ferx check`
+names the line.
+
+### Added
+- **A fit records the settings of the stage that produced its estimates, and `run_covariance`
+  reproduces its covariance step with default options** (#426): `FitResult::scoring_settings`
+  (a `ScoringSettings`) holds `inner_maxiter`, `inner_tol`, `inner_restarts`,
+  `mu_referencing`, `n_agq`, `inner_optimizer`, `ebe_warm_start` and the six `ode_*`
+  settings of that stage (the one that ran the inline covariance step; a trailing
+  `agq_eval_only` / `imp_eval_only` evaluator does not count), and is saved in `.fitrx`
+  (`scoring_settings`). `run_covariance` takes each of them the caller leaves at its
+  default from the record, so `run_covariance(&fit, None, None, &FitOptions::default())`
+  matches the inline step bit for bit on a fit that pinned a non-default
+  `inner_optimizer`, `inner_tol` or ODE tolerance (an explicit default cannot override a
+  non-default record; edit `fit.scoring_settings` instead). The step's own settings
+  (`covariance_method`, `fd_hessian_step`, `analytic_cov_hessian`, `cov_inner_tol`) stay
+  the caller's. `SirSettings` now carries the same record as its `scoring` field.
+- **Exact covariance step for Laplace, AGQ and FOCE with a prediction-dependent residual**
+  (#486). The R-matrix is the second derivative of the profile objective along the mode's
+  tangent, `Uᵀ∇²Ψ U` with `U = [I; dη̂/dx]`, from forward second-order passes through the
+  gradient's own recorder and kernel. Fits anchored on the exact Hessian (`method = laplace`,
+  or AGQ with the exact anchor), FOCE fits with proportional or combined error, and fits
+  with a serial residual `correlation cs|ar1|car1(RHO)` line used to take the reconverged
+  finite-difference stencil. They now get the analytic matrix (under Laplace's exact anchor,
+  for subjects with up to 8 random effects; past that the subject takes the stencil).
+- **Linear `[odes]` models are solved exactly — the `ADVAN5` equivalent** (#852): when every
+  equation is linear in the states, `ode_method = auto` (the default) propagates the system by
+  the matrix exponential instead of integrating it — exact to rounding rather than to
+  `ode_reltol`, with no stability limit on fast compartments and an exact steady state, and
+  about 35× faster on a stiff six-state model. `ode_method = linear` asserts it (a parse error
+  naming the reason on a model that cannot qualify); naming an integrator opts out. The fit
+  reports which path ran (`ode_linear_exact` in the YAML and `FitResult`).
+- **Time-to-event residuals in the sdtab** (#901): every TTE record gets a row with
+  `COXSNELL`, `MARTINGALE`, `DEVIANCE` and `PIT` at the subject's EBE, built from the
+  cumulative-hazard increment the likelihood scored for it (delayed entry, clock-forward
+  and clock-reset RTTE, competing risks). TTE rows come after the Gaussian and binary
+  rows; in Rust they are `SubjectResult::tte_rows`. Writing the sdtab of a fit restored
+  from `.fitrx` is now also refused for a model with a time-to-event endpoint, whose
+  rows the checkpoint does not keep (#911).
+- Adaptive dosing: a pre-scheduled base regimen now composes with EVID=3/4 system resets
+  under time-varying covariates and inter-occasion variability, not only on the
+  constant-covariate path. `simulate_adaptive` used to refuse that combination with
+  `E_ADAPTIVE_UNSUPPORTED`; it now runs, with the reset zeroing (or re-seeding) the state
+  and turning off a base infusion still running at it, and the frozen-replay verifier
+  checking every run (#932).
+- **Adaptive dosing: `auc_target` now works on subjects with system resets
+  (EVID=3/4)** (#943). The window AUC behind `auc_target_attainment` is integrated
+  by the reactive driver on the run's own trajectory, with a node on each side of
+  every dose, reset or infusion end, so a bolus or reset inside a decision window
+  integrates exactly; before, a mid-window bolus into the monitored compartment
+  carried a node-placement bias of up to about 1%. Values on smooth windows move by
+  up to about 1e-4 relative.
+- **Adaptive dosing: `auc_target` now works with time-varying covariates, `TIME` in
+  the PK and inter-occasion variability (`kappa`)** (#943). Each segment of a decision
+  window is integrated under the PK snapshot, κ and covariate row of the data record
+  that governs it — the snapshot its trajectory already runs under — and each grid
+  point is put on the observation scale by the `[scaling]` divisor under that κ.
+  Validated per window against new mrgsolve AUC24 references for the renal, IOV,
+  renal-IOV and loading vancomycin kits. A pre-scheduled base regimen combined with a
+  system reset under a time-varying covariate or IOV is still refused, with or
+  without `auc_target`.
+- **Per-subject dose expressions in `[adaptive_dosing]`** (#944): `start_dose`, each
+  side of `dose_bounds` and each rung of `levels` can be an expression over θ and data
+  covariates instead of a number, e.g. `start_dose = 15 * WT` and
+  `dose_bounds = [0, min(30 * WT, 4000)]`, so one block doses every patient by weight
+  or renal function. Each expression is evaluated once per subject at the first
+  decision, from the covariates in force there, and every subject's values are checked
+  before any subject runs (`E_ADAPTIVE_DOSE_VALUE`, naming the subject and the values
+  read). A state, `TIME`, an individual parameter, a random effect, a κ or `MIXNUM` is
+  refused when the model is parsed. `AdaptiveDosingSpec`'s `start_dose`, `dose_bounds`
+  and `levels` now hold `DoseValue`s (`From<f64>` converts a number). Validated against
+  mrgsolve on a weight-based vancomycin example (`examples/adaptive_vanco_mgkg.ferx`).
+- **`[adaptive_dosing]` dose expressions can read a subject's individual parameters
+  when they are known** (#944): `start_dose = 400 * CL` doses each subject whose η are
+  supplied (from a previous fit, or a table) from its own CL, evaluated at the first
+  decision with κ = 0. A subject whose η are drawn is refused
+  (`E_ADAPTIVE_DOSE_KNOWLEDGE`), since its CL is the simulated truth, with three
+  routes named: a data column carrying the known value, supplied η, or the new
+  `dose_knowledge = oracle` key. The oracle doses drawn subjects from their drawn
+  values as a perfect-information comparison arm and is never silent: those subjects
+  have `AdaptiveSubjectMetrics::dose_oracle = true` and the run warns
+  (`W_ADAPTIVE_DOSE_ORACLE`). `MIXNUM` may be read only under the oracle. An individual
+  parameter that no random effect reaches (e.g. `TVCLW = TVCL * (WT / 70)`) is known for
+  every subject and may always be read.
+- **`round_to` in `[adaptive_dosing]` puts every dose on a grid** (#944): with
+  `round_to = 250`, the start dose and the dose after each percentage step are rounded to
+  the nearest multiple of 250 (ties up), then clamped to the multiples inside
+  `dose_bounds`, and the rounded dose is carried to the next decision. A step the grid
+  absorbs is logged like a step clamped at a bound (the rule fired, the dose is
+  unchanged). `round_to` must be a finite number > 0 and cannot be combined with
+  `levels`. Bounds holding no multiple of the step, or a low bound that aligns to 0 under
+  percentage steps (a dose could round to 0 and never rise again), are refused for each
+  subject before the run (`E_ADAPTIVE_DOSE_VALUE`), and at parse time for numeric bounds.
+  New field `AdaptiveDosingSpec::round_to`. Validated against mrgsolve
+  (`examples/adaptive_vanco_mgkg_rounded.ferx`).
+- **Adaptive dosing can change the dosing interval, not only the dose** (#945):
+  `simulate_adaptive()` keeps `decision_times` as a fixed review grid and
+  consults the controller only at grid points that are due under the current
+  dosing interval. Set the starting interval with
+  `AdaptiveSimulateOptions::start_interval` and change it with the new
+  `DoseAction::SetInterval { interval }`. Points that are not due are logged as
+  the new `DecisionOutcome::NotDue` (with what the monitors read) and counted in
+  `AdaptiveSubjectMetrics::n_not_due`; each decision-log row carries the
+  interval in force. Without an interval every grid point is due, as before.
+  `DecisionOutcome`, `DecisionLogEntry`, `AdaptiveAction`, `AdaptiveRule` and
+  `AdaptiveDosingSpec` are now `#[non_exhaustive]`.
+- **The `[adaptive_dosing]` block can change the dosing interval** (#945): declare a
+  ladder with `intervals = [12, 24, 36, 48]` and `start_interval = 24`, and step it
+  from a rule with `lengthen` / `shorten`, alone or after one dose effect
+  (`when signal > 20 : decrease 25%, lengthen`). On an `at = every S …` grid each
+  interval must be a whole multiple of `S`. `simulate_adaptive_from_spec()` takes
+  the interval from the block and refuses `opts.start_interval`. New public items:
+  `AdaptiveDosingSpec::intervals` / `start_interval`, `AdaptiveRule::interval`,
+  `IntervalStep` and `AdaptiveAction::Maintain`.
+- **Parameter uncertainty in adaptive-dosing simulations** (#946):
+  `AdaptiveInputs::with_uncertainty(&fit, UncertaintySpec { method, n_draws })` draws
+  `n_draws` parameter sets (θ, Ω, σ, Ω_IOV) from the fit, with the sampler
+  `simulate_with_uncertainty` uses, and runs every subject and replicate of
+  `simulate_adaptive_with_inputs` / `simulate_adaptive_from_spec_with_inputs` under
+  each. Trajectory, ledger, decision and metrics rows carry their real `draw`, and the
+  new `AdaptiveSimulationResult::parameters` holds each draw's parameter set. The draws
+  come from a stream of their own, so draw 1 is unchanged by the number of draws, and a
+  draw at the point estimate reproduces the run without uncertainty; each draw
+  simulates new virtual patients. A θ-only dose expression stays at the point estimate
+  in every draw. The run refuses `n_draws = 0` and parameters that are not the fit's
+  estimate (`E_ADAPTIVE_OPTIONS`), an asymptotic draw from a fit without a covariance
+  matrix (`E_FIT_INPUT_MISSING`, naming the SIR remedy the fit allows), and supplied η
+  (`E_SUPPLIED_ETAS`). Messages name `(draw d, sim s)` only when uncertainty is on.
+- **Population summary of an adaptive run, with bands across parameter draws** (#946):
+  `summarize_adaptive(&result, &AdaptiveSummaryOptions)` returns, per draw, the mean and
+  median of every outcome metric and of each analyte's latent signal at every decision,
+  plus a `FractionAtLeast(a)` row for each requested threshold (e.g.
+  `pct_readings_in_window ≥ 0.8`). Each run counts equally; a run that carries no value
+  is counted in `n_missing`, never imputed. `bands` holds the quantiles of each per-draw
+  statistic across draws (default 0.05 / 0.5 / 0.95, type 7); a run with one draw has
+  none (`NotDrawn`). `prediction_intervals` holds the quantiles pooled over every run,
+  kept apart from the bands. A quantile is reported only once there are enough values
+  to resolve it (19 for 5 % / 95 %). The summary reads the result and changes nothing
+  in it.
+- **Variance decomposition of adaptive outcomes, and assay replicates** (#946):
+  `decompose_adaptive(&result)` splits the variance of each outcome metric of an adaptive
+  run into parameter-uncertainty, between-subject (BSV) and within-subject (IOV κ and
+  assay noise) layers, per subject and averaged over the population, plus a
+  between-subject line, so the lines sum to the total. Each estimate has a jackknife
+  Monte Carlo SE; a negative estimate is reported as it is, a metric missing in a run is
+  skipped and counted, and a supplied-η subject's BSV is `Supplied`.
+  `AdaptiveSimulateOptions::n_reps = R` reruns each patient `R` times with the same η and
+  fresh κ and assay noise, which the within layer needs (`R ≥ 2`); `R = 1`, the default,
+  is the run without replicates, bit for bit. The ledger, decision and metrics rows carry
+  a new `rep` tag.
+- **Controller effect as a contrast against a reference regimen** (#946): run the
+  adaptive arm and a reference arm with the same model, population and seed, then
+  `decompose_contrast(&adaptive, &reference, &labels)` gives the variance decomposition of
+  both arms and of their difference (adaptive − reference) per layer, with a paired
+  jackknife SE, and `summarize_contrast(.., &opts)` gives the population summary of both
+  arms and of the per-run differences (the mean effect per draw, its band, and the
+  interval of one patient's effect). Both refuse a pair that does not share its random
+  numbers and name what differs, read from the new `AdaptiveSimulationResult::manifest`
+  (seed, point parameters, decision grid). `AdaptiveDosingSpec::fixed_reference()` gives
+  the start dose at every due point as the reference; `AdaptiveArmLabels` names both arms.
+- **`block_sigma` now works together with inter-occasion variability (`kappa`)**
+  under `method = foce` and `focei` (#979). Such a model, for example total and
+  unbound concentrations with correlated per-endpoint residuals and a κ on CL, used
+  to be refused with `E_BLOCK_SIGMA_IOV_UNSUPPORTED`. The IOV objective and its EBE
+  search now score the full residual covariance at the estimated correlation, on
+  the analytic gradients. On a two-endpoint NONMEM anchor the objective matches to
+  5e-8. Other estimators (`saem`, `imp`, `laplace`, `vi`, `n_agq > 1`) still
+  refuse the combination.
+- **Profiled θ level blocks** (#1065): `theta PLACEBO[STUDY, TIME](0.0) profile`
+  takes a level block out of the optimizer's search. At every outer evaluation its
+  levels are solved as the exact minimiser of the FOCE/FOCEI objective over the block,
+  by Newton on the total gradient with each subject's EBE re-solved. The optimizer
+  then searches only the structural parameters, so an 800-level unstructured placebo
+  model becomes a few-dimensional fit. The OFV, the estimates and the standard errors
+  are the unprofiled fit's: the levels stay in `theta`, count in `n_parameters` and
+  BIC, and get standard errors from `covariance_method = r`, which differences the
+  profile objective with the levels re-solved at every point. A block that is not
+  read linearly with a data-only coefficient is refused (`E_PROFILE_NOT_LINEAR`), and
+  so is a combination the solve does not cover (`E_PROFILE_SCOPE`: a method other
+  than `foce` / `focei`, a non-additive residual error, a non-Gaussian endpoint,
+  `covariance_method = s` / `rsr`, …). `FitResult.profiled_blocks` and the fit YAML's
+  `theta_blocks.<name>.profiled` name the profiled blocks.
+- **Within-group residual correlation** (#1081): `correlation cs(RHO) by ARM` or
+  `correlation ar1(RHO) by ARM` in `[error_model]` correlates the residuals of the
+  rows of one subject that share the `by` value — compound symmetry, or
+  first-order autoregressive in time order — with `ρ` an ordinary θ. The
+  correlation scales the rows' own `weight =`-scaled loadings, so a weighted MBMA
+  endpoint gets `R = σ² W C W`. Fitted by `foce` / `focei`; anchored against
+  NONMEM on the naproxen MBMA to 3e-9 in OFV. See
+  `docs/model-file/residual-correlation.qmd`.
+- **Continuous-time residual correlation** (#1081): `correlation car1(RHO) by ARM`
+  correlates two rows of a block by `ρ^|Δt|`, `Δt` the time between them in the
+  data's `TIME` units (nlme's `corCAR1`), so irregularly spaced visits decay with
+  elapsed time rather than visit count. `ρ` must lie in `[0, 1)` (checked by
+  `fit()` and `simulate()`), and tied times within a block are refused. Under
+  `ar1` and `car1` a block that spans a `TIME`-restarting `EVID=3/4` reset is
+  refused (`E_RESIDUAL_CORRELATION_RESET`): add the occasion column to `by`.
+  Anchored against NONMEM on the naproxen MBMA to 3e-9 in OFV, and its estimate
+  of `ρ` to NONMEM's. See `docs/model-file/residual-correlation.qmd`.
+- **Nested variability levels below the subject** (#1082): `level NAME by COLUMN in PARENT`
+  declares a level (study inside sponsor, arm inside study, …) and `kappa … at LEVEL`
+  attaches a kappa to it, drawn once per group of that level and shared by the groups
+  inside it. Groups are nested by key, so arm labels need not be unique across studies,
+  and `weight =` stays on each kappa. All levels of a subject are integrated jointly in
+  its FOCE / FOCEI marginal, matching NONMEM's exact `ETA`-slot coding to 1e-7 in OFV.
+  One `level` is the explicit spelling of `iov_column` and fits to the same bits. In this
+  release nested models fit with `foce` / `focei`; other estimators, simulation and a
+  residual `correlation` line are refused with their own codes.
+- **Nested levels: output per level and simulation** (#1082). A fit with nested levels
+  reports each kappa's level (`FitResult.kappa_levels`; KAPPA rows print `K_ST at STUDY`,
+  the fit YAML a `level:` line), each level's estimates once per group with the group's
+  labels (`FitResult.ebe_kappas_by_level`, and one `ebes_kappa_<LEVEL>.csv` per level in
+  `.fitrx`; older bundles still load), one sdtab column per kappa with the estimate of the
+  row's group, and kappa shrinkage and the typical weight over the groups of each kappa's
+  own level rather than over arm cells. `simulate()`, `simulate_with_uncertainty()` and the
+  NPDE reference now draw each kappa once per group of its level; before, NPDE on a nested
+  fit drew an outer-level kappa once per arm. Adaptive dosing and a residual `correlation`
+  line on a nested model are still refused.
+- **Nested levels and kappa: residual correlation** (#1082). A residual
+  `correlation cs|ar1|car1(RHO) by …` line now fits on a model with `kappa`, at one
+  level or at nested levels, by FOCE and FOCEI. The marginal
+  carries every level's random effects and the line's dense `R`, and `simulate()` and
+  NPDE draw from the same nested `R`. On a nested model `by ARM` may name a level,
+  grouping by its groups nested by key; spellings a level and a data column would
+  read two ways are refused with `E_RESIDUAL_CORRELATION_GROUPING_AMBIGUOUS`. `cs` over
+  the groups of a kappa-carrying level is the kappa's own covariance and is refused
+  with `E_RESIDUAL_CORRELATION_CONFOUNDED_KAPPA`; `ar1` and `car1` are not. Where the
+  two coincide in only some subjects, the fit runs and says how many
+  (`W_RESIDUAL_CORRELATION_PARTLY_CONFOUNDED_KAPPA`). With the
+  line, a kappa model's inner and outer gradients and its R-matrix are exact (#2101).
+  `E_NESTED_LEVEL_CORRELATION_UNSUPPORTED` is retired. Validated against NONMEM on the
+  three-level `exact3` anchor to 5.7e-8 in OFV.
+- **Export a fitted DCM as a plain population PK model** (#1331): `ferx export-dcm
+  run.fitrx` (or `nn::export::export_dcm_from_fit`) writes every `[covariate_nn]`
+  block out as ordinary `[individual_parameters]` equations at the fitted weights, and
+  every other theta / omega / sigma / kappa at the fit's estimate. The result loads
+  without the `nn` feature and its networks predict exactly what the fitted networks
+  do, bit for bit. `--fixed-theta` names each weight as a FIXed theta instead of
+  inlining it; `--network-only` keeps the model file's values outside the networks.
+- **`tanh(x)` and `softplus(x)` expression functions** (#1331): usable anywhere an
+  expression is. They run the `[covariate_nn]` activations' own code, so `softplus` is
+  `x` above 20 and `exp(x)` below -20, unlike a hand-written `log(1 + exp(x))`.
+- **Opt-in f-SAEM E-step kernel for SAEM, `saem_kernel = imh`** (#1449): each
+  subject's block random-walk proposals are replaced by draws from an independent
+  Laplace proposal centred on its conditional mode (Karimi, Lavielle & Moulines
+  2020), with a small defensive prior component; the componentwise sweep still
+  runs. On a data-rich busulfan subset it improves the importance-sampled
+  −2 log L on every seed (−2.2, 6/6) and tightens the seed-to-seed spread 3.4×,
+  reaching NONMEM SAEM's level, at the random walk's CPU. When a θ carries no η,
+  pair it with `mstep_solver = score_sa` (the fit warns if it is not). New
+  options `saem_imh_proposals`, `saem_imh_refresh`, `saem_imh_defensive` and
+  `saem_imh_min_obs_per_eta`; the kernel declines (with a warning) on models
+  outside its analytic scope and on data with fewer than 2 observations per
+  subject per random effect. The default `saem_kernel = rw` is unchanged.
+- **A `[covariate_nn]` with no `init` is now warned about** (#1561): `fit()` and
+  `ferx check` report `W_NN_BARE_OUTPUT_START` when every output-layer bias starts
+  at 0, which puts every output at `softplus(0) = 0.693` whatever parameter it
+  feeds. From that start an unpenalized FOCEI fit of a two-compartment DCM reported
+  convergence at OFV −234, worse than the covariate-free point in its own model
+  (−1185); with `init` declared the same fit reached −1252. A warm start from a
+  fitted point does not trigger the warning.
+- **Adaptive dosing can simulate known patients at their own η** (#1594):
+  `SuppliedEtas::from_fit` (a fit's EBEs) or `SuppliedEtas::from_table` (your own
+  values), passed through `AdaptiveInputs::new(&params).with_etas(&etas)` to the new
+  `simulate_adaptive_with_inputs` / `simulate_adaptive_from_spec_with_inputs`.
+  Subjects are matched by ID; one without supplied η is refused (`E_SUPPLIED_ETAS`)
+  unless `.with_unmatched(UnmatchedSubjects::Draw)` draws it from Ω. A supplied η is
+  the same in every replicate (κ and a `Dv` monitor's assay are still drawn), and
+  `AdaptiveSubjectMetrics::eta_supplied` marks it. A `[mixture]` model is refused.
+  The existing entry points are unchanged.
+- **`bind_theta_levels_from_fit` binds a simulation design against a fit's level bindings**
+  (#1614), so a `theta NAME[COL, ...]` model can be simulated with its fitted θ. Pass the
+  `parsed.bindings.levels` kept from binding the fit data. Each design record gets its
+  level's position in the fit, and the fit's contrast is kept, so the θ layout is the
+  fit's. A design level the fit never observed is refused, naming the block and every
+  such label. For a block keyed on `TIME` the design can therefore only be simulated at
+  the fit's observation times. See
+  [Simulating with a fit's θ](docs/api/fitting.qmd#simulate-with-fit-theta).
+- **`bind_from_fit` binds a model to a fit's data-derived bindings in one call**
+  ([#1619](https://github.com/FeRx-NLME/ferx-core/issues/1619)). Pass the fit's
+  `data_bindings` and both halves come from the fit: the level layout, and the
+  `[covariate_model]` statistics behind `center = median` and friends. A design of heavier
+  subjects than the fit's no longer re-centres the covariate factors on its own median
+  (17% on predictions, measured). Bindings a fit cannot have written are refused: empty
+  bindings on a model that needs them, a split contrast group, a stored `auto` contrast or one
+  the block does not declare ([#1672](https://github.com/FeRx-NLME/ferx-core/issues/1672)),
+  and a missing or unread covariate statistic.
+- **A fit carries the data-derived bindings its model was compiled from**
+  ([#1621](https://github.com/FeRx-NLME/ferx-core/issues/1621)). `FitResult::data_bindings`
+  holds each `theta NAME[COL, ...]` level block's levels and contrast and the statistics
+  behind symbolic `[covariate_model]` centres (`center = median`), and `.fitrx` bundles and
+  `fit.json` save and reload them exactly. A reloaded fit can now bind a simulation
+  design without the original fit data: put its statistics into the design's bindings,
+  re-parse, then call `bind_theta_levels_from_fit` with its levels (the sequence in
+  `docs/api/fitting.qmd`). `CompiledModel::data_bindings()` reads the same value off a
+  bound model. Bundles saved earlier load with empty bindings. `bind_theta_levels_from_fit`
+  now refuses bindings that list a level twice, which previously bound silently with an
+  extra θ.
+- **`theta_level_values` reports every level of a bound level block with its value**
+  (#1623), the dependent levels included. Each `ThetaLevelValue` carries the `label`, the
+  `value` the model applies at that θ, and a `theta_index` that is `Some(k)` for a free
+  level (its position in `theta`, so its SE can be joined) and `None` for a dependent one,
+  whose value is the negated sum of its group's free θ, or `0` for a `ref` level. A θ of
+  the wrong length is refused. See
+  [Level labels and values](docs/api/fitting.qmd#level-labels-values).
+- **The compact-summary rule for large θ blocks is public** (#1623):
+  `io::output::compact_theta_blocks` and `THETA_BLOCK_COMPACT_MIN`, so a wrapper reports the
+  same blocks compactly as the fit writers. The rule is **20 or more free coefficients**;
+  the docs said "more than 20", which was off by one.
+- **Bayes reports when the conjugate mu-reference move stops working** (#1626).
+  That move is Metropolis-corrected, so a rejected draw is a valid step and the
+  sampler still targets the right posterior — which also makes a move that is
+  rejected every sweep invisible. It is not harmless: a theta this move draws is
+  excluded from the random-walk (theta, sigma) block, so nothing else proposes
+  it, and a chain that never accepts leaves that theta at its initial value. A
+  fit now warns when any chain accepted fewer than half of its post-warmup
+  draws, reporting that chain's rate beside the pooled one and naming the
+  largest group of rejections: a draw outside a declared `theta_lower` /
+  `theta_upper` box, a Metropolis rejection, or a conditional that could not be
+  formed.
+- **`simulate_with_uncertainty_diag` returns uncertainty simulations with their warnings**
+  (#1645). It returns a `SimulationOutput` whose rows are exactly what
+  `simulate_with_uncertainty` returns. Its `warnings` carry the bundle
+  `simulate_with_options_diag` reports: parse and model/data findings, data-reader findings
+  through the same filter `fit()` uses, and ODE-solver diagnostics. They also name each
+  parameter draw skipped in the flip-flop regime, which used to be dropped silently.
+- **Kappa (IOV) estimates in `format_summary()`, and a weighted kappa's weight in the fit
+  YAML** ([#1657](https://github.com/FeRx-NLME/ferx-core/issues/1657),
+  [#1660](https://github.com/FeRx-NLME/ferx-core/issues/1660)). The string summary now has a
+  `--- KAPPA (IOV) ---` section with the console's rows, including the weighted-kappa line. A
+  sample-size-weighted kappa's `omega_iov` entry adds `weight`, `weight_typical` and
+  `sd_at_typical_weight`; `variance` and `sd` are unchanged, and unweighted entries are
+  byte-identical.
+- **A fit records how it read its data and what it was given** (#1685): `FitResult` gains
+  `reader_settings` (the `[data]` renames, `[covariates]`, `iov_column` and `[data_selection]`
+  clauses the file entry points read with, caller-added filters included) and
+  `population_fingerprint` (a per-subject digest of the population `fit()` was given). Both
+  round-trip through `.fitrx` as optional keys; the format version is unchanged. `run_sir`
+  and `run_covariance` re-read `fit.data_path` with the recorded settings — so an IOV model
+  passed as `Some(model)` with `population = None` now runs — and refuse any population,
+  supplied or re-read, that is not the fitted one, naming the first subject that differs.
+  `load_fit` reads a bundled `data.csv` with the recorded settings and checks it the same way;
+  a mismatch loads the estimates without the population, with a warning.
+  New public `ReaderSettings` and `read_population_with`. A fit without the records (an older
+  `.fitrx`) is resolved as before.
+- **`layout_from_fit` lays a model out on a fit's bindings without a population**
+  ([#1703](https://github.com/FeRx-NLME/ferx-core/issues/1703)). It gives the fit's
+  θ count, names, bounds and `FIX` flags, with the same validation as `bind_from_fit`,
+  and writes nothing to any population. Use it to size a SIR or covariance skeleton.
+  `bind_from_fit` runs the same function, so the two cannot disagree on a layout.
+- **SIR reports an interval for each IOV kappa variance**
+  ([#1705](https://github.com/FeRx-NLME/ferx-core/issues/1705)). `FitResult.sir_ci_kappa`
+  carries the 95% SIR interval of each `omega_iov` diagonal (in `kappa_names` order), on both
+  `sir = true` and `run_sir`, which agree to the bit. It is printed in the console's SIR
+  block, written as `ci_kappa:` in the fit YAML's `sir:` section and saved in `.fitrx`; a model
+  with no kappa writes nothing new, and an older bundle loads with `None`. Between-arm
+  variability in an MBMA fit now gets a SIR interval like every other variance.
+- SIR now warns when its effective sample size is below 100 — the threshold the SIR docs already call a poor proposal — instead of returning intervals silently. The warning names the draw the intervals hinge on and every variance the data cannot bound away from zero (conditional ΔOFV at the variance's lower bound below 3.84), whose SIR lower limit then reflects the parameter box rather than the data. `warfarin_iov` fitted with FOCEI was returning intervals at ESS 3.5 of 1000 with no warning. `run_sir` on a fit now replaces the fit's earlier `SIR:` notes instead of keeping them beside the new result, and updates `warnings_structured` (#1723).
+- New `[fit_options] sir_scale = packed | natural` (`FitOptions::sir_scale`, `SirScale`). `natural` targets the likelihood under a flat prior on the reported scale (variances for omega/kappa, sigma as a variance), the PsN SIR convention, with the proposal re-centred on that target. Its lower limits for a variance the data cannot bound away from zero no longer depend on the parameter box (`warfarin_iov` FOCEI: SIR ESS 3.5 → 140 of 1000 draws). `packed` stays the default: for a variance informed by few groups the natural target has a heavy upper tail (the bundled MBMA placebo shape: ESS 143 → 35). `natural` is refused for a model with `prior(...)` (#1723).
+- **A fit records the settings its SIR ran under, and `run_sir` repeats it**
+  (#1758, #1713): `FitResult::sir_settings` holds the draw counts, resolved seed,
+  `sir_df`, `sir_scale` and, in `sir_settings.scoring` (#426), the inner-loop and
+  ODE solver settings the SIR draws were scored with; it is saved in `.fitrx` (`sir.settings`) and
+  summarised in the console and YAML `sir:` block. `run_sir` takes each recorded
+  setting the caller leaves at its default from the fit, so `run_sir` with
+  default options reproduces the fit's SIR bit for bit (an explicit default value
+  cannot override a non-default record; edit `fit.sir_settings` instead). It also
+  applies the recorded `inner_optimizer` / `ebe_warm_start` to the draws instead of
+  inheriting those of the last `fit()` in the process, and restores the process's own
+  afterwards. On a fit with no record (a pre-#1758 `.fitrx`), an unset `sir_seed`
+  takes the fit's `sir_seed`. A bundle whose `sir.settings` holds a value
+  `[fit_options]` would reject, or a seed that disagrees with `sir_seed`, fails to
+  load as corrupt.
+- **A `[mixture]` fit records its per-class Ω/Σ override values** (#1765):
+  `FitResult::mixture_overrides` holds the fitted `omega(k)` / `sigma(k)` values
+  (natural scale) for every estimator, SAEM included, and `.fitrx` bundles keep it
+  under the new `mixture_overrides` key (no format-version bump). `run_sir`,
+  `run_covariance` and `simulate_with_uncertainty` read it, so they now work — and
+  repeat the in-fit SIR and covariance step bit for bit — on an SAEM mixture fit
+  and on a reloaded bundle without a packed estimate, where they used to refuse.
+- **The predict, simulate and adaptive-dosing refusals now carry a code** (#1774):
+  `EngineError::code()` returns `E_ENDPOINT_TV_COVARIATE`,
+  `E_ENDPOINT_TIME_DEPENDENT_PK`, `E_READOUT_DEPOT_UNSUPPORTED`,
+  `E_CTMM_UNSUPPORTED`, `E_TTE_NOT_SIMULATABLE`, `E_SIMULATE_HORIZON`,
+  `E_PROPENSITY_INPUT`, `E_ADAPTIVE_UNSUPPORTED`, `E_ADAPTIVE_OPTIONS` or
+  `E_ADAPTIVE_SPEC` where it returned `None`, so a caller can match on the code
+  instead of the message. A missing `omega_iov` on `simulate*` now carries
+  `E_PARAM_SHAPE`, and an `[adaptive_dosing] observe` covariate missing from the data
+  `E_MISSING_COVARIATE`. The messages are unchanged.
+- **`run_sir` and `run_covariance` input refusals now carry a code** (#1774):
+  `EngineError::code()` returns `E_FIT_INPUT_MISSING` (an input neither passed nor
+  recorded on the fit, such as `fit.model_path` or SIR's covariance matrix),
+  `E_FIT_INPUT_CHANGED` (the model or data file's SHA-256 is not the fit's) or
+  `E_FIT_INPUT_MODEL` (a model that is not the fit's, including a `[mixture]` fit's
+  stale or mis-sized packed estimate, which `simulate_with_uncertainty` now codes too)
+  or `E_SIR_OPTIONS` (SIR settings it cannot run with) or `E_SIR_NOTHING_TO_SAMPLE`
+  (every parameter FIX) where it returned `None`, and
+  `E_THETA_LENGTH` for a fit whose θ is not the model's length. A failed re-read of
+  the fit's model or data file now carries the code `ferx check` reports for the same
+  file (`E_MODEL_READ`, the parse codes, `E_DATA`, `E_MISSING_COVARIATE`,
+  `E_COVARIATE_NOT_NUMERIC`). The messages are unchanged.
+- The refusals `fit()` and the file entry points raised without a `ferx check` code now
+  carry one, so a caller can match on `EngineError::code()` instead of parsing the message
+  (#1788): `E_MIXTURE_METHOD` (a `[mixture]` model with `n_agq > 1`, an estimator not
+  wired for mixtures, or Bayes with per-class overrides; `init_params` with no per-class
+  Ω/Σ is `E_PARAM_SHAPE`), `E_RTTE_RECORDS`, `E_BINARY_STATE`, `E_CTMM_RECORDS`,
+  `E_LTBS_UNSUPPORTED`, `E_IIV_ON_RUV_SHARED_ETA`,
+  `E_IIV_ON_RUV_METHOD`, `E_IOV_SINGLE_OCCASION`, `E_AGQ_GRID_TOO_LARGE` for the
+  quadrature grid under IOV, `E_DATA_PATH_MISSING`, and on `run_model_simulate()` (and
+  `ferx --simulate`) `E_MISSING_BLOCK`, `E_SIMULATION_DESIGN`, `E_MISSING_COVARIATE` and
+  `E_SIMULATE_HORIZON` for the `[simulation]` design. `ferx check` now reports the
+  mixture-method, `iiv_on_ruv` and endpoint-record refusals, and with `--data` the AGQ grid
+  under IOV and a derived `iov_occasion` with one occasion per subject (both counted on
+  the occasions the rule derives),
+  so it no longer calls a model valid that `fit()` refuses. Every message reads as before.
+- **A warning when an explicit thread count exceeds the available CPUs** (#1811).
+  A pinned `threads`, a CLI `--threads N` or a `RAYON_NUM_THREADS` pin above
+  `available_parallelism()` (which respects container CPU quotas) is still
+  honoured, but the fit now says the workers time-share the cores and how to
+  lower the count.
+- **`io::output::block_summary` is public** (#1812): the `(min, median, max)` the
+  console report, `format_summary` and the fit YAML print for each compact θ block
+  (median = lower middle value on an even count) can now be called by bindings,
+  so ferx-r's print of a collapsed block cannot drift from the engine's.
+- **`PopulationFingerprint::verify(&model, &population)`** (#1814) checks that a
+  population is the one a fit was given, with the same checks, order and
+  `E_POPULATION_MISMATCH` refusal as `run_sir()` / `run_covariance()`, for a
+  post-hoc step that re-reads the data on its own (the R wrapper's
+  `ferx_calc_npde()`). `Ok` carries a note when the fingerprint is from another
+  encoding scheme and could not be compared.
+- **`.fitrx` bundles carry the optimizer's packed estimate** (#1815): `save_fit` writes
+  `fit.json`'s new `packed_estimate` key and `load_fit` reads it back bit for bit, so
+  `run_covariance` on a reloaded FOCE / FOCEI / Laplace fit repeats the fit's inline
+  covariance step exactly instead of matching it to ~1e-5, and `run_covariance` /
+  `run_sir` on a reloaded `[mixture]` fit with a per-class override run instead of being
+  refused. The vector is used only when it unpacks bit-for-bit to the fit's reported
+  estimates: a fit whose estimates were edited after the fit is now evaluated at the
+  edited values (it used to be evaluated at the original optimum), and a `[mixture]`
+  override fit in that state is refused with a message saying so. Bundles saved before
+  this change, or written by ferx-r, load without the key and behave as before.
+- **The KAPPA (IOV) row formatter is public** (#1825): `io::output::format_kappa_rows_from`
+  prints the `--- KAPPA (IOV) Estimates ---` rows from a borrowed `KappaRowsInput`
+  (`KappaRowsInput::from_result` for a `FitResult`), so a wrapper prints the
+  engine's rows at print time instead of keeping its own copy. `KappaRowsOptions { ascii: true }`
+  spells `→` as `->` and `κ` as `kappa` for consoles without UTF-8. The CLI and
+  `format_summary` output is unchanged.
+- **The OMEGA row formatter is public** (#1859): `io::output::format_omega_rows_from`
+  prints the `--- OMEGA Estimates ---` rows from a borrowed `OmegaRowsInput`
+  (`OmegaRowsInput::from_result` for a `FitResult`), so a wrapper prints the
+  engine's rows at print time instead of keeping its own copy: the exact log-normal
+  CV%, `[FIX]` with `SE = ---`, and no CV%/SD after a failed or SIR-fallback
+  covariance step. `OmegaRowsOptions` adds, off by default, a scale tag
+  (`type_tag`), an additive ETA's CV% at its linked θ and a logit ETA's
+  `+/-1 SD = [lo, hi]` (`typical_value_spread`, reading the new
+  `EtaLinkedTheta`), and `[initial specified as SD]` (`init_as_sd`). The CLI rows
+  are unchanged. `format_summary()`'s OMEGA and SIGMA rows are now the console's
+  verbatim, so their name column widens from 16 to 20 characters, matching its
+  KAPPA rows.
+- **Individual survival curves at the fit's EBEs** (#1885): the new
+  `predict_survival_at_etas_diag` evaluates `S(t)`, `H(t)`, `h(t)`, the CIF and the
+  survival summaries at each subject's own η, supplied as a `SuppliedEtas`
+  (`SuppliedEtas::from_fit` for a fit's EBEs). `predict_survival` / `_diag` still give the
+  population (η = 0) curve. For an analytic hazard and a single-event record without
+  delayed entry, the cumulative hazard at the record's time is the one the likelihood
+  evaluated, bit for bit; an ODE-accumulated hazard agrees to the solver tolerance. Anchored against NONMEM `POSTHOC` on a joint PK-TTE model with live
+  IIV and on the exponential TTE example.
+- **Kaplan–Meier VPC for single-event TTE models** (#1886): `vpc_tte()` simulates
+  `n_sim` replicates of the observed design in one simulator call and returns, per
+  stratum, the observed Kaplan–Meier curve (with its Nelson–Aalen cumulative hazard)
+  beside the pointwise 5 %–95 % band of the replicate curves. The curve follows R
+  `survival::survfit`'s tie convention and matches it row for row; the band is R's
+  type-7 quantile over the replicates still under follow-up. Replicates are censored
+  like the data (`VpcCensoring::Observed`, the default): a subject observed censored at
+  its own time, a subject observed with an event at a time drawn from its stratum's
+  reverse Kaplan–Meier censoring distribution beyond its event time. `VpcCensoring::Horizon`
+  censors at the horizon only. Strata by covariate or first dose. Inputs the curve would be
+  wrong on are refused with `E_VPC_TTE_INPUT`: several TTE endpoints and no `cmt`,
+  repeated events, left truncation, interval censoring, too few replicates. The
+  estimator is also public as `stats::km::kaplan_meier`.
+- **VPC for repeated-events (RTTE) models** (#1886): `vpc_rtte()` simulates `n_sim`
+  replicates of the observed design and returns, per stratum, three families of observed
+  curves, each beside the pointwise 5 %–95 % band of the same curve over the replicates: the
+  mean cumulative function (the expected number of events per subject by time `t`), the
+  Kaplan–Meier curve of the time to the `k`-th event (absolute time), and the Kaplan–Meier
+  curve of the time from the `(k − 1)`-th event to the `k`-th (gap time, from order 2).
+  `max_order` sets the highest order; unset, it is the largest order that at least 10 observed
+  subjects reached. Each replicate subject is followed to its own observed follow-up end
+  (`VpcCensoring::Observed`, the default) or to the horizon. The observed curves match R
+  `survival::survfit` row for row. The mean cumulative function is also public as
+  `stats::km::mean_cumulative`. The result's `warnings` say how many subjects end on an
+  event record (`W_VPC_RTTE_ENDS_ON_EVENT`). `vpc_tte()` on a repeated-events endpoint now
+  points to `vpc_rtte()` instead of saying the VPC is not supported.
+- **Kaplan–Meier mean covariate (KMMC) VPC** (#1886): `vpc_kmmc()` checks whether a
+  single-event TTE model captures how a covariate drives the hazard. At every step of the
+  Kaplan–Meier curve it takes the mean of one baseline covariate over the subjects still at
+  risk, and returns the observed curve beside the pointwise 5 %–95 % band of the same curve
+  over `n_sim` replicates, per stratum. `VpcKmmcOptions::new("WT")` takes every `vpc_tte()`
+  option plus `level` (the share of at-risk subjects at one value, for a multi-level code) and
+  `min_at_risk` (default 10, applied to the observed curve and to each replicate). Every
+  replicate subject draws its censoring time from its stratum's censoring distribution, which
+  keeps the band at its nominal coverage where keeping the observed censoring times would
+  make it too narrow. The observed curve matches the mean over R `survival::survfit`'s risk
+  sets row for row. The curve is also public as `stats::km::kaplan_meier_mean_covariate`. A
+  covariate that changes within a subject uses each subject's first value and is reported in
+  `warnings` (`W_VPC_KMMC_TIME_VARYING_COVARIATE`).
+- `vpc_cif()`: a cumulative-incidence VPC for competing risks. Every TTE endpoint of the model is
+  a cause; per stratum it returns the observed Aalen–Johansen cumulative incidence of each cause
+  and the all-cause Kaplan–Meier curve, each beside the pointwise band of the replicates. The
+  estimator is also available on its own as `stats::cif::aalen_johansen`, with
+  `stats::cif::vpc_band_cif` for the band; it matches R's `survfit` multi-state fit row for row.
+  The `vpc_tte()` / `vpc_kmmc()` refusal for several TTE endpoints and no `cmt` now names
+  `vpc_cif()` ([#1887](https://github.com/FeRx-NLME/ferx-core/issues/1887)).
+- **npde for single-event time-to-event records** (#1889): with `npde_nsim > 0`
+  the sdtab `NPDE` and `NPD` cells of a TTE row are filled (the same number in
+  both), and `stats::npde::compute_tte_npde` computes the scores after a fit. An
+  observed event is scored by the fraction of simulated replicates with an
+  earlier event; a right-censored time is imputed between that fraction and 1.
+  Repeated events, competing risks, left truncation and interval-censored
+  records are not scored: the fit succeeds, their cells stay blank and one
+  `W_NPDE_TTE_SKIPPED` warning says why (`E_NPDE_TTE_INPUT` from the direct
+  call). A `.fitrx` bundle carries the scores in a new trailing `NPDE` column
+  of `predictions_tte.csv`, written only when a score exists; builds from
+  before this change cannot read a bundle that carries it, and bundles without
+  one are unchanged.
+- **The console report, `ferx summary` and the fit YAML now show the final gradient**
+  (#1934): a `Final gradient: |g|∞ = … (packed coordinates, source: …)` line under
+  `Converged:`, and `final_gradient_max_abs` / `final_gradient_source` in the YAML
+  `model:` block. A `converged` verdict next to a gradient far from zero is the sign of
+  a fit that stopped while still descending; until now that was only visible by
+  unpacking the `.fitrx`.
+- `imp_sobol` fit option: Sobol quasi-random importance draws for the estimating `imp`
+  method, the counterpart of IMPMAP's `impmap_sobol` (#1965).
+- **`simulate_with_uncertainty()` takes a TTE horizon** (#2003): the new
+  `SimulateUncertaintyOptions::horizon` is the administrative censoring horizon of every
+  draw, checked like `SimulateOptions::horizon`. Repeated-event (`type = rtte`) and
+  drug-driven (joint PK-TTE) models, which need a horizon and were refused on this entry
+  point, can now be simulated with parameter uncertainty. A caller that builds the options
+  with `..Default::default()` needs no change; an exhaustive struct literal needs
+  `horizon: None`.
+- **A `theta NAME[COL, …]` level block fits beside kappas at nested levels** (#2034):
+  a block whose levels each lie inside one group of a kappa-carrying level (for
+  example `PLACEBO[STUDY, TIME]` beside a kappa at `STUDY`) was refused with
+  `E_NESTED_LEVEL_THETA_BLOCK_UNSUPPORTED`. The level-block binder now measures
+  each kappa on the groups of its own level, so such a block binds or is refused
+  for the same reasons as with one level: when it absorbs the kappa, `auto` takes
+  the within-group contrast, and a contrast that leaves the kappa unidentified is
+  refused with `E_THETA_LEVEL_BINDING`, naming the level's group. The code
+  `E_NESTED_LEVEL_THETA_BLOCK_UNSUPPORTED` is no longer emitted. This also
+  covers blocks keyed on `TIME`, which the old check let through without
+  checking them.
+- **`ferx check --data` prints one row per nested level** (#2035): `W_LEVEL_SUMMARY`
+  gives each level's group count, the groups per parent (min / median / max), how
+  many parents hold a single group, and the kappas at the level. A level where only
+  some parents hold one group is identified and fits, so `E_LEVEL_SINGLE_MEMBER`
+  does not refuse it; the row is where it shows. Informational, not recorded by
+  `fit()`.
+- The input refusals that still carried no `ferx check` code now have one, so a caller
+  can match on `EngineError::code()` instead of parsing the message (#2044): ODE solver
+  settings on a hand-built `FitOptions` that no solver can run with (`ode_reltol` /
+  `ode_abstol` not finite and positive, `ode_max_steps = 0`) are `E_ODE_SOLVER_OPTIONS`
+  from `run_sir()` and `run_covariance()`; a logit-scaled θ estimated outside (0, 1) is
+  `E_LOGIT_THETA_OUT_OF_RANGE` on `[parameters]` from `simulate_with_uncertainty()`
+  (asymptotic method) and `run_sir()`, with its advice in `suggestion()`; and
+  `simulate_with_uncertainty()` refuses a covariance matrix or SIR pool the fit does not
+  carry as `E_FIT_INPUT_MISSING`, and one of the wrong size as `E_FIT_INPUT_MODEL`.
+  Every message reads as before, and `run_sir_core()` / `draw_parameter_samples()`
+  still return the same text as a `String`.
+- **Flip-flop twin seed for the inner EBE solve** (#2095): on a closed-form
+  `one_cpt_oral` model whose `V` and `KA` are each log-normal on a random effect of
+  their own, the cold inner multi-start now runs one descent from the subject's
+  flip-flop twin `(CL, V·k/ka, k)`, so a subject trapped in the shallower flip-flop
+  mode reaches the deeper one by construction rather than by the Sobol screen's
+  draws. Unimodal subjects, subjects with a dose into the central compartment
+  or with parameters that change in time, `y = ...` readouts, FREM and non-Gaussian endpoints, `init(...)` amounts
+  that read the twinned parameters, and every other model are unchanged. On by default; set
+  `inner_twin_seed = false` in `[fit_options]` to disable.
+- A `profile`d θ level block can now be fitted under `method = laplace` (at `n_agq = 1`).
+  Its levels minimise the Laplace objective the fit reports, and its covariance step
+  matches the unprofiled Laplace step. The `n_agq > 1` check is now made per stage of a
+  method chain, so `foce` with `n_agq > 1`, which ignores `n_agq`, is no longer refused.
+  Adaptive quadrature (`n_agq > 1` under `laplace` or `focei`) is still refused (#2107).
+- A `profile`d θ level block can now be fitted under adaptive quadrature (`n_agq > 1`, with
+  `method = laplace` or `focei`). Its levels minimise the stage's quadrature objective, and
+  the profiled fit reaches the unprofiled fit's optimum and standard errors (#2107).
+- **`covariance_method = s` and `rsr` on a fit with a `profile`d θ level block** (#2108):
+  both were refused with `E_PROFILE_SCOPE`. `rsr` is the unprofiled sandwich `R⁻¹SR⁻¹`,
+  with the profiled `R⁻¹`, so its structural block is the efficient-score sandwich; `s`
+  is the unprofiled `S⁻¹` over every parameter, levels included, and still needs more
+  subjects than free parameters. `run_covariance` repeats either step bit for bit, in
+  memory and after a `.fitrx` reload.
+- A `profile`d θ level block now fits together with a residual `correlation cs|ar1|car1(RHO) by …`
+  line, including the MBMA shape of an arm kappa with `correlation car1(RHO) by OCC` and nested
+  levels. The profile solve reads the objective's own dense residual covariance, so the profiled
+  fit reaches the unprofiled fit's OFV, estimates and standard errors; `covariance_method = r`
+  only, as for every profiled fit. Before, the pair was refused with `E_PROFILE_SCOPE` (#2110).
+- **A profiled θ level block can be read through a logit link** (#2111): a bounded
+  endpoint such as an observed proportion, `y = inv_logit(TV + PLACEBO[STUDY, TIME] + η)`,
+  now profiles its placebo block instead of being refused with `E_PROFILE_NOT_LINEAR`.
+  The link must be the whole prediction (scaled, added-to and nested links are refused,
+  with a message that says so). The profile solve then uses the exact Newton matrix, or
+  second differences of the objective where the adjoint cannot serve a subject, under
+  `foce`, `focei`, `laplace` and adaptive quadrature. The profiled levels reach the
+  unprofiled optimum and NONMEM's FOCEI and LAPLACE objectives with every level a
+  `THETA`.
+- **A profiled θ level block can be read by a `[binary_model] logit` predictor** (#2111):
+  `logit = TVL + PLACEBO[STUDY, TIME] + η + EMAX * TRT` now profiles its placebo block
+  instead of being refused with `E_PROFILE_SCOPE`. The predictor's logit link is implicit,
+  each binary record is scored at its own level, and the solve takes the exact Newton
+  matrix, under `foce`, `focei`, `laplace` (one objective on binary rows) and adaptive
+  quadrature. The profiled levels reach the unprofiled objective and NONMEM's
+  `METHOD=COND LAPLACE LIKE` objective with every level a `THETA`. A model with a
+  time-to-event or Markov endpoint is still refused, by a message that names that endpoint.
+- **Bounds on a `profile`d θ level block** (#2112): `theta PLACEBO[STUDY, TIME](0.0, -10.0, 2.5) profile`
+  is now accepted instead of refused with `E_PROFILE_SCOPE`. At every outer evaluation the
+  levels are the exact minimiser over the box, by a box-constrained Newton step per group of
+  coupled levels; a level that ends on its bound is held there exactly and reported with a
+  `BoundaryEstimate` warning. A box no level reaches leaves the fit bit-identical. Anchored
+  against NONMEM with that level `FIX`ed at the bound. The covariance step holds a level on its
+  bound as it holds a `FIX` θ: its standard error is printed as not available, the others are
+  computed with it held, and the new `FitResult.profiled_levels_at_bound` lists the held levels.
+  A point box, an empty box or an init outside the box is refused at parse time.
+- `DataSource` and `read_population_with_source` read a population from bytes
+  already in hand (`DataSource::read(path)` or `DataSource::from_bytes(..)`), so
+  a caller's population and `data_hash` describe the same read of the dataset.
+  `fit_from_files` and `prepare_run` now stamp `data_hash` from the bytes they
+  parsed instead of hashing the file again after the read, so a CSV edited during
+  a fit is no longer recorded as the fitted data (#2140).
+- **`predict_survival_diag()` returns survival predictions with their diagnostics**
+  (#2164): a `SurvivalPredictionOutput { results, warnings }`, the survival twin of
+  `predict_diag()`. `warnings` carries the same non-fit bundle — parse warnings,
+  data-reader findings through the filter `fit()` uses, the model/data checks,
+  experimental-feature notices, and for an ODE-accumulated (joint PK-TTE) hazard the
+  ODE-solver diagnostics and steady-state note of that pass. `predict_survival()` is
+  now a thin wrapper over it and returns the same rows, bit for bit.
+- **`validate_model_file_with()` checks a model against call-time fit options**
+  (#2165): it takes `(key, value)` overrides — any `[fit_options]` key, `method`,
+  or a `[data_selection]` `ignore` / `accept` / `ignore_subjects` clause — and runs
+  every `validate_model_file()` check against the model file's options with those
+  merged in, the way `ferx_fit(settings = …)` does. A fit run with
+  `iov_occasion = dose` on data with no occasion column no longer validates as
+  `E_IOV_MISSING_OCC`. An override that cannot be applied is `E_FIT_OPTION`.
+- **The off-diagonal correlation facts are public** (#2231): `io::output::offdiag_corrs`
+  returns the block-Ω / `block_kappa` pairs the console's `--- Correlations ---` blocks
+  and `format_summary` report (`|cov| > 1e-15`, row-major lower triangle) as
+  `OffDiagCorr { i, j, name_i, name_j, cov, corr, corr_source }`, from a borrowed matrix,
+  optional parameter-correlation matrix and names. `corr_source` says whether `corr` came
+  from the parameter-correlation matrix or the cov/√var fallback, so a wrapper formats its
+  own lines without copying the rule. The CLI and `format_summary` output is unchanged.
+- **`W_FREM_DRAWN_ETA`: simulating a FREM model at drawn η is no longer silent** (#2245).
+  A FREM model links its covariates to the PK only through Ω, so a subject simulated at
+  an η drawn from Ω gets PK that follows a drawn covariate value, not its own, and its
+  `FREMTYPE` rows report the drawn value. `simulate_with_options_diag()` (without
+  `match_method`), `simulate_with_uncertainty_diag()` and adaptive simulations (for the
+  subjects without a supplied η) now say so, naming supplied EBEs and `match_method` as
+  the routes that keep the association. A covariate-conditional draw is not implemented
+  yet.
+- **`imp` and `impmap` now estimate models with inter-occasion variability**
+  (#2301): each subject's random effects and per-occasion κ are importance-
+  sampled jointly, and Ω_IOV is updated in closed form from the weighted κ second
+  moments pooled over every occasion. The fit reports Ω_IOV, per-occasion κ̂ and a
+  κ-marginalised IS objective. On warfarin with IOV on CL, every estimate and the
+  IS −2 log L agree with NONMEM 7.6.0 `METHOD=IMPMAP` to within 0.9 of NONMEM's
+  own iteration-to-iteration SD. `ferx check` no longer reports
+  `E_IMPMAP_IOV_UNSUPPORTED`. IOV with a `[mixture]` block is still refused
+  under these methods, now at check time as `E_IMP_MIXTURE_IOV_UNSUPPORTED`, and
+  so are nested variability levels.
+- **`SimulationResult` reports the mixture class drawn for each row** (#2372): a new
+  `mixnum: Option<usize>` field is `Some(k)` (1-based `MIXNUM`) on a `[mixture]` model and
+  `None` otherwise, on `simulate*`, `simulate_with_uncertainty` and the adaptive
+  trajectories — so a VPC can be split by class and the class shares checked against the
+  mixing probabilities, as NONMEM's `$TABLE MIXNUM` allows under `$SIMULATION`.
+- **`ferx model.ferx --simulate` writes a `MIXNUM` sdtab column on a `[mixture]` model**
+  (#2372): the class each subject was simulated under, beside the fitted `MIXEST` /
+  `PMIX_*`, as NONMEM's `$TABLE MIXNUM` under `$SIMULATION`. It is carried on the new
+  `Subject::simulated_mixnum` (`None` for data read from a file).
+- **Profiled fits code their level-gradient fallback and report their profile work**
+  (#2405): the warning for subjects whose profile-solve level gradient fell back from
+  the adjoint to reconverged finite differences now starts with `W_PROFILE_FD_GRADIENT`
+  and is classified by that code (`gradient_fallback`, info), in the fit and in the
+  covariance step. With `verbose`, a profiled fit prints one line when its outer
+  optimizer stops, summing the profile work of the optimizer's evaluations: how many
+  there were (and how many solves failed — their work is counted), Newton steps summed
+  over groups, EBE re-solves, and level gradients from the adjoint against those by
+  finite differences. The pre-flight's and the covariance step's solves are not in it.
+- **`W_COV_RSR_ONE_SUBJECT_LEVELS`** (#2415): a `covariance_method = rsr` step on a model
+  with a θ level block, profiled or not, now says when some levels are read by a single
+  subject, as with an MBMA `[STUDY, TIME]` block and one subject per study. Such a level's
+  `rsr` standard error is not usable (on `mbma_placebo` it is 1.5–4.8× below `r`'s). The
+  warning names each block, how many of its levels are affected and one of them, and says
+  to read those SEs from `covariance_method = r`.
+- **`W_ZERO_DV_MAGNITUDE_ONLY`: `fit()` and `ferx check` warn about `DV = 0`
+  observations under a proportional (or power, or zero-additive) error model**
+  (#2459). Since #2443 removed the 1e-12 variance floor, such rows give a
+  log-variance that keeps falling as the prediction approaches zero, and a fit can
+  stop at a wrong optimum that still reports `converged`. The warning counts the
+  rows, names the first, and suggests an additive component, removing the rows, or
+  `CENS = 1` with `bloq_method = m3`. `simulate()` does not warn.
+- **Discrete-time Markov model endpoint, `[markov_model] type = dtmm`** (#2473): each
+  `transition A -> B = <expr>` is the probability that the state observed at a record is
+  `B` given that the previous observed state was `A` (the NONMEM `PREVIOUS`-DV `$PRED`
+  model). The stay probability is filled in, the first record is conditioned on, a step is
+  a record whatever its spacing, and a probability reads the scored record's `TIME` and
+  covariates. A probability that reads an ODE model state (a drug-driven DTMM) is not yet
+  supported and is refused.
+  A parameter value that makes any row of the matrix invalid is penalized. Fitted by
+  `focei`, `saem` and `imp`, with exact inner and outer gradients and Laplace curvature;
+  matches NONMEM `LAPLACE LIKE` on a 2-state and a 3-state cumulative-logit model.
+  Simulation is not supported yet and is refused.
+- **Minimal continuous-time Markov models** (#2474): `[markov_model] type = mctmm`
+  fits the minimal CTMM of Schindler & Karlsson (2017) for an ordered state scale.
+  Instead of one intensity per transition, the block declares a mean equilibration
+  time `tau`, proportional-odds `cutpoints = [...]` for the steady-state distribution,
+  and an optional linear predictor `lp`. Only adjacent states exchange, each pair
+  relaxing at `1/tau` toward its steady-state ratio. The order of `states` defines the
+  scale, and its DV codes must increase along it. The block expands to the equivalent
+  `type = ctmm` generator at parse time, so it gets every CTMM estimator, the exact
+  η-gradient, and the drug-driven `Q(t)` route when `lp` or `tau` reads an ODE state.
+  Validated against NONMEM 7.5.1 on a 3-state model (OFV agrees to better than 1e-6);
+  `examples/mctmm_3state.ferx` is a runnable example.
+- **Simulations return each subject's drawn parameters** (#2505):
+  `simulate_with_options_diag()` and `simulate_with_uncertainty_diag()` now carry
+  `SimulationOutput::parameters`. It has one row per `(draw, sim, id)` with the
+  drawn η and κ, the `[individual_parameters]` and the `[derived]` / `[output]`
+  values. Each value is taken at the subject's first observation row (NONMEM's
+  `FIRSTONLY`), and `varying` names any column that changes within a subject.
+  A steady-state AUC can now be read as `F·dose/CL` instead of integrating IPRED.
+- **Per-candidate and per-sample progress events in `ferx-tools`** (#2512): every
+  search tool's event enum (`CovsearchEvent`, `IivsearchEvent`, `RuvsearchEvent`,
+  `IovsearchEvent`, `ModelsearchEvent`, `GlobalsearchEvent`, `AmdEvent`) gains a
+  `CandidateFinished` variant, emitted as each candidate's fit completes, with its
+  step, id, features, OFV, criterion, gate verdict and failure reason.
+  `BootstrapEvent::ReplicateDone` now carries the replicate's `sample` index, its
+  `ofv` and a `ReplicateOutcome` (`converged` / `not_converged` / `stalled` /
+  `failed`) and `skipped`, the exclusion filter that leaves it out of the summary,
+  if any; `DeltaOfvDone` carries `sample` and `dofv`. AMD's allometry step reports
+  its two fits as `CandidateFinished` too. `Runner::run_observed`
+  exposes the same per-candidate hook to callers of the runner. The event enums
+  are now `#[non_exhaustive]`, so a consumer that matches them needs a `_ =>` arm.
+- **SAEM names an additive mu-referenced typical value it cannot shift under a
+  `[mixture]`** (#2548): `E0 = TVE0 + ETA_E0` takes SAEM's closed-form natural-scale
+  shift only in a single-population fit, so under a mixture TVE0 stays on the numerical
+  M-step, which stopped 1–11 OFV above the maximum likelihood on a single population
+  (#2540). A run-time warning now names each such θ and points to a FOCEI check, or a
+  log-normal parameterisation with a non-negative lower bound.
+- **`W_NN_UNSCALED_INPUT` warns about badly scaled `[covariate_nn]` inputs** (#2549): a fit
+  names every network input whose data, after the block's `center`/`scale`, reach far enough to
+  saturate a hidden unit on their own at the first layer's initial weights — where the network
+  barely learns and the optimum a fit reaches can depend on its path.
+- **Adaptive dosing warns when a moved reset puts a decision before it** (#2559): the data
+  reader moves an `EVID=3`/`4` reset written inside a running infusion or `ADDL` train past
+  that window (#1609), and decision times are read on the engine clock. A decision written
+  after such a reset, which ran before it and had its dose silently removed, now raises
+  `W_ADAPTIVE_DECISION_BEFORE_MOVED_RESET` in the result's `warnings`, naming the subject,
+  the decision times, both reset times and the shift to add.
+- **A θ level block and time-varying covariates in a `[binary_model]` predictor** (#2562):
+  `theta PLACEBO[STUDY, TIME](0.0)` can be read in a `logit = ...` predictor, as in a
+  binary model-based meta-analysis, and each binary record is scored at its own level and
+  its own covariate values (an arm, a dose group) instead of the subject's baseline. The
+  binary records define the block's levels, as Gaussian observations do; so do the
+  records of a DTMM that reads the block. Validated against NONMEM `METHOD=COND LAPLACE
+  LIKE` (ΔOFV 1.4e-9). A profiled block read there is now refused by `E_PROFILE_SCOPE`
+  instead of the false "no prediction reads it".
+- **`FitResult::total_ebe_nm_polished`** (#2571): under `inner_optimizer = nelder_mead`,
+  counts how many times, summed over every inner loop like `total_ebe_fallbacks`, a
+  subject's Nelder–Mead stop was not a mode and the gradient-based stationarity certificate
+  had to move it there. These solves used to read as plain Nelder–Mead successes. The count
+  is 0 under every other `inner_optimizer`, and is not counted (reads 0) by the Gauss–Newton
+  phase of `gn` / `gn_hybrid`, SAEM, trust-region, VI and IMP. Saved fits written before
+  this field load it as 0.
+- **`DecisionOutcome::label()` and `DecisionOutcome::n_dosed()`** (#2581): the
+  adaptive decision log's outcome label (`"dosed"`, `"hold"`, `"stop"`, `"not_due"`)
+  and its realized-dose count, mapped inside the engine. A downstream crate such as
+  ferx-r no longer needs a wildcard arm on the `#[non_exhaustive]` enum, so a future
+  outcome that doses cannot silently be reported as zero doses.
+- **`FERX_PROFILE=1` now reports what the inner multi-start buys** (#2601). A line on
+  stderr gives how many guarded cold-start multi-starts ran and how many moved a subject's
+  EBE through the twin seed, the Sobol screen and the per-coordinate seeds. It tells you
+  whether `inner_screen = 0` or `inner_restarts = 0` would cost anything on your dataset.
+  On a synthetic 3,000-subject sparse two-compartment model, the multi-start is about 80% of
+  a `maxiter = 0` evaluation and moved 2 subjects.
+- A probit link for `[binary_model]`: write the predictor as `probit = …` (or add
+  `link = probit`) for `P(DV = 1) = Φ(lp)`, NONMEM's `P = PHI(LP)`. The Bernoulli term is
+  computed in log space, so a record far in either tail keeps its exact value, and its
+  gradient, η-Hessian and covariance-step derivatives are exact. New expression function
+  `pnorm(x)`, the standard-normal CDF, accurate in both tails. Both are accepted as a link
+  by `profile`d θ level blocks, as the logit forms are. Anchored against NONMEM
+  `METHOD=COND LAPLACE LIKE`. `cloglog` is not available (#2603).
+- **`iiv_on_ruv` now composes with `correlation` and `block_sigma`** (#2656): a model can
+  carry both a within-group residual correlation and between-subject variability on the
+  residual, the NONMEM shape with one `EPS` shared through `L2` and an `ETA` on the residual
+  magnitude. The random effect scales the subject's whole `R`, so a `correlation` line fits
+  under `focei` and a `block_sigma` under `focei`, `saem`, `imp`, `laplace` and `vi`.
+  `iiv_on_ruv` may also sit after an `if/else` selected error model, which is what lets a
+  `block_sigma` across a paired total/unbound row carry it. The objective, EBEs and CWRES
+  match NONMEM on `nonmem_anchor/iiv_ruv_dense/`.
+- **The fit says when an `[odes]` right-hand side is not native code** (#2681). A block
+  the RHS compiler declines runs on the bytecode interpreter, several times slower, and
+  nothing used to say so. A fit now reports it once, as an informational
+  `W_ODE_RHS_INTERPRETED` entry in `warnings` / `warning_details` (category
+  `ode_rhs_route`) naming the construct (an `if (…) { … }` statement, `sqrt`, …) and the
+  statement it is in. A compiled block that runs without
+  native code (`FERX_NO_RHS_JIT=1`, a host Cranelift cannot target) is reported as
+  `W_ODE_RHS_NOT_NATIVE`. `ferx check` reports the same text as an `info` row, so the
+  route is visible before a long run.
+- **`imp_max_time` and `impmap_max_time`** (#2687): a wall-clock limit in seconds on
+  the IMP / IMPMAP iterations. A fit that reaches it stops after the current
+  iteration, keeps its estimate, and reports `converged: false` with a warning.
+- **In-memory `.fitrx` bundles** ([#2696](https://github.com/FeRx-NLME/ferx-core/issues/2696)):
+  `save_fit_to_bytes`, `load_fit_from_bytes` and `load_fit_from_bytes_without_population`
+  work on a bundle's bytes, and `bundle_with_data` and `bundle_with_interface_extras`
+  change existing bytes. `save_fit_from_bundle` saves a fit with no `Population`, taking the
+  data columns from the bundle it was loaded from, so a bundle loaded without data can be
+  saved again.
+- **A gradient-driven fit that stops without converging now says whether the fixed-EBE
+  fallback is in play at its estimates** (#2713). The warning counts the subjects whose
+  outer gradient at the reported estimates is the fixed-EBE fallback, gives how far the
+  gradient the fit used is from the exact (reconverged) one, and names the rerun that
+  decides whether the fallback caused the stop: `reconverge_gradient_interval = 1`.
+- **`sin(x)` and `cos(x)` in the model DSL** (#2720): trigonometric functions, in
+  radians, everywhere the other functions work — `[individual_parameters]`,
+  `[structural_model]`, `[scaling]`, `[odes]` and residual-error expressions — so
+  circadian baselines (`AMP * cos(2 * 3.141592653589793 * (TIME + SHIFT) / 24 - PHS)`)
+  port directly from NONMEM's `SIN`/`COS` instead of needing a hand-written Taylor
+  series. A random effect inside the argument is differentiated exactly on both loops
+  and in the covariance step. Anchored against NONMEM `$PRED` (`nonmem_anchor/circadian_cos*.ctl`).
+- Combined proportional + additive residual error under log-transform-both-sides:
+  `log(DV) ~ combined(PROP, ADD)` (natural-scale `DV`) and
+  `DV ~ log_combined(PROP, ADD)` (`DV` already logged), with
+  `Var(log DV) = PROP² + ADD²/f²` — NONMEM's `W = SQRT(PROP**2 + ADD**2/IPR**2)`.
+  `PROP` is on the log scale and `ADD` in natural `DV` units; `f` is floored at the
+  LTBS floor (`1e-12`) before it divides `ADD`. Matches NONMEM 7.6.0 FOCE/FOCEI
+  objectives to 6e-9, and the analytic gradients cover it. Per-endpoint LTBS
+  (`CMT=N:` lines) is now accepted when every endpoint is on the log scale, so a
+  plasma + urine model can give each its own `PROP` and `ADD`, with a per-CMT
+  magnitude (#2731) such as a factor on the plasma `PROP` while `TAD < 3`. Rust API: new
+  `ErrorModel::LogCombined` variant, and `ErrorSpec::sigma_loading_slopes_at(cmt, f,
+  n_sigma)`, the slopes at a prediction (`sigma_loading_slopes` reports the
+  `LogCombined` additive slot, whose slope depends on `f`, as `NaN`) (#2729).
+- Magnitude expressions now work on `CMT=N:` lines and inside `if/else` branches of
+  `[error_model]`, with the same rules as a plain line, so a joint model can put a factor on
+  one endpoint's residual: `CMT=1: DV ~ additive(S * (1.0 + (TPF - 1.0) * EARLY))`. Two
+  endpoints may share a sigma under different factors. A zero- or two-sigma expression there
+  now reports that rule instead of `references unknown sigma`. Adaptive dosing refuses a
+  magnitude expression on a `CMT=N:` line. Validated against NONMEM 7.5.1. (#2731)
+- **Adaptive dosing honours compartment on/off records** (#2753): `simulate_adaptive()`
+  and `[adaptive_dosing]` now run on data with `EVID=2` rows that turn a compartment off
+  (`CMT=-N`) and back on (`CMT=N`), which #2737 refused with `E_ADAPTIVE_UNSUPPORTED`.
+  The rows act as they do in `predict()`, except at a decision: one at the same time as a
+  row comes after it (unless the row is written after a dose row at that time), so its dose
+  lands. A controller dose into an off compartment turns it back on, and a monitor on an off
+  compartment reads 0. An observation row of a compartment that the data leave off is still
+  refused (`E_OBS_CMT_OFF`). The Rust functions `ode_predictions` and
+  `ode_predictions_with_solver_stats` honour the rows too, where they ignored them before.
+- **`W_PLAN_FD_FALLBACK`: a subject whose compiled plan fails takes finite differences**
+  (#2786): should a subject's compiled derivative plan ever fail at run time, that subject
+  alone takes finite-difference derivatives for the quantity at hand, the fit completes
+  with the same results, and one warning counts the subjects and quotes the failure. It
+  is not expected to appear; please report it if it does.
+- **Steady-state (`SS=1`) dosing into an absorption input with a lag, and into a `zero_order()`
+  window** (#2786, #719): a compartment `lagtime`/`ALAG` or a per-route `lag=` on a
+  `first_order()`/`transit()`/`igd()`/`weibull()` compartment, and a lone `zero_order()` window
+  (also with a lag), are now served with exact analytic gradients instead of being refused
+  (`E_ABSORPTION_SS_LAG`, `E_ABSORPTION_SS_ZERO_ORDER`, both retired). A `zero_order()` mixed with
+  another absorption function, and a zero-order compartment carrying both a per-route `lag=` and
+  an `ALAG{c}`, keep a specific error (`E_ABSORPTION_SS_ZERO_ORDER_MIXED`,
+  `E_ABSORPTION_SS_ZERO_ORDER_LAG`). Checked against an independent pulse-train reference and
+  NONMEM 7.6.0.
+- **`FitResult::status()`: one verdict on whether a fit can be used as it stands**
+  (#2799). It is `CONVERGED`, `CONVERGED WITH ISSUES` or `NOT CONVERGED`, with typed
+  reasons in a fixed order: `evaluation_only`, `budget_spent`, each critical warning code,
+  `covariance_failed`, and `collapsed_at_guard: <names>` for a collapse the covariance step
+  ran on but did not hold. The console prints a `Status:` line after `Final gradient:`,
+  the fit YAML gains `status:` and `status_reasons:`, and the JSON a derived `status` key.
+  `converged` keeps its meaning, and multi-start selection is unchanged. The facts it
+  reads are new public fields, `eval_budget_spent` (set by NLopt, the trust region, pure
+  Gauss–Newton and `optimizer = bfgs`) and `evaluation_only`. A standalone `imp_eval_only`
+  / `agq_eval_only` evaluation now reports `covariance_status: NotRequested` instead of
+  `Failed`: it owns no covariance step. The multi-start
+  "k of n starts failed" note is now an `Info` warning: it quoted the sibling starts'
+  errors, so a "did not converge" in them made a healthy returned fit look failed.
+- Adaptive dosing: a run with `round_to` now warns (`W_ADAPTIVE_STEP_ABSORBED`) when the
+  dose grid absorbs the smallest `increase N%` at a dose a subject can be at, so that
+  rule fires there and cannot raise the dose. This is the subject's start dose as placed
+  on the grid, or the lowest dose the decrease rules bring it to. The warning counts the
+  subjects, names each with its dose (an oracle subject with its replicates), gives the
+  lowest dose the step can raise, and says what to change. No simulated number changes
+  (#2810).
+- **`[mixture]` per-class overrides are reported with their estimate, SE and name**
+  (#2833): an `omega(k)` / `sigma(k)` override now gets its own rows, named
+  `<base>_MIX<k>`. They appear in the console (`--- Mixture per-class overrides ---`),
+  the fit YAML (a new top-level `mixture_overrides:` section) and `parameter_table`.
+  A `FIX`ed override, or one SAEM holds at its initial value, shows as fixed (`---`).
+  One held at its bound shows `N/A`, and its base parameter keeps its SE. The
+  covariance matrix labels name these coordinates and `block_sigma` correlations
+  instead of `param_<n>`. `FitResult` gains `se_mixture_overrides` and
+  `mixture_override_params`.
+- **An evaluation-only run now warns when a `theta` starts outside its own
+  declared bounds** (#2865): with `maxiter = 0` such a start is clamped and the
+  objective is scored at the bound, so `theta TVCL(0.5, 0.001, 0.2)` reports the
+  OFV of `0.2`. That was silent, and `ferx check` said `ok`. Both now carry a
+  `W_THETA_INIT_OUTSIDE_BOUNDS` warning (category `init_outside_bounds`) naming
+  the theta, its declared start, the bound and the value scored. No objective
+  value changes, and the run is still not refused, so `--dofv`,
+  `ferx gam --no-fit` and the bootstrap Δofv sweep keep working. With
+  `maxiter > 0` the declaration is still the error
+  `E_THETA_INIT_OUTSIDE_BOUNDS`. A `FIX`ed theta is scored at its declared
+  value and is not reported.
+- **A multi-start fit reports what every start did** (#2867): with `n_starts > 1`,
+  `FitResult.starts` holds one `StartRecord` per start (OFV, converged, status,
+  iterations, wall time, final θ, which one was returned, and a failed start's error
+  and code), and the fit YAML (`multi_start:` block), fit JSON and `.fitrx` carry the
+  same rows. One `multi_start` info line now appears on every multi-start fit and says
+  whether the starts agree, e.g. `7 of 8 converged starts within 1.0 of best; 1
+  converged above it: start 4 (+5.27)`. It replaces `Multi-start: best result from
+  start k/n`, which was printed only when start 0 lost and read the same whether the
+  starts agreed or not. Estimates, OFV and the selected start are unchanged.
+- `EPRED`, `PWRES` and `EWRES` sdtab columns, written whenever `npde_nsim > 0`
+  from the NPDE simulation at no extra cost (#2871). `EPRED` is the Monte-Carlo
+  expected prediction (NONMEM's `$TABLE EPRED`); `PWRES` (Monolix's name, also
+  written as NONMEM's `EWRES`) is the population-weighted residual
+  `Σ_sim^(-1/2)(y − EPRED)`, the simulation-based analogue of CWRES, valid after
+  any estimator and linear in `y`. It decorrelates with the symmetric inverse
+  square root, matching NONMEM's default `EWRES`; NPDE keeps the Cholesky factor.
+  Both round-trip through `.fitrx` and are on `SubjectResult` / `SubjectNpde`.
+- Count endpoints: a `[count_model]` block fits, simulates and predicts a non-negative
+  integer DV under a Poisson (`type = poisson`) or negative-binomial (`type = negbin`,
+  size `r`, variance `λ + λ²/r`) law, with the mean written as `lambda = …` or
+  `log_lambda = …` over θ, η, per-record covariates and `TIME`. The OFV is the full
+  `−2 log L` (`ln Γ(k+1)` included), equal to NONMEM's `METHOD=COND LAPLACE -2LL` objective
+  and, on fixed effects, to R's `glm` / `MASS::glm.nb`. FOCEI / Laplace (with exact inner,
+  η-Hessian and outer derivatives), SAEM and IMP are supported; `method = gn` is refused
+  (`E_COUNT_GN_UNSUPPORTED`). `simulate()` draws one count per record,
+  `predict_categorical()` returns the new `Prediction::Rate { lambda, size }`, and sdtab /
+  `.fitrx` carry the count rows with a Pearson `IWRES` (#2877).
+- A `[mixture]` fit that ends with two classes merged (no subject's data favours either by
+  more than 1 log-likelihood unit) or with an empty class (no subject's posterior probability
+  of it reaches 1e-2) now warns `W_MIXTURE_MERGED_CLASSES`, naming each pair and class, and
+  advises refitting from different class starts or with `optimizer = bobyqa` (#2907).
+- **One path reads final estimates from either fit file** (#2911): `{model}-fit.json`
+  and `{model}-fit.yaml` both carry a top-level `estimates` block holding the
+  `theta`, `omega`, `sigma`, `block_sigma`, `omega_iov` and `mixture_overrides`
+  sections keyed by parameter name, with the same entry and field names, so
+  `estimates.theta.TVCL.estimate` works on both without branching on the format.
+  The YAML keeps its top-level sections as they were; the JSON keeps its vectors
+  and its values are full precision, with `null` for the YAML's `~`. All
+  renderings come from one table, so they cannot disagree.
+- `vpc_tte()`, `vpc_rtte()` and `vpc_kmmc()`: a stratum with no band point at any grid
+  time now adds `W_VPC_EMPTY_STRATUM` to the result's `warnings`, after the simulator's,
+  naming the stratum and the reason: fewer subjects than `min_at_risk` (`vpc_kmmc()`),
+  every grid time past the last time of every replicate curve (with the latest), or too
+  few replicate curves defined at any grid time. Before, such a panel came back with
+  every band entry `None` and no word why. With the `Auto` and `AllSteps` grids,
+  `vpc_tte()` and `vpc_rtte()` never raise it; `vpc_rtte()` reads it from the mean
+  cumulative function (#2947).
+- **A fit of an ODE model now says when its OFV is not settled at the ODE tolerance**
+  (#2994): after the fit, ferx re-finds the EBEs and re-scores the published objective once
+  with `ode_reltol` / `ode_abstol` one decade tighter, and warns with `W_ODE_OFV_NOT_SETTLED`
+  (category `ode_solver`) when the OFV moves by more than 0.1 units. On a stiff feedback
+  model the default tolerance had left several OFV units of error with no sign of it.
+  Covers FOCE / FOCEI / GN / Laplace objectives of non-mixture models, including a trailing
+  `agq_eval_only` readout (`method = [vi, laplace]`); a check that cannot be set up, or whose
+  objective at either tolerance does not integrate cleanly, or whose re-solve leaves
+  unconverged EBEs, says so with `W_ODE_OFV_SETTLEMENT_UNCHECKED`.
+  Estimates and OFV are unchanged.
+- **`mstep_optimizer = newton | lbfgs`: exact-derivative θ/σ M-step for SAEM, IMP and IMPMAP** (#3001):
+  the numerical M-step (the channel that estimates a theta with no closed-form update, and
+  every σ the closed-form residual update does not own) can now run on the exact fixed-η score
+  — the adjoint θ score and the analytic σ score the `mstep_solver = score_sa` path already
+  uses — instead of derivative-free BOBYQA. `newton` takes Fisher-scoring (Gauss-Newton) steps
+  on that score and the expected information from the same adjoint recording, warm-started at
+  the previous iterate (2–4 passes per M-step against BOBYQA's 8–15); `lbfgs` runs NLopt
+  L-BFGS on the same score. `auto`, the default, picks `newton` where it applies and `bobyqa`
+  elsewhere; one shared key for all three estimators. `newton` serves the models with the closed-form
+  information (adjoint in scope, plain Gaussian likelihood, not a mixture); on any other it runs
+  BOBYQA and the fit's warnings name the property that put it out of scope. A Newton solve that
+  stalls, or loses its information at run time, continues with BOBYQA from where it stopped and
+  with the evaluations it did not spend (one budget per M-step); the fit's warnings count those
+  M-steps and the cause.
+- **Mixture models under Laplace and adaptive Gauss-Hermite quadrature** (#3025):
+  `method = laplace`, and `focei` with `n_agq > 1`, now fit `[mixture]` models. Each class is
+  scored with the single-population Laplace / AGQ objective at its own mode, with the exact
+  outer gradient and the exact covariance R-matrix (no finite-difference fallback), IOV
+  included. `E_MIXTURE_METHOD` no longer refuses these.
+  `agq_eval_only = true` on a mixture is refused (`E_MIXTURE_METHOD`).
+- **`ferx summary --json`** emits the run summary as one machine-readable JSON
+  document on stdout (#3074): a `runs` array with, per bundle, the run status,
+  OFV / AIC / BIC, the name-keyed `estimates` of the fit JSON (plus every θ by
+  position and a `theta_blocks` summary of large θ level blocks), covariance and
+  shrinkage diagnostics and `warnings_structured`, plus `delta_ofv` against the
+  first run when several bundles are compared. A bundle that fails to load gets
+  an `error` entry instead of a bare stderr message; exit codes are unchanged.
+- A residual-magnitude expression may read the individual prediction `IPRED`, so the
+  residual SD can be any function of the prediction, e.g. the MBMA arm-mean SD
+  `DV ~ additive(EPS * A * exp(B * IPRED) / sqrt(NIND))` (#3121). `IPRED` is on the
+  natural scale (NONMEM's `IPR`), also under LTBS. Analytic gradients and R-matrix under
+  FOCE, FOCEI and Laplace; validated against NONMEM 7.6.0 (objective to 6e-8, fit,
+  no-random-effects and FOCE variants, POSTHOC residuals). `weight =` and `power(...)`
+  exponents stay prediction-free.
+- **`ode_ofv_check = false` skips the post-fit OFV tolerance check, and two new `FitResult` fields time what follows the estimate** (#3157): on a run that only scores a model at given estimates the check (two inner-loop passes, one a decade tighter) can cost as much as the evaluation. A fit that skipped it carries `W_ODE_OFV_SETTLEMENT_UNCHECKED` naming `ode_ofv_check = false`. `ofv_settlement_wall_time_secs` and `subject_results_wall_time_secs` are in the fit YAML's `estimation:` block next to `covariance_wall_time_secs`. Defaults are unchanged.
+- **`[fit_options] inner_kick = true` looks for a second EBE mode a kink puts a barrier away** (#3159): every inner solve restarts from a small kick of each coordinate and keeps a lower mode, which finds the second local minimum a clipped prediction can put up to 0.165 lower (not reachable by `inner_restarts`/`inner_screen`). It also checks a stall at a large gradient against the gradients around it (gradient sampling) and leaves a kink's valley floor along it, where the inner search had certified a point up to 0.175 above the minimum. Off by default: the kicks run whether or not the model has a kink (measured 2-20× on four fast ODE examples without one), and a smooth ODE objective can stall at a large gradient too.
+- **Stable labels on the adaptive summary and decomposition enums** (#3213, #946):
+  `AdaptiveSummaryMetric`, `AdaptiveSummaryStatistic`, `AdaptiveBandStatus`,
+  `AdaptiveVarianceScope`, `AdaptiveVarianceLayer` and `AdaptiveComponentStatus` each
+  gain a `label()` (`CUM_DOSE`, `fraction_at_least`, `between_subject`, …, the
+  spellings ferx-r writes), and `AdaptiveSummaryMetric::from_label` / `SCALARS` read a
+  scalar metric back. `summarize_adaptive`'s threshold refusal now names the metric by
+  its label (`the threshold for CUM_DOSE is inf`) instead of its Rust name.
+
+### Changed
+- **Large models keep the analytic R-matrix** (#486). Above 100 free parameters a defaulted
+  `covariance_method = r` used to switch to the score cross-product, and the pre-fit note
+  quoted `2n²` re-converged objectives, both because `R` was a finite-difference stencil.
+  A fit the exact R-matrix serves, such as a covariate-NN model, now keeps `r` at any
+  size, with no stencil cost warning. Fits outside its scope still switch.
+- **IOV analytic gradients cover up to 48 random effects per subject** (#486). The adjoint
+  serves any IOV subject whose stacked `[η, κ₁…κ_K]` count is at most 48, with no limit on
+  θ; the covariance step's analytic R-matrix does too, and Laplace's exact anchor serves up to 24. The
+  forward provider it replaces served up to 96 stacked axes but capped the model at 24
+  `(θ, η, κ)`. A subject past the cap takes the reconverged finite-difference gradient, and
+  `FitResult.warnings` names it. On a 20-subject, 9-occasion fit with 30 stacked random
+  effects per subject, the exact gradient took 41.5 s where finite differences took 2739 s.
+- **An AGQ/Laplace subject whose EBE stopped short of its mode now takes the held-EBE score,
+  and the fit says so** (#486). When the exact inner Hessian is indefinite at an EBE the inner
+  search left non-stationary, the mode identity behind the exact gradient does not hold. Such
+  a subject used to be scored by `2 × (free parameters)` reconverged finite differences, with
+  no warning. On a 147-weight covariate network under Laplace that made the fit 12× slower.
+  It now takes the analytic gradient at the held EBE, as FOCE and FOCEI already do, and the
+  outer gradient fallback warning in `FitResult.warnings` counts it. The covariance step still
+  uses only exact or reconverged scores.
+- **Three more combinations take the exact analytic gradient** (#486):
+  - An η-dependent `obs_scale` on an `[odes]` model under LTBS, with or without IOV. These
+    fits used finite differences on both loops.
+  - A right-hand side that reads `TIME`, `T` or `TAFD` across an estimated lag or modeled
+    duration, in the covariance step and under Laplace. Such subjects were salvaged
+    numerically.
+  - A right-hand side that reads `TAD` under unlagged steady-state dosing, bolus or
+    infusion. The dual SS run-in now uses the same per-window clocks as the value path. These
+    subjects used a finite-difference inner gradient.
+- **A covariance step of an ODE model that finite-differences its objective or its scores now
+  runs whole at `ode_reltol = 1e-6` / `ode_abstol = 1e-8`** when the fit itself ran looser
+  (#520). The R-matrix stencil divides by `h²` and so amplified the integration noise of the
+  default `1e-4` / `1e-6`: on a 3-compartment IV ODE model the standard errors came out 2–7×
+  too large with no warning, and once an eigenvalue was floored, 4400× too large. Every matrix
+  of the step — the R stencil, the exact analytic terms of a per-subject salvage, the score
+  matrix `S`, and the modes and `H` they are built at — runs at that one tolerance, so no SE
+  mixes the derivatives of two objectives. The fit, its estimates and its OFV are unchanged.
+  When the exact analytic R-matrix covers every subject, as on most Gaussian `[odes]` fits,
+  `r` and `rsr` keep the fit's tolerance throughout. A fit pinned tighter keeps its own;
+  closed-form transit / inverse-Gaussian models are covered through their absorption ODE twin,
+  and a linear model solved by matrix exponential through any segment the exponential declines
+  to the integrator. If the tighter run cannot be set up, the step runs at the fit's tolerance
+  and says so (`W_COV_ODE_TOLERANCE_NOT_TIGHTENED`; a step that then fails
+  says so in its failure message). Measured cost: 0.95–1.17× the stencil's
+  wall time. **Results move**: standard errors at the default tolerance of ODE models on the
+  finite-difference or salvaged R route — `analytic_cov_hessian = false`, `gradient = fd`,
+  mixtures, non-Gaussian endpoints, models outside the sensitivity scope, and subjects
+  salvaged per subject — under `r` and `rsr`, and under `covariance_method = s` of every ODE
+  model.
+- **Objective values of linear `[odes]` models move by the integrator's former error** (#852):
+  such models are now solved exactly rather than integrated at `ode_reltol`, so predictions
+  shift by the old tolerance (about 1e-5 relative at the defaults) and `ode_reltol` /
+  `ode_abstol` no longer affect them. Set `ode_method = rk45` (or any named integrator) to
+  reproduce an earlier integrated result.
+- Adaptive dosing: the outcome metrics `signal_min`, `signal_max`, `signal_mean` and the
+  window metric are now scored on the latent (noise-free) monitor value, like
+  `auc_target_attainment`, instead of the assay-noised reading. Results change for `Dv`
+  (`with_assay_error`) monitors only; `Ipred` monitors are unaffected. The window metric
+  `AdaptiveSubjectMetrics::pct_time_in_window` is renamed `pct_readings_in_window`: it
+  is the fraction of decision readings in `target_window`, never a time. Each
+  `ObservedSignal` now records `latent` next to `value` (which stays the reading the
+  controller saw), and the struct is `#[non_exhaustive]`. **Rust API (breaking):** code
+  reading `pct_time_in_window` must read `pct_readings_in_window`, and `ObservedSignal`
+  can no longer be built with a struct literal outside ferx-core (#946).
+- **An adaptive run with two monitors of the same name is refused** (#946)
+  (`E_ADAPTIVE_OPTIONS`, naming the monitor). Before, the controller silently read only
+  the last of them, while the decision log recorded both.
+- `DoseLedgerEntry` is now `#[non_exhaustive]` and gains a `rep` field (the assay
+  replicate, #946). Code that builds a ledger row with a struct literal no longer
+  compiles; reading the rows is unchanged. `DecisionLogEntry` and
+  `AdaptiveSubjectMetrics` gain the same `rep` field (additive: both were already
+  `#[non_exhaustive]`).
+- `AdaptiveDosingSpec::validate` now accepts a hand-built spec without rules: it is the
+  fixed regimen `AdaptiveDosingSpec::fixed_reference()` returns, the start dose at every
+  due point (#946). An `[adaptive_dosing]` block in a model file still needs at least one
+  rule.
+- A negative absorption lag at the initial estimates — `lagtime` / `ALAG{n}`, or a
+  per-route `fn(..., lag=L)` on the compartment a dose lands in — is now a fit-init error,
+  `E_NEGATIVE_LAGTIME`, in `fit()` and `ferx check`, matching NONMEM (`PK PARAMETER FOR
+  ABSORPTION LAG IS NEGATIVE`). It was a warning, `W_NEGATIVE_LAGTIME`, and the fit started
+  the dose's input before its record time. The check reads every dose record's own
+  snapshot and names the subject and record. `predict()` and `simulate()` still serve a
+  negative lag and keep reporting it as `W_NEGATIVE_LAGTIME` (#1189).
+- **A `[covariate_nn]` input absent from the covariate map reads as `0.0`, like every
+  other expression** (#1331): under `center`/`scale` the network used to substitute the
+  centred origin for a missing key, so it was the one reader of an absent covariate that
+  disagreed with the expression evaluator. Fits are unaffected (a missing column is
+  refused before any fit); a sparse in-memory snapshot or a direct `pk_param_fn` call
+  now gives the same value as the exported equations.
+- **A dose now keeps the absorption parameters of its own dose record for its whole
+  absorption** (#1569). Every built-in absorption forcing (`transit`, `igd`, `weibull`,
+  `first_order`) reads its kernel parameters, its pathway fraction `FR` and its per-route
+  `lag=` at the dose record, as `F`, the lagtime and `zero_order`'s window already were.
+  Only the disposition (`CL`, `V`, …) follows the current interval. Until now the kernel
+  was re-read in every interval, so a dose still absorbing when IOV or a time-varying
+  covariate moved `MTT` / `MAT` / `KA` / `FR` / `lag=` created or destroyed drug. One
+  transit dose (`n = 3`) whose `MTT` changes once mid-absorption now absorbs exactly its
+  mass, where it absorbed:
+
+  | `MTT` change | at `t` | before | now |
+  |---|---|---|---|
+  | 4.0 → 2.5 | 5 | 0.777 | 1.000 |
+  | 2.0 → 4.0 | 2 | 1.424 | 1.000 |
+  | 4.0 → 2.0 | 3 | 0.504 | 1.000 |
+
+  **Results move** for models with IOV or a time-varying covariate on an absorption
+  parameter, where a dose is still absorbing when the parameter changes. This includes
+  closed-form `pk *_transit` / `*_ig` models, whose IOV and TV-covariate subjects run on
+  the ODE twin. With IOV or covariates only on disposition parameters, predictions are
+  unchanged: bit-identical, except that fractioned (`FR*`) pathways with overlapping
+  doses can move at rounding level (measured ≤ 5.3e-15 relative). The typical-value
+  checks `E_ABSORPTION_DOMAIN` / `E_ABSORPTION_FRACTION` now evaluate at dose records
+  only, so a value out of range only at an observation or EVID=2 row is no longer
+  rejected: `IPRED` and `PRED` never apply it, and `predict()` serves it.
+  Validated against NONMEM 7.6.0 (`nonmem_anchor/transit_iov_mtt`, `ig_iov_mat`: `$DES`
+  with a per-dose kernel).
+- **An EVID=3/4 reset now cancels every dose recorded before it, including a lagged dose
+  that has not yet arrived** (#1587). A lagged bolus whose arrival, or a lagged infusion or
+  absorption window whose start, falls after the reset contributes nothing after it,
+  as in NONMEM. Previously ferx applied such a dose, reading up to +270 % against NONMEM
+  after the reset. This holds on every engine (ODE and analytic, predictions and
+  gradients, the adaptive driver) and for every absorption form (depot, `first_order`,
+  `zero_order`, `transit`, per-route `lag=`, lagged infusions). A dose recorded at the
+  reset itself (an `EVID=4` row's own dose, or a dose row after a co-timed `EVID=3` row)
+  is kept. Validated against NONMEM `ADVAN2` and `ADVAN13`
+  (`nonmem_anchor/evid_reset_lag`, 23 subjects). Only subjects with a reset between a lagged
+  dose's record and its arrival change.
+- **The unseen-level refusal and `E_THETA_LENGTH` now name the action, not a Rust
+  function** (#1623). Simulating a design with a level the fit never observed is still
+  refused; its advice is now to simulate only the fit's levels, or to simulate the design
+  on its own levels without the fit's θ. A θ of the wrong length on a level-block model now
+  says a fit's θ fits only a design bound against that fit's level bindings. Neither names
+  `bind_theta_levels` or `bind_theta_levels_from_fit` any longer, since the R wrapper
+  passes these messages through; the Rust routes are in the functions' documentation.
+- **The Bayes η block adapts per subject and starts at the EBEs** (#1626). The
+  default Metropolis η kernel used to be one block step, with one scale for
+  every subject, shaped by `chol(Ω)`. Each subject now adapts its own step
+  size and, from mid-warmup, its own proposal shape from its running η
+  covariance. Componentwise sweeps follow the block moves. Every chain starts
+  each subject's η at its EBE at the initial parameters, not at 0. A chain
+  that started at 0 could fall into a negligible-mass flip-flop mode and never
+  leave it. Posterior draws for a given `bayes_seed` therefore differ from
+  earlier releases. A Bayes sweep costs about twice as much. Warfarin still
+  converges: max R̂ 1.002–1.004 across four seeds.
+  A covariate coefficient now drawn by the conjugate mu-reference move has a
+  flat prior on θ within its bounds. On the random walk it had N(init, sd 10)
+  on log θ.
+- **`contrast = auto` on a level block now sees the `y` readout, and a random effect reached
+  through a variable** ([#1642](https://github.com/FeRx-NLME/ferx-core/issues/1642)). A block
+  read in the readout next to a parameter carrying an η (`E0 = TVE0 + ETA_E0`,
+  `y = E0 + PLACEBO + ...`), or in an individual parameter built from one (`E1 = E0 + PLACEBO`),
+  now takes within-study sum-to-zero by default, as the single-line spelling always did — 15
+  free θ instead of 17 on 3 studies × 6 times. Explicit global contrasts on these spellings are
+  refused, naming the expression that reads the block. Refit to pick the new layout up; a fit
+  bound before the change still rebinds its own layout through `bind_theta_levels_from_fit`.
+- **`simulate_adaptive` no longer reports `W_NO_DOSES`** (#1645). On that entry point the
+  controller supplies the regimen, so a dataset carrying only an observation grid is the
+  expected input, and the warning's advice (check for an `AMT` column with dose rows) does
+  not apply. Every
+  other entry point still reports it.
+- **`W_TTE_DEGENERATE_HAZARD` is reported once per subject and CMT** (#1648): a
+  simulation of several replicates repeated the same line for every replicate in which a
+  subject's analytic hazard draw degenerated, with nothing to tell the lines apart (28
+  lines for 3 subjects over 50 replicates, 51 over 20 uncertainty draws of 5). The
+  diagnostics-carrying entry points now give one line per subject and CMT, with the number
+  of replicates affected and which they are: the `sim` indices on
+  `simulate_with_options_diag`, the uncertainty draws on `simulate_with_uncertainty_diag`,
+  and one line counted over all reference replicates in the warnings of
+  `stats::npde::compute_tte_npde`.
+  A single replicate keeps the previous text. The lines now follow the run's other
+  per-subject lines. No simulated row changes.
+- **A level block that takes a separate level at every observation now counts every random
+  effect that reaches `y`, through the states too; one that does not no longer counts a
+  time-varying one** ([#1650](https://github.com/FeRx-NLME/ferx-core/issues/1650)). With one
+  subject per study, `[STUDY, TIME]` reproduces any per-subject effect, so an η on `CL` read
+  as `central / V` now resolves `contrast = auto` to `sum_to_zero_within`, and an explicit
+  `sum_to_zero`, `ref` or `none` is refused. On a block whose last column holds several
+  observation times (`[STUDY, VISIT]`), an η reaching `y` only through a time-varying term
+  (`EMAX` in `EMAX * TIME / (TIME + ET50)`) is identified and no longer refuses a global
+  contrast. A fit saved before this change keeps its layout when re-bound from the fit.
+- **A kappa on a level block is now measured on its occasions**
+  ([#1678](https://github.com/FeRx-NLME/ferx-core/issues/1678)). A kappa counts toward
+  `contrast = auto`, and refuses a contrast that leaves its levels free, exactly when each of
+  the block's levels lies within one occasion of one subject — the η rule, with the occasion in
+  place of the subject. In the MBMA layout, where each arm is an occasion carrying the study's
+  full visit grid, a between-arm kappa no longer refuses an explicit `sum_to_zero`; a
+  `[STUDY, OCC]` block, or occasions that split a subject's records into periods, now counts
+  it. Occasions derived by `iov_occasion = dose | time(...)` count like an `iov_column`.
+  `mbma_placebo` binds as before.
+- **A sample-size-weighted log-normal kappa's weight line reports a CV%, like its row**
+  ([#1683](https://github.com/FeRx-NLME/ferx-core/issues/1683)). The console and `ferx summary`
+  line under the row now reads `→  CV% = 11.2 at NARM = 4.0000` instead of the log-scale
+  `→  SD = 0.1120 …`, so it compares directly with the row's `(CV% = … at weight 1)`; a kappa
+  of unknown type gets the same. Additive, logit and custom kappas keep `SD = …`, unweighted
+  rows are unchanged, and the fit YAML is unchanged (`sd_at_typical_weight` × 100 is the CV%).
+- **A sample-size-weighted kappa's weight line is worded like its row and shown when its row's
+  note is** ([#1697](https://github.com/FeRx-NLME/ferx-core/issues/1697),
+  [#1698](https://github.com/FeRx-NLME/ferx-core/issues/1698)). Under a logit kappa the console
+  and `ferx summary` line now reads `→  SD = … at NARM = …, logit scale`, in the row's
+  `(SD = … at weight 1, logit scale)` order. When the row has no CV%/SD note — a custom kappa,
+  or a covariance step that failed or fell back to SIR — the line drops its figure too and
+  reads `weight = NARM (κ ~ N(0, KAPPA/NARM))`; a custom kappa's line used to print `SD = …`.
+  With a computed covariance step, additive and log-normal lines are unchanged; unweighted rows
+  and the fit YAML are unchanged.
+- **`FitOptions::interaction` is now documented as the inherited flag** (#1727): it is
+  what a stage whose method does not fix the η–ε interaction (Gauss-Newton, Laplace, …)
+  inherits; `method = foce` and `method = focei` override it per stage, so setting it has
+  no effect on those stages. No behaviour change.
+- **`stats::npde::compute_npde_npd` returns `Result<Vec<SubjectNpde>, String>`**
+  (#1740), so it can refuse a population carrying a categorical covariate value
+  outside the model's levels. Callers add `?` (or handle the `Err`).
+- **The non-`fit` entry points return `EngineError` instead of `String`, carrying
+  `ferx check`'s code** (#1746). `predict()`, `predict_diag()`, `predict_survival()`,
+  `predict_categorical()`, the `simulate*` family, `simulate_adaptive*`,
+  `compute_npde_npd()`, `run_sir()`, `run_covariance()` and `inits_from_nca()` now hand
+  back the `Diagnostic` `ferx check` reports for the same refusal — `code()`, `block()`,
+  `suggestion()` — so a caller matches on `E_COV_LEVEL_UNKNOWN` rather than parsing the
+  message. A refusal `ferx check` has no code for carries none. `to_string()` is the old
+  message byte for byte (`run_sir` / `run_covariance` keep their `"run_sir: "` prefix,
+  now also available as `context()`), so printing code is unaffected; code that bound
+  the error as a `String` needs `.to_string()`. `fit()` still returns `String`.
+- **`fit()` and the file entry points return `EngineError` instead of `String`**
+  (#1772): `fit`, `fit_from_files`, `prepare_run`, `prepare_run_with_inits`,
+  `run_model_with_data`, `run_model_with_data_inits`, `run_model_with_overrides`,
+  `run_model_simulate`, `run_model_simulate_with_overrides` and `read_population_with`.
+  `to_string()` is the old message, byte for byte, so code that only prints or searches
+  the text adds `.to_string()` (or `.map_err(|e| e.to_string())` before a `?` into a
+  `String`). A refusal `ferx check` codes now carries that code on `fit()` too, as it
+  already did on `predict()`: the model/data preconditions, an unbound `theta NAME[...]`
+  block (`E_THETA_LEVELS_UNBOUND`), a transit / inverse-Gaussian closed form it cannot
+  fit (`E_TRANSIT_UNSUPPORTED`, `E_IG_UNSUPPORTED`, `E_TRANSIT_FLIP_FLOP`,
+  `E_IG_FLIP_FLOP`), and on the file entry points the model and data reads (`E_MODEL_READ`,
+  the parse codes, `E_DATA`, `E_MISSING_COVARIATE`, `E_COVARIATE_NOT_NUMERIC`) and the
+  binders (`E_THETA_LEVEL_BINDING`, `E_COVARIATE_STATS_BINDING`). `fit()`-only refusals
+  with no `ferx check` code (mixture options, LTBS on a hand-built model, `iiv_on_ruv`,
+  RTTE / binary / CTMM records, the `[simulation]` design checks) have `code()` `None`
+  (#1788).
+- **The binders return `EngineError` with a code** (#1773). `bind_theta_levels`,
+  `bind_covariate_stats`, `bind_from_fit`, `layout_from_fit` and the deprecated
+  `bind_theta_levels_from_fit` return `Result<(), EngineError>` instead of
+  `Result<(), String>`. A level-block refusal carries `E_THETA_LEVEL_BINDING` (block
+  `parameters`) and a covariate-statistics refusal `E_COVARIATE_STATS_BINDING` (block
+  `covariate_model`), the codes `ferx check --data` reports for the same failure, and
+  now also for refusals only a from-fit binding reaches, such as a design level the fit
+  estimated no θ for. `run_sir` / `run_covariance` pass that code through. The text is
+  unchanged: `to_string()` is the old message, so code that matched on it keeps
+  working; call `.to_string()` where a `String` is needed.
+- **`ferx check` reports three refusals `fit()` already made** (#1774): with `--data`,
+  a covariate that varies within a subject on a survival hazard, binary predictor or
+  CTMM intensity (`E_ENDPOINT_TV_COVARIATE`), and an analytic `[scaling] y` readout of
+  the `depot` amount across an EVID=3/4 reset or a dose into a non-default compartment
+  (`E_READOUT_DEPOT_UNSUPPORTED`); without `--data`, a `TIME`-dependent individual
+  parameter that reaches an ODE-accumulated hazard (`E_ENDPOINT_TIME_DEPENDENT_PK`,
+  #1853). Such inputs were reported `valid: true` and then refused by `fit()`; they are
+  now `valid: false`.
+- **`simulate_with_uncertainty()` no longer asks for a horizon option it does not have**
+  (#1774): a repeated-event or drug-driven TTE model, which needs a horizon, was refused
+  with "set `SimulateOptions.horizon`", an option of `simulate_with_options()`. The refusal
+  (`E_SIMULATE_HORIZON`) now names `SimulateUncertaintyOptions.horizon`, the option this
+  entry point takes since #2003.
+- **`covariance_method = s` no longer builds, or fails on, the `R` matrix** (#1803).
+  `S⁻¹` reads only the per-subject scores, but the step used to assemble `R` first and
+  refuse `s` whenever `R` had a flat or non-finite diagonal or no positive eigenvalue,
+  though `S⁻¹` may well exist there. `s` now succeeds wherever `S` is full-rank, with the
+  same matrix as before wherever it already succeeded, and fails only on a singular `S`
+  or a score that cannot be computed — so it no longer hands the SIR fallback an
+  `R`-based proposal. Under `rsr` at an estimate that minimised the covariance objective
+  (FOCE, FOCEI, Gauss–Newton, Laplace), a failed `S` now stops the step before `R`'s
+  stencil runs. The step fails either way; where `R` also has no positive eigenvalue it
+  now reports `S`'s failure rather than `R`'s. With a SIR fallback armed
+  (`covariance_fallback = sir` or `sir = true`) `rsr` still builds `R` first, so an `R`
+  with no positive eigenvalue still hands SIR its proposal. The pre-fit cost note and
+  `covariance_n_evals_estimated` now count `R`'s finite-difference route as `2n²`
+  objective evaluations, where they used to quote `n²`, and are absent under `s`.
+- **`run_sir()` / `run_covariance()` refuse a population that is not the fit's with
+  code `E_POPULATION_MISMATCH`** (#1813). Every such refusal, a subject list that is
+  not the fit's included, now carries the code and one message: what differs, and
+  how the population was obtained (supplied, or re-read with which settings, and
+  whether the fit recorded the data file's SHA-256). The message no longer names a
+  cause the check had not established ("this version of ferx reads the file
+  differently", "it was given its population in memory"), and the remedy, "use the
+  population the fit was given, or refit", is in `suggestion()` instead of Rust-only
+  advice. A dose edited without changing the dose count now says so, rather than
+  "differ: 1 in this population, 1 in the fit's". When the population is the fit's
+  but the fit's per-subject results are another count or order (a fit rebuilt from
+  separate fields), the refusal is `E_FIT_SUBJECTS_MISMATCH`, naming the fit's rows
+  rather than the population.
+- **A covariate change on a TTE / CTMM row now counts as time-varying** (#1854): the
+  reader kept no covariate from a row routed to a `[event_model]` or `[markov_model]`
+  endpoint, so a covariate that changed only on such rows — or whose subject baseline
+  came from one — looked constant, and an endpoint evaluated at the baseline was not
+  refused. Each such row's covariates are now kept in the new `Subject::endpoint_covariates`
+  field and read by the time-varying-covariate check (`E_ENDPOINT_TV_COVARIATE`), which
+  also compares them with the subject's baseline — the first value on any row, including
+  one skipped for a missing DV or removed by `[data_selection]` — so a model accepted
+  before can now be refused. The population fingerprint hashes the new
+  snapshots (encoding scheme 5), so a fingerprint saved by an earlier version is not
+  compared, with a warning, rather than reported as a mismatch.
+- **A name assigned inside an `if` without an `else` can no longer be read
+  where it may be unassigned** (#1857): if an `[individual_parameters]` name is
+  not assigned on every path through an `if` (no `else`, or not in every branch),
+  any read of it is now a parse error that names the variable and what reads it.
+  This covers a later statement or condition in the block, any other block, and
+  the dose attributes (`F`, `ALAG`, `F1`, …). Before, depending on the reader, it
+  silently became `0` on records where the branch did not run (a `pk(...)` role,
+  `f=`, a later statement), was read from a same-named data column (a
+  `[structural_model]` readout or `[scaling]`), or was dropped (an ODE `F`). Fix
+  the model by assigning a default before the `if` (`E0 = 0` matches NONMEM's
+  behaviour for an `ETA`-dependent variable; for bioavailability use `F = 1`)
+  or by adding an `else`. This also refuses the NONMEM pattern of one `if` per
+  category (`if (SEX == 0) {…}` then `if (SEX == 1) {…}`) when a later line reads
+  the name, even if the data hold no other category: write it as one
+  `if`/`else if`/`else` chain.
+- **Breaking (output values):** a log-normal (or untyped) OMEGA / KAPPA variance is
+  now reported as the exact CV%, `sqrt(exp(variance) - 1) * 100`, instead of the
+  first-order `sqrt(variance) * 100` — on the console rows, `format_summary()`,
+  `format_kappa_rows_from()` and the fit YAML's `cv_pct` key, whose value changes
+  for downstream readers (0.2: 44.72 → 47.05; 2.37: 153.95 → 311.41; a variance
+  past ~709.8, where the exact CV% overflows, writes YAML's `.inf`). A weighted
+  kappa's weight line now prints the exact CV% at the typical arm,
+  `sqrt(exp(variance / n) - 1) * 100`, and the fit YAML gains a matching
+  `cv_pct_at_typical_weight` key on log-normal and untyped weighted kappas (#1858).
+- **`theta_level_values` reports a standard error and a SIR interval for every
+  level of a θ level block** (#1890, the engine half of ferx-r#528). It takes two
+  new arguments, the fit's `covariance_matrix` and its kept `sir_resamples_packed`
+  (pass `None, None` for values only), and `ThetaLevelValue` gains `se` and
+  `sir_ci`. A free level's are its `se_theta` and `sir_ci_theta` entries. A
+  sum-to-zero dependent level's `se` is the delta-method standard error of the
+  negated sum of its group's free θ, taken on the packed scale the covariance is
+  on, and its `sir_ci` is the percentile interval of that sum over the draws. A
+  `ref` reference level has neither.
+- **`impmap_sobol` now applies to every proposal form** (#1965): the default Student-t
+  proposal and the defensive mixture (`imp_defensive_alpha > 0`) included. Before, it
+  worked only with `impmap_proposal_df = normal` and was otherwise ignored with a warning,
+  so with default settings it never ran. The Student-t scale and the mixture component now
+  come from the same Sobol point as the normals. Fits that set `impmap_sobol = true` with a
+  t proposal or a mixture now give different estimates; on the default t₄ proposal the
+  spread across seeds fell 1.2–60× in the #1965 benchmark (the mixture path was not
+  benchmarked). Seeded fits without Sobol are unchanged.
+- **Sobol draws for IMP/IMPMAP are now Owen-scrambled** (#1965) instead of randomized by one
+  random shift per coordinate (Cranley–Patterson). Scrambling keeps the points' stratification,
+  and on the default t₄ proposal at K = 300 it cut the spread of the final −2LL across seeds a
+  further 1.3–2.2× in the #1965 benchmark. Seeded fits with `impmap_sobol = true` or
+  `imp_sobol = true` draw different points, so their results are no longer bit-compatible
+  with earlier versions and estimates may change. This includes normal-proposal fits, which
+  the first #1965 change left unchanged. Fits without Sobol are unchanged.
+- **On data with `EVID=3`/`EVID=4` periods that restart `TIME`, `[individual_parameters]`
+  (and kappa `weight` expressions) now read the `TIME` as written in each period** (#1969), as
+  NONMEM's `$PK` does, instead of the internally shifted clock. This covers every record of
+  the period: observations, `EVID=2` rows, doses (their `F`, lag and modeled rate/duration)
+  and the reset row that re-seeds `init(...)`. **Results change for any model that reads
+  `TIME` in `[individual_parameters]` on such data** (9800 OFV on the reset fixture; now
+  matching NONMEM). `TIME` inside `[odes]` is unchanged. A `.fitrx` or R fit object stored
+  before this release carries an older population fingerprint, which is treated as absent,
+  with a warning.
+- **Adaptive-dosing refusals now carry a code once the driver runs** (#1983): a
+  controller action the driver refuses (a dose into compartment 0, past the model's
+  states, into an input-rate or lagged compartment, a bad amount or rate, or a `Stop`
+  with actions after it) is `E_ADAPTIVE_CONTROLLER_ACTION` on `simulate_adaptive`, and
+  `E_ADAPTIVE_SPEC` (block `adaptive_dosing`) on `simulate_adaptive_from_spec`, whose
+  controller is the spec's `route` — a `route` compartment out of range or fed by an
+  input-rate function is now refused there before any subject runs; two of a subject's times
+  (decision, observation, EVID=2, reset or base-dose) within 1e-15 of each other without
+  being equal is `E_ADAPTIVE_OPTIONS`; a base dose the driver cannot replay, a non-finite
+  break time, or a `TAD` read before any dose is `E_ADAPTIVE_UNSUPPORTED`.
+  `max_decisions`, a monitor compartment out of range, a `Dv` monitor with no
+  `[error_model]` (`E_ADAPTIVE_SPEC` on `simulate_adaptive_from_spec`), and a base
+  regimen with an EVID=3/4 reset under a time-varying covariate or IOV are now refused
+  before any subject is simulated — also when `n_sim = 0` or the population is empty,
+  which used to return an empty result — so those messages no longer start with
+  `subject '…' (sim N):` (the reset one starts with `subject '…':`). A frozen-replay or
+  snapshot verification failure still carries no code.
+- **A level block aliased with another θ is now refused for that reason, and the
+  message names the θ** (#1991). Before, it got the random-effect refusal. For
+  `E0 = … + TVB * D2 + PLACEBO + ETA_E0` the message now says that under
+  `contrast = ref` the coded levels move `y` exactly as `TVB` does. It adds
+  that dropping the random effect would leave `TVB` aliased, and advises
+  removing `TVB` or the block — the block only when the other θ keep their
+  rank without it. Nested blocks under a global contrast, and
+  one-column blocks under `none` next to an intercept, keep their refusal. When
+  the levels are aliased, it no longer advises dropping the random effect
+  there, and it advises `sum_to_zero_within` only when that contrast keeps its
+  rank too. That old advice led to a model that bound while still aliased.
+- **The cold inner multi-start now screens 100 Sobol draws for an off-axis start**
+  (#2013): before its axis seeds, the cold EBE solve scores `inner_screen` draws from
+  N(0, 4Ω) and descends from the three lowest, keeping a result only when it is lower
+  and more than 0.5 apart from the incumbent in the Ω⁻¹ metric. A subject whose
+  individual objective has a second, deeper mode off every axis — a flip-flop
+  absorption subject is the common case — now reaches it, and the fit names such
+  subjects in a `W_EBE_START_DEPENDENT` warning. A subject with a single mode keeps
+  its EBE bit for bit. The draws are keyed by subject ID, so results do not depend on
+  thread count or data order. `inner_screen = 0` restores the previous solve.
+- `ModelSource::read_verified` now returns a coded `EngineError` instead of a
+  `String`: an edited model file is `E_FIT_INPUT_CHANGED`, an unreadable one
+  `E_MODEL_READ`, and one that does not parse carries the parse's code — the
+  classifier `ferx check` and `run_sir` / `run_covariance` already use. The
+  error's text is unchanged. This lets ferx-r's `ferx_sir()` /
+  `ferx_covariance()` raise a coded refusal for a model-hash mismatch (#2027).
+- With nested levels, the console's `--- Kappa Shrinkage (pooled) ---` block now names
+  each kappa's level (`K_ST at STUDY shrinkage: 10.0%`), matching the summary's
+  `Kappa shrinkage:` line, since the pool is that level's groups. A one-level fit's
+  console output is unchanged (#2083).
+- **`ferx --simulate` on a model with nested levels explains why the design falls short**
+  (#2084): when the `[simulation]` block leaves out a level's column, the
+  `E_MISSING_COVARIATE` refusal now names the level and says that a design, with one
+  value per subject, cannot express groups below a subject. It no longer only advises
+  `covariate ARM = <value>`, which gives every subject one group per level, and which the fit
+  refuses with `E_LEVEL_SINGLE_MEMBER` when a kappa twins a random effect of the level
+  above it. It points to `simulate()` on a dataset with the level columns instead.
+- **A `profile`d block may be read through an `if` on data, or more than once** (#2114):
+  an `if` branch or inline `if` whose condition reads data only (`B = if (WT > 70)
+  PLACEBO * 2 else PLACEBO`) and a sum of reads (`A = PLACEBO * X`, `B = PLACEBO * Z`,
+  `y = A + B`) are affine with a data-only coefficient, and are accepted where they were
+  refused with `E_PROFILE_NOT_LINEAR`. A condition reading a θ, an η or the block, a
+  branch that is not itself affine, and two reads multiplied or divided are still
+  refused.
+- **Adaptive-dosing simulation refuses a log-transformed error model** (#2129):
+  `log(DV) ~ additive(…)` / `DV ~ log_additive(…)` is now `E_ADAPTIVE_UNSUPPORTED` in
+  `simulate_adaptive` and `simulate_adaptive_from_spec`. The reactive driver read,
+  noised and returned the linear readout, so its trajectories disagreed with
+  `simulate()` (which reports `ln(IPRED)`) and a `Dv` signal carried a log-scale σ on a
+  linear value.
+- **A constrained `theta NAME[cols]` block with no bounds written defaults to
+  `(-1e9, 1e9)`** (#2174): its free θ are contrast coefficients, which have no sign, and
+  its init must be 0, so the positive default θ box refused `theta EFF[STUDY](0.0)` and
+  `(0.0) FIX` ("constrained level bounds must include 0 (got 0.000000001..1000000000)").
+  Both now bind, and fit exactly as the written `(0.0, -1e9, 1e9)` does. `contrast =
+  none`, count blocks and scalar θ keep the positive default. A constrained block's
+  written bounds must now hold 0 strictly inside them: `(0.0, 0.0, 5.0)` and
+  `(0.0, -5.0, 0.0)` used to run with every contrast coefficient held to one sign (and,
+  at a lower bound of 0, starting at `1e-10` rather than 0); they are now refused, with
+  the side and the fix named. A `FIX` block, whose bounds do nothing, is exempt.
+- **Reconverged finite-difference gradients re-solve the EBEs at an inner tolerance of at most
+  `1e-7`** (#2261, #2376): the FD outer gradients (used for IOV models without the analytic
+  gradient, and by `reconverge_gradient_interval`), the per-subject salvage gradients, the
+  reported final gradient and the AGQ finite-difference score start each probe at the mode,
+  and at the default `inner_tol = 1e-5` such a probe could stop almost where it began, losing
+  part of the EBE's response from the difference (up to 9e-4 relative error in a gradient
+  on an IOV model, and 35% on one component of the population gradient where subjects take
+  the salvage gradient, measured). Estimates moved by at most 7e-6 relative on the fits
+  measured. The cost, each measured on one fit: 55% on an IOV `gradient = fd` fit
+  (`nested_levels_3`), about 1% on a BOBYQA fit's reported gradient, 64% with
+  `reconverge_gradient_interval = 1`, and 2.9× on a simulated fit where 8 of 24 subjects take
+  the salvage gradient (subjects no analytic gradient serves, such as a steady-state infusion
+  under a lag time). The covariance step keeps `cov_inner_tol`.
+- **`W_NONFINITE_OBJECTIVE` now says which part of a named subject's likelihood
+  failed, and whose contributions it lists** (#2267): a subject is described as
+  having `no Gaussian observation` rather than "every IPRED and PRED finite" when it
+  has none. The sentence names each part of the subject's likelihood whose own value
+  is unusable, as recorded by the FOCE, FOCEI or dense-`R` marginal that scored it (over the
+  stacked `[η, κ]` system for an IOV subject):
+  the residual term (e.g. a proportional error on a prediction of 0), residual
+  variance or covariance, the censored (M3) term, the random-effect prior, the
+  curvature log-determinant (including when the time-to-event, categorical or CTMM
+  Hessian breaks it), each of those non-Gaussian terms, or the IOV + FREM refusal
+  (`failed term: time-to-event on CMT 2 = 1e20`). For a Laplace/AGQ, BAYES or mixture objective, which the
+  post-hoc FOCE/FOCEI contributions do not sum to, the warning says so. An unusable
+  parameter-prior penalty is named, and when no contribution is unusable the warning
+  says why it cannot name a subject instead of ending silently. The structured
+  warning gains `failed_terms`, `contribution_score`,
+  `contributions_are_objective_terms` and `ofv_prior`.
+- **`parse_method_token()` and `apply_method_option()` are public** (ferx-r #506):
+  a front end with its own `method` argument now reads method tokens and chains
+  exactly as a `[fit_options]` `method = ...` line does, so a new estimator (such
+  as `vi`) cannot be missing from a copied token list.
+- **Validation diagnostics gain an `info` severity, and `W_LEVEL_SUMMARY` uses it**
+  (#2387): the per-level row `ferx check --data` prints for a model with nested
+  levels is a fact, not a finding, so it is now `Severity::Info` (`"severity":
+  "info"` in `--json`, `info[W_LEVEL_SUMMARY]` in the human output) and is no longer
+  counted as a warning. A nested-level model with nothing else to report validates
+  clean instead of "with warnings". The summary line counts info rows on their own
+  (`ok: m — no errors (0 warning(s), 2 info)`); exit status is unchanged. Rust callers
+  matching exhaustively on `Severity` need a `Severity::Info` arm; the new
+  `Diagnostic::info`, `Diagnostic::is_warning` and `CheckReport::info_count` go with it.
+- **A profiled fit no longer names a sparse subject in its FD level-gradient
+  warnings** (#2408): a subject with fewer observations than
+  `min_obs_for_convergence_check` whose EBE solve did not converge or fell back
+  to Nelder–Mead still takes the re-solved finite-difference level gradient and
+  level blocks, but is left out of the "could not be given the exact analytic
+  gradient of the profile solve" and "exact analytic Hessian of their objective
+  terms" counts, as the unconverged-EBE count already leaves it out.
+- **A fit with a `profile`d θ level block steps its structural covariance stencil at `3e-3`
+  by default** (#2414), not the global `fd_hessian_step = 1e-2`. The profile objective's FD
+  Hessian is about ten times further from the exact one at the same step. On the test
+  fixtures, `r` standard errors that sat 0.4–0.75% from the unprofiled fit's exact ones at
+  `1e-2` are now under 0.1%; on a nested fixture with a `correlation` line at the default
+  inner tolerance the gap shrinks from 0.5% to 0.13%. An explicit `fd_hessian_step` is used
+  as written, `1e-2` included. A caller building `FitOptions` by hand raises the new
+  `fd_hessian_step_set` with the step.
+- **Every model with a `theta NAME[COLS]` level block gets one rank check at bind
+  time** (#2421): the binder refuses a model whose free θ, each block coded under
+  its contrast, are rank-deficient over every value the likelihood reads
+  (predictions, residual magnitudes, hazard and categorical records, every
+  mixture class) at both probe points. The refusal names a minimal set of
+  aliased θ and blocks, and a contrast that keeps the rank when there is one.
+  Before, only a block rescuing a random effect was checked, so
+  `TVE0 + PLACEBO` under `contrast = none` bound with a flat direction. `auto`
+  moves a block that absorbs nothing to the first contrast under which the
+  model keeps its rank, and a nested block resolved to `sum_to_zero_within`
+  whose remaining direction the other θ carry is refused naming the random
+  effect. A free θ, or a block's level, that moves no value at either probe
+  point is refused too, also where the dead-level check does not run. The random-effect span certificate now also runs on models with a
+  hazard, a categorical or Markov endpoint, a mixture (every class) or a
+  diffusion term, where an absorbed random effect used to bind. Models that
+  bound aliased before, including θ outside every block that duplicate each
+  other in a model with a block, are now refused.
+- **`EndpointLikelihood::Tte` has a `hazard_program` field** (#2437): the dual-evaluable
+  form of an analytic hazard's parameter expressions, which gives the FOCEI Laplace term
+  its exact η-Hessian. Code that builds the variant by hand sets it to `None` and keeps the
+  finite-difference Hessian.
+- The model-based meta-analysis (MBMA) features now carry a **beta** maturity label, each
+  backed by a NONMEM anchor: θ level blocks, `profile`d level blocks, nested variability
+  levels, within-arm residual `correlation`, residual and kappa `weight =`, and
+  compartment-free `[structural_model]`s. The Feature Maturity table has a new MBMA group
+  listing them; residual `weight =`, kappa `weight =` and residual `correlation` were
+  labelled experimental, and the others read as stable from their page's banner (#2463).
+- **`final_gradient_source` reports `"analytic"`** (#2482) for a derivative-free fit whose
+  model is in the exact gradient's scope (previously `"finite_difference"`), and
+  `optimizer = auto` now picks `nlopt_lbfgs` for time-to-event, binary and CTMM models.
+- **Verification legs settle at the objective's measured resolution** (#2482): a gradient
+  fit's tight-tolerance verification legs (#2462) end when a leg improves on the one before
+  it by no more than the gap between two scores of its own starting point, instead of only
+  when it fails to improve at all. On a noise-floored objective this saves a leg
+  (`ctmm_pd_2state`: 248 → 173 evaluations, same optimum).
+- Rust API: the public field `CompiledModel::endpoints` is now a `BTreeMap<usize, EndpointLikelihood>`
+  (was a `HashMap`), so it iterates in ascending CMT order. Lookups and inserts are spelled the
+  same; code that names the `HashMap` type must change (#2531).
+- **A one-line additive typical value is now a mu-reference** (#2544):
+  `BASE = TVE0 + PLACEBO + ETA_E0 + KAPPA_ARM` (one bare theta, one eta, and terms
+  that read neither) gets the same `ETA_E0 → TVE0` anchor as
+  `E0 = TVE0 + ETA_E0`, so SAEM moves TVE0 by its closed-form update and no longer
+  warns `not mu-referenced: BASE`. On the shipped `mbma_placebo` example SAEM now lands
+  where the split spelling does (about 97–99 against the FOCEI minimum 97.07, instead
+  of 101–108). An additive anchor, in either spelling, is now kept only when its
+  theta and eta reach the model through that line alone; a theta also read in
+  another block, or by another individual parameter the model reads, is warned
+  about instead. FOCE/FOCEI on the affected MBMA models gives the same estimates to
+  every printed digit.
+- **`predict_warm_etas` takes the first-order prediction whole** (#2549): the public
+  Almquist Eq. 48 helper no longer caps a subject's predicted step at an L2 norm of 2. The
+  mode response is the mode's exact derivative, so the uncapped start is second-order
+  accurate; every cap measured lost outer iterations on some model. In a fit, a predicted
+  start at which the objective is undefined starts at the mode it was predicted from. The
+  built-in `bfgs`/`lbfgs` outer loop now takes its mode response from the gradient's own
+  sweeps, as the NLopt optimizers do, and like them leaves `[covariate_nn]` models, IOV
+  and mixture models, and AGQ with more than one node unpredicted. `FERX_EBE_PREDICTOR=0` switches the predictor off for every optimizer.
+- **A FOCE/FOCEI verification leg starts at the incumbent's modes** (#2549): the #2462 leg
+  re-solves at a tighter inner tolerance from the point it verifies, and its inner solves now
+  start at that point's own EBEs instead of cold. A cold start could leave an ODE subject
+  unconverged at the leg's tolerance, have the leg's start rejected, and report a fit far
+  above the optimum it had reached.
+- `saem_kernel = imh` (the f-SAEM independent Metropolis-Hastings E-step) now runs on
+  ODE models whose eta-gradient and eta-Jacobian the dual ODE walk serves exactly,
+  instead of declining them to the random walk with a warning. SDE models and ODE
+  shapes the walk does not cover still run the random walk. On an RK45-integrated
+  ODE twin of the 100-subject busulfan bench (Linux, 6 seeds) it lowers the
+  importance-sampled -2 log L by 2.4 on every seed at the same CPU; on a TMDD
+  model whose thetas mostly carry no eta it ties the random walk at 27 % less CPU
+  (#2639).
+- **IMP and IMPMAP fits now say which objective is which** (#2654): the console
+  report and the fit YAML name `ofv` as Laplace on these fits and print the
+  importance-sampling marginal and its Monte-Carlo SE next to it, since the
+  marginal is what NONMEM `METHOD=IMP` reports. `ferx summary` carries the same
+  label. The YAML `objective_function`
+  block gains `ofv_type`, `marginal_minus2_log_likelihood` and
+  `marginal_mc_standard_error`; `ofv`, AIC and BIC keep their values. The
+  `imp_auto` / `impmap_auto` docs now state the real rule, a per-subject MC SE
+  target of 0.05, instead of a total SE of 1.0.
+- **`imp_auto` / `impmap_auto` no longer let a cold start set K for the whole run**
+  (#2687): K now rises only once the objective has settled or the averaging window
+  is about to start, each rise is sized to the Monte-Carlo SE instead of always
+  doubling, and K halves again, down to the starting count, when the SE falls below
+  half the target. K also stops rising once SE²·K has doubled since the first rise,
+  which means extra samples are not lowering the SE. Fits that used `auto` can land
+  on different numbers at the same seed.
+- **`.fitrx` format version 2** ([#2695](https://github.com/FeRx-NLME/ferx-core/issues/2695)):
+  a bundle now holds everything the ferx-core and ferx-r writers each held. `FORMAT_VERSION`
+  is `"2"`, and a v1 bundle, including one named by `[priors] from_fit`, is refused with the
+  version error: refit to get a v2 bundle, there is no migration. New entries are
+  `predictions_discrete.csv`, `covtab.csv`, `trace.csv` and `interface_extras.json`; new
+  `fit.json` keys are `stalled_at_init`, `estimate_near_boundary`, `max_abs_correlation`,
+  `cov_fixed`, `covariate_types`, `bayes`, `importance_sampling`, `impmap_trace` and
+  `exclusions`, the first four replacing what ferx-r kept in `r_extras`. `FitResult` gains
+  `trace_csv`, `cov_fixed` and `interface_extras` (a JSON document an interface stores with
+  the fit and core returns byte for byte), and `LoadedFit` gains `verdicts`. A reloaded
+  binary-endpoint fit keeps its discrete rows, so its sdtab is no longer refused; a
+  time-to-event endpoint still is. Keys that used to default for an older file are now
+  required.
+- **`save_fit` refuses data and model text that were not fitted** ([#2696](https://github.com/FeRx-NLME/ferx-core/issues/2696)):
+  with `include_data` or `--include-data`, a file whose SHA-256 is not the fit's
+  `data_hash` is refused and named, and model text that does not match `model_hash` is
+  refused too. On the CLI the fit still completes, with a warning that no bundle was
+  written. A fit with no recorded hash is written unchecked.
+- **The outer-gradient fallback warning now says why subjects fell back** (#2713). The
+  old catch-all ("a shape no analytic recorder serves, or a trial point where it could
+  not be formed") is replaced by a count per cause: an inner Hessian that was singular,
+  or indefinite at an EBE off a strict mode, versus a subject no recorder served (a data
+  shape outside the recorders' scope, or a recording that failed at a trial point).
+- **A data-driven θ level block is read bare only** (#2744). A subscripted read of a
+  `theta NAME[COL, ...]` block (`NAME[COL]`, `NAME[TIME]`, a computed `NAME[COL + 0]`
+  or a literal `NAME[2]`) is now a parse error (`E_PARSE`) that names the bare spelling
+  `NAME`, in every place the block can be read. It used to be accepted and index the
+  block by the number it evaluated to: equal to the bare read when that column held
+  exactly 1..N, and otherwise a range error, a dead-level refusal, or (for `TIME` and a
+  computed index) a fit at the divergence sentinel. Drop the subscript, or use the
+  counted form `theta NAME[N]` read as `NAME[COLUMN]`, which is unchanged.
+- **A mixture fit's L-BFGS stop is verified at a tight inner tolerance** (#2745): the
+  #2462 verification leg now runs on `[mixture]` models, which `optimizer = auto` sends
+  to L-BFGS since #3025. A stop the leg cannot confirm is no longer reported
+  `converged`. On the bundled mixture fixtures the leg gains nothing and the fit is
+  unchanged; it adds about a third more evaluations on the 120-subject
+  `mixture_2cpt_oral_iov` example. A mixture takes the legs that start from its own
+  modes, not the cold-mode and Newton-step rounds that follow them for other models.
+- **Exact derivatives come from compiled per-subject plans** (#2786): each subject's
+  predictions, likelihood kernel and covariance passes are recorded once and compiled
+  (Cranelift), and every gradient, inner Hessian and R-matrix — FOCE, FOCEI, Laplace, AGQ,
+  SAEM/VI scores, mixtures, SIR — is taken from those plans by forward and reverse passes. The
+  dual-number types (`Dual1`, `DualMixed`, `DualF`, `DualV`, `DualH`, the scalar reverse tape)
+  are gone from the public API (`sens::dual1`, `sens::dual_mixed`, `ode_predictions_ekf`,
+  `survival::data_term_hessian_fd` and the `one_cpt` dual helpers are removed; `PkNum` gains the
+  plan-recording methods). Width limits went with them: any number of random effects (including
+  stacked IOV `[η, κ]` past 48 and Laplace's exact anchor past 8) gets exact derivatives, and the
+  covariance step no longer declines a subject for its width. Finite differences remain only behind
+  `gradient_method = fd` and as a safety net that ordinary models no longer reach.
+- **The BHHH Newton decrement serves AGQ, Laplace and mixture fits** (#2786): the check that keeps
+  a fit from stopping while a Newton step would still gain OFV (#1934) now forms its per-subject
+  gradients from the quadrature's and the mixture's own exact gradients, where it was withheld
+  before; and a failed exact derivative of the mixing probabilities or the SIR log-Jacobian is
+  counted in `W_PLAN_FD_FALLBACK` instead of falling back to finite differences silently.
+- **The Newton start from a verified incumbent now also serves AGQ and `[mixture]` fits** (#2786):
+  the step's gate follows the exact outer gradient's scope (`analytic_outer_gradient_available`)
+  instead of the narrower FOCE-family list, so those fits can take the polish leg and report its
+  convergence diagnostics; a model on `gradient = fd` still takes none.
+- **Standalone `run_covariance` / `run_sir` keep the fit's gradient record** (#2786): a
+  standalone step no longer rewrites the fit's `gradient_method_inner/outer` or removes its
+  `W_PLAN_FD_FALLBACK`; if the step itself falls back it adds its own warning naming the step.
+  A `.fitrx` written before the gradient label became `analytic` (`analytic (Dual2)`) is read as
+  analytic, so loading it no longer warns about an unrecorded finite-difference route.
+- `mixture::mixture_gradient` now serves an inter-occasion-variability (IOV) mixture
+  exactly: it re-solves every class's per-occasion modes and differentiates at them, where
+  it used to return `None` and send the caller to a whole-objective finite difference
+  (#2786).
+- **Gauss-Newton reports its exact gradients** (#2786): `method = gn` / `gn_hybrid` take each
+  subject's θ score from the exact plan contractions, so `gradient_method_outer` now reads
+  `analytic` for them (it read `finite differences` unconditionally), and `gradient = fd` now
+  forces their θ scores to finite differences as it does for FOCE / FOCEI.
+- **SDE models: one filter solve, and SAEM's IMH kernel** (#2786): the extended Kalman
+  filter's measurement variance is now the residual variance at the filter's own mean, so a
+  `[diffusion]` subject's likelihood no longer integrates the ODE a second time for it (values
+  move at the solver tolerance). `saem_kernel = imh` now serves SDE models: its proposal's
+  gradient and curvature carry the filter's process-noise variance.
+- **A parameter collapsed onto ferx's internal lower guard no longer gets a standard
+  error** (#2797). A variance or sigma at the floor of its log packing, or a THETA with
+  no declared lower bound on the internal `1e-10` floor, prints `N/A` (YAML: `se: ~`,
+  `held: collapsed_at_guard`). When the covariance step's `R` is clean, the other SEs are
+  computed with it held at its estimate, as for a `FIX` parameter (they move by about
+  1e-5 relative on the reference fixture). A floored `R` or an `S` fallback keeps the
+  unconditional matrix unchanged. The new `FitResult::held_at_bound` lists every such
+  parameter, the profiled levels on their bound included (`profiled_bound`), with its
+  reason. `cov_fixed` marks a collapsed row only when the step held it, and the guard
+  warning says which case applies. `profiled_levels_at_bound` is still filled but is
+  deprecated in favour of `held_at_bound`.
+- The positive Durbin–Watson warning on a compartment-free model (an MBMA or other
+  algebraic `[structural_model]`) no longer recommends a transit absorption model,
+  an extra compartment or IOV on ka/F, none of which such a model has. It names a
+  `correlation ar1(RHO) by …` line instead, `by` the grouping the model declares
+  (its `iov_column`, or the innermost level when levels are nested), or asks for a
+  grouping when there is none. Models with compartments get the same text as
+  before, and the statistic itself is unchanged (#2798).
+- **Durbin–Watson values move on every model** (#2798): `dw_statistic` and
+  `iwres_lag1_r` now pair only rows of one subject that share an occasion (an
+  `iov_column`, a derived `iov_occasion`, or a nested model's innermost level cell)
+  and, under a `correlation … by` line, a residual block. The Durbin–Watson
+  denominator is pair-normalised, `Σ (eₜ² + eₜ₋₁²)/2` over the same pairs, so
+  independent residuals give 2 however short the series are. The classic `Σ e²`
+  form read about `2·pairs/rows` instead (1.70 on the naproxen MBMA, which warned
+  low on 12% of correct models; now about 1% on each side, so about 2% in all
+  counting the high-DW warning, which never fired on that layout before). The thresholds
+  stay 1.5 and 2.5.
+  Values from earlier versions are not comparable. The public
+  `iwres_autocorrelation` keeps its signature and stays ungrouped (one series per
+  subject), pair-normalised.
+- **`RAYON_NUM_THREADS` now sets the worker count of a fit that does not pin
+  `threads`** (#2800). A positive value is used as given — no "minus one", no cap
+  at 8 — so a container started with `--cpus 8 RAYON_NUM_THREADS=8` fits on 8
+  workers, not 7. An explicit count still wins: the R `threads` argument, the
+  CLI's `--threads N` and `[fit_options] threads = N`. `threads = 0` / `auto`
+  name the engine default, which now includes the variable. A value that is not a
+  non-negative integer is ignored with a warning; the variable is read once per
+  process. The "more threads than subjects" note now says where the count came
+  from. Environments that already set `RAYON_NUM_THREADS=1` (CI runners, for
+  instance) now run unpinned fits on one worker.
+- **A collapsed `[mixture]` per-class override is now held and listed in
+  `held_at_bound`** (#2809): an `omega(k)` or `sigma(k)` override on ferx's internal
+  lower guard is held by the covariance step under the same rule as a base parameter
+  (#2797), so the other standard errors equal a run with the override `FIX`, and the
+  guard warning's "computed with them held at the floor" is now true for it. Its
+  `held_at_bound` entry carries a new `class` field (1-based, `omega(2)` → `2`); `kind`
+  and `index` name the base parameter it overrides, which keeps its own SE. `class` is
+  omitted for a base entry, so a `.fitrx` with no override entry is byte-unchanged; a
+  reader built before this change drops it and would read the override as its base.
+  `FitResult::status()` follows the same rule: a held override collapse adds no reason,
+  and one the step did not hold (a floored `R` or an `S` fallback) is listed as
+  `collapsed_at_guard` under its `_MIX{k}` name.
+- The `E_THETA_LEVEL_BINDING` refusal for a `theta NAME[COL]` block with no levels, on data
+  no reader could make define one (for example TTE-only data), now says "no Gaussian rows"
+  twice rather than three times when the block is read bare, and ends on a next step: drop
+  the block when nothing reads it, declare it as one scalar `theta NAME` when something reads
+  it bare, or add rows that define a level, scored by an expression that reads it (#2819).
+- **The Durbin–Watson statistic joins occasions that run in time** (#2829):
+  `dw_statistic` and `iwres_lag1_r` split a subject's residual series at its
+  occasions only when they are parallel (study arms, level cells, which restart
+  the clock). Occasions that follow one another in time (dosing intervals, study
+  periods) are one series, whether `iov_column` or an `iov_occasion` rule
+  declares them. Under the split of #2798 every occasion ended a series, so a
+  design with one observation per occasion, such as sparse TDM, had no statistic
+  (`NaN`) and no warning; it has both again. Values move on models with
+  time-ordered occasions (the bundled `warfarin_iov` at its initial estimates:
+  0.13 to 0.42). On a compartment-free model the warning's advice names the
+  `iov_column` only when the statistic was split there.
+- **The Durbin–Watson statistic joins `correlation … by` blocks that run in time**
+  (#2858): under a `correlation` line, `dw_statistic` and `iwres_lag1_r` split a
+  subject's decorrelated residuals at its blocks only when the blocks are parallel
+  (study arms, which restart the clock). Blocks that follow one another in time,
+  such as `by OCC` over visits, are one series, by the rule occasions follow since
+  #2829. Paired within blocks only, a line `by` the visits hid the cross-visit
+  pairs, and with one row per block the statistic was `NaN`. Values move on fits
+  with such a line; no estimate or objective does. When the statistic pairs across
+  blocks, the positive warning says so and names a line `by ID`. A second warning
+  reports positive autocorrelation between consecutive blocks when the statistic
+  over the pairs that join two blocks alone is below 1.5 (at least 62 such pairs)
+  while the pooled one is not, as with several rows per visit under `by OCC`.
+- **`vpc_rtte()` reads the observed data on `[0, sim.horizon]` only** (#2908): with
+  `sim.horizon` below the data's follow-up, the observed curves are now cut at the horizon as
+  the replicates are (events after it dropped, follow-up ending there), so the gap-time curves
+  compare like with like. The result equals calling `vpc_rtte()` on the data cut at the horizon
+  first, including the default `max_order` (which can now be lower) and the
+  `W_VPC_RTTE_ENDS_ON_EVENT` count. `W_VPC_RTTE_HORIZON_BELOW_FOLLOW_UP` is no longer raised.
+  With `sim.horizon` unset nothing changes.
+- **A leftover `[initial_values]` block is a warning, not a parse error** (#2913): the
+  block has not been read for several releases, so a stored model or archived run
+  carrying one now parses again, with a `W_DEPRECATED_BLOCK` warning (in `ferx check`
+  and the fit's warnings) saying it is ignored and that deleting it cannot change the
+  fit. Its contents are dropped exactly as before; `E_DEPRECATED_BLOCK` no longer exists.
+- `[data] path` is now optional (#2914). A `[data]` block may carry only column
+  maps for a model whose dataset is always passed by the caller (`--data`,
+  `ferx_fit(data = ...)`, `ferx_simulate(data = ...)`), so such a model parses and
+  can be copied away from its dataset. With no path on either side the file entry
+  points still refuse with `E_DATA_PATH_MISSING`, whose message now reads "set
+  `path = ...` in the model file's `[data]` block".
+- An `[error_model]` magnitude expression can now read a name assigned in
+  `[individual_parameters]`, as every other block does, when that name is
+  assigned once at top level without a random effect (e.g. `ISPK = 1`, then
+  `DV ~ additive(S * ISPK)`); its definition is substituted into the
+  expression. A name that depends on η, or is assigned in an `if/else` branch
+  or more than once, is rejected with that reason instead of being reported as
+  an undeclared covariate. A θ that `[individual_parameters]` reassigns under
+  its own name (`CL = CL * exp(ETA_CL)`) now means the assigned value there too,
+  where the error model used to read the raw θ silently (#2915).
+- `vpc_tte()`, `vpc_rtte()` and `vpc_kmmc()` now refuse an empty `VpcGrid::Times` grid
+  with `E_VPC_TTE_INPUT`, where they returned every stratum with an empty grid. Give at
+  least one grid time, or use `VpcGrid::Auto` (#2947).
+- The `gradient_method_inner` / `gradient_method_outer` labels and the console banner now read `analytic` instead of `analytic (Dual2)` (Dual2 is no longer the engine), and report the realised route: a fit whose compiled plans failed (`W_PLAN_FD_FALLBACK`) reports `finite differences (compiled plan failed)`, or `analytic ×a, FD ×k` when only some subjects fell back (#2949).
+- **`vpc_tte()` reads the observed data on `[0, sim.horizon]` only**, as `vpc_rtte()` does
+  (#2950): with `sim.horizon` below the data's follow-up, a record after the horizon is a
+  censoring at the horizon. The curve and its band up to the horizon do not change. The raw
+  `observed` curve now ends at the horizon instead of running past the band, the observed
+  value at a `VpcGrid::Times` point past the horizon is empty, and the automatic grids can gain
+  a point at the horizon itself. With `sim.horizon` unset nothing changes.
+- **`vpc_kmmc()` reads the observed data on `[0, sim.horizon]` only**, as `vpc_tte()` and
+  `vpc_rtte()` do (#2955): with `sim.horizon` below the data's follow-up, a record after the
+  horizon is a censoring at the horizon. The mean-covariate curve and its band up to the
+  horizon do not change; the raw `observed` curve now ends at the horizon instead of running
+  past the band, and the observed value at a `VpcGrid::Times` point past the horizon is empty.
+  With `sim.horizon` unset nothing changes.
+- **A SAEM fit now reports NONMEM's `SAEMOBJ` as its OFV** (#2973), the objective NONMEM
+  prints for the `$EST METHOD=SAEM` step, labelled "SAEM objective (NONMEM SAEMOBJ
+  convention; not a likelihood)": `−2 Σ_i log(mean p(y_i, η_i))`, the log of the mean joint
+  density of data and random effects over the convergence phase's draws and iterations, with
+  no 2π constants. It is accumulated from the draws the E-step already makes, so it is free.
+  It is not a likelihood: do not compare it across models. There is no AIC or BIC under it, as in
+  NONMEM: `FitResult::aic` / `bic` become `Option<f64>`, `None` (`aic: null` in `fit.yaml`, `AIC/BIC: n/a`
+  on the console) when the reported objective is not a likelihood (or not finite), and model search
+  stops with an error naming `saem_ofv = imp` on a SAEM-objective fit, fitted, resumed or reused. The FOCE/Laplace value is reported separately as a
+  diagnostic (`saem_objective.foce_ofv`, `ofv_foce_laplace` in `fit.yaml`); `imp`, `agq`, `focei` and an
+  explicit `[saem, imp]` chain build AIC/BIC from their own likelihood value. A VI fit with no objective
+  has `None` too (was `NaN`). `.fitrx` files written before read unchanged. The importance-sampled
+  −2 log L (NONMEM `$EST METHOD=IMP EONLY=1`, with its Monte-Carlo standard error) is the
+  explicit follow-up: `saem_ofv = imp`, or `method = [saem, imp]` with `imp_eval_only = true`,
+  whose value becomes the reported OFV as NONMEM's last `$EST` does. New option
+  `saem_ofv = saem | imp | agq | focei` (default `saem`; `agq` is deterministic adaptive
+  quadrature, `focei` restores the pre-#2973 value) with `saem_ofv_samples` (3000),
+  `saem_ofv_nodes` (11) and `saem_ofv_pilot_samples` (300) for the importance-sampled and
+  quadrature readouts. IOV models (IOV-only included) average the joint density of data, η and κ
+  draws, and a model with no random effects at all reports the data −2 log L; a mixture, whose convention no NONMEM run
+  anchors, reports the importance-sampled value with a warning naming the fallback. The estimates are unchanged; SAEM OFVs from earlier versions are
+  FOCE/Laplace values and are not comparable with the new default.
+- **`covariance_method = s` and `rsr` now use NONMEM's `MATRIX=S` score** (#2974): each
+  subject's row of `S` is the total derivative of its objective, with the EBEs (and κ̂ under
+  IOV) re-estimated at every parameter value, taken exactly from the analytic outer gradient.
+  Before, the row held the EBEs at the estimates, a score biased at the MLE that put `s` and
+  `rsr` 3–36% off NONMEM's on FOCE, FOCEI, IOV and mixture fits, by an amount more subjects
+  did not shrink. `s` and `rsr` standard errors move on every FOCE/FOCEI fit with random
+  effects; at a common point ferx's `s` now reproduces NONMEM's `MATRIX=S`.
+- **`method = gn`, `gn_hybrid` and `optimizer = trust_region` build their BHHH matrix from
+  the same per-subject rows as their gradient** (#2974): each subject's total derivative, the
+  EBEs re-estimated at every parameter value, for FOCE as well as FOCEI. Before, the matrix
+  used the fixed-EBE score while the gradient added the EBE response, so the quadratic model's
+  curvature and slope came from two different vectors. Gauss-Newton iterates change, and so
+  can the final estimates on FOCE (the old gradient there was the fixed-EBE score, not the FOCE
+  objective's): warfarin `gn` FOCE ends at -280.358918 instead of -280.358945. A small change
+  at a collapsed trust radius now counts as convergence when the BHHH Newton decrement shows
+  less than 0.1 OFV left to gain, so `pkpd_nonmem` under `gn` reports convergence at its optimum.
+- **The numerical θ/σ M-step of SAEM, IMP and IMPMAP defaults to Newton (`mstep_optimizer =
+  auto`), and BOBYQA runs to its tolerance** (#3001): default results change. `auto` is
+  `newton` where the model is in its scope (adjoint in scope, plain Gaussian likelihood, not a
+  mixture) and `bobyqa` elsewhere, silently — and, in SAEM, `bobyqa` where no θ is left to the
+  numerical solve (every θ is owned by a closed-form step: a σ-only solve), where BOBYQA's
+  evaluations are all served by the prediction memo and Newton's fused pass is extra work (0 to
+  7 percent more instructions measured on the σ-only SAEM sets), so those fits are the BOBYQA
+  fits, estimates identical to `mstep_optimizer = bobyqa`; the fit file's `model:` block records the optimizer
+  that ran (`mstep_optimizer`, also `FitResult::mstep_optimizer_used`; absent where no numerical
+  solve runs: `score_sa`, or SAEM's closed-form σ update), and `mstep_optimizer =
+  bobyqa` restores the derivative-free solve. Wherever BOBYQA runs its evaluation budget is a
+  runaway guard of 100 per interpolation point instead of `mstep_maxiter·(n+1)`, so it stops on
+  its tolerance. Against the previous default (seeds 1 and 2, importance-sampled −2 log L, fewer
+  instructions is better): models with several numerical θ cost 0.51–0.75 times the
+  instructions and fit better (`pk2_big_nomu` −133 and −129, `warfarin_nomu` −25 and −16, `mm`
+  −29 and −21), IMP on a 14-θ model 0.23 times (worst |z| against NONMEM 2.15 to 0.30),
+  IMPMAP σ-only fits 0.39–0.54 times with identical −2 log L (IMP and IMPMAP keep `newton` for
+  a σ-only solve: their BOBYQA keeps no memo), and SAEM fits with a numerical θ 0.51–0.75
+  times, apart from an ODE model with two numerical θ at 1.14.
+  `FitOptions::mstep_optimizer` gains the `Auto` variant (the default) and `as_str`; ferx-r
+  should accept `"auto"` for `mstep_optimizer` and may read `mstep_optimizer_used`.
+- **Only blocks that carry a name into the objective count as reading it** when SAEM and
+  IMP/IMPMAP decide whether a covariate θ or η is exclusive to its mu-reference (#3014).
+  `[output]`, `[derived]`, `[simulation]`, `[covariates]`, `[priors]`, `[covariate_nn]` and
+  the data and option blocks only declare, report or configure names, but a name spelled
+  there used to count as a read: tabling a typical value such as `TVCL` in `[output]` or
+  `[derived]` cost its covariate group the joint M-step. Those models now take it, as the
+  same model without the listing does. A new block must be classified as a reader or not
+  before it can be added.
+- **Mixture models default to a gradient-based outer optimizer** (#3025):
+  `optimizer = auto` on a `[mixture]` model now resolves to NLopt L-BFGS on the exact
+  posterior-weighted mixture gradient for every method (FOCE, FOCEI, Laplace, AGQ), as for a
+  single population; it used to resolve to BOBYQA. Most mixture fits reach the same or a lower
+  objective in a fraction of the evaluations, but a fit started with nearly identical classes can
+  stop at a merged-class saddle that BOBYQA happened to leave (the `W_MIXTURE_MERGED_CLASSES`
+  warning fires): start the classes apart. An explicit `bobyqa` is still honoured, and the
+  built-in BFGS / L-BFGS / trust-region paths, which do not carry the mixture objective, fall
+  back to what `auto` resolves to (with the existing warning) instead of BOBYQA.
+- `gradient = fd` on a `[mixture]` model now differentiates the mixture objective by finite
+  differences, as on a single population; before, the mixture outer gradient was exact
+  regardless of the opt-out (#3025).
+- **An `omega NAME ~ 0 FIX` placeholder η is held at 0 and removed from the model, as NONMEM holds
+  `$OMEGA 0 FIX`** (#3150). It used to stay a full dimension of every subject's inner problem at a
+  variance of `1e-8`: a fit with six placeholders ran 2.5 times slower than the model without them
+  and its OFV differed by about 3e-6. Now the model is the one written without them, bit for bit
+  (a closed-form two-compartment model: OFV 744.7283530727 both ways, NONMEM 744.7283530753). A
+  `block_omega` of zeros goes the same way, and `W_ZERO_FIX_ETA_DROPPED` names what was removed. A
+  placeholder read by `iiv_on_ruv`, a `[mixture]` override, an endpoint block or `frem_predictions`
+  stays, and none goes when it would leave no η; a placeholder that stays carries the `1e-8` floor
+  on its own diagonal only, no longer on every η's variance. **Contract changes:** the removed η has no row in
+  Ω, the EBEs, the shrinkage tables or the `sdtab`; a supplied Ω or per-subject η sized for the
+  declared shape (ferx-r's `omega_init`, a `from_fit` import, a NONMEM `.phi` as `SuppliedEtas`) is
+  refused with the note quoted; and seeded `saem`, `imp`, `impmap`, `bayes`, `vi` and simulation
+  runs draw a different stream, since it follows the η count.
+- **ferx-search is LGPL-3.0-or-later** (#3183): the model-search crate is
+  LGPL-3.0-or-later from its first release, the one after 0.4.0; earlier
+  ferx-tools releases, including 0.4.0, remain MIT. ferx-core, ferx-tools and
+  the ferx-cli source stay MIT. The `ferx` binary links ferx-search, and the new
+  `ferx --licenses` prints every license and third-party notice it carries
+  (including NLopt's LGPL-2.1 Luksan routines) and how to rebuild it with a
+  modified ferx-search. The ferx-tools and ferx-cli crates now ship their MIT
+  `LICENSE` file, which their 0.4.0 tarballs lacked.
+- **Model search moved from `ferx-tools` to a new `ferx-search` crate** (#3185): Rust
+  code calling `search`, `modelsearch`, `covsearch`, `iivsearch`, `iovsearch`,
+  `ruvsearch`, `amd`, `allometry` or `globalsearch` now imports them from
+  `ferx_search::` and depends on `ferx-search`. `ferx-tools` keeps `bootstrap` and
+  `gam`, and `lanes::run_in_lanes` is public there. The `ferx` subcommands and their
+  results are unchanged.
+- **Model search is an optional, default-on `search` feature of `ferx-cli`** (#3187):
+  `cargo build -p ferx-cli --no-default-features` builds a `ferx` without the eight
+  search tools and without `ferx-search`; in that build `ferx covsearch …` says the
+  binary was built without search rather than calling it an unknown tool. Default
+  builds are unchanged.
+- **The inner stall escape now runs by default on an ODE model with a kink in its prediction** (#3210): an `if`, `min`, `max`, `clamp`, `abs`, `floor`, `ceil` or `round` that reads a random effect or a state, in `[individual_parameters]` or a `[scaling]` `y` readout. On such a model a subject's EBE no longer stops on a kink's valley floor without `inner_kick = true` (on the clipped fixture of #3159, two EBEs that ended 0.054 and 0.026 from their minima now end within 1e-5). A default fit on such a model can now end with `W_EBE_START_DEPENDENT` where a cold re-solve does not reach the mode the escape found (on the clipped fixture's full fit, where main reported converged at the same OFV; `inner_kick = true` removes it there). A model without such a branch is unchanged, bit for bit. `inner_kick` still adds the second-mode kicks and turns the escape on for every model. `CompiledModel` gains the field `prediction_has_kink`.
+
+### Deprecated
+- **`bind_theta_levels_from_fit`**: use `bind_from_fit` with the fit's `data_bindings`,
+  which binds the covariate statistics from the fit too
+  ([#1619](https://github.com/FeRx-NLME/ferx-core/issues/1619)).
+- **`gn_lambda`** (`[fit_options]` key and `FitOptions::gn_lambda`): it never had an effect,
+  because Gauss-Newton has used a trust region instead of Levenberg-Marquardt damping since
+  0.1.0. Setting it now warns on every method; the next minor release removes it. The
+  Gauss-Newton page now describes the trust region, its stopping rules, and the `lm_lambda`
+  trace column, which holds the trust radius
+  ([#1841](https://github.com/FeRx-NLME/ferx-core/issues/1841),
+  [#2828](https://github.com/FeRx-NLME/ferx-core/issues/2828)).
+- **`FitOptions::lbfgs_memory`** (Rust API only; it was never a `[fit_options]` key): nothing
+  ever read it, so setting it had no effect on any optimizer. The field is now marked
+  deprecated and the next minor release removes it, together with `gn_lambda`
+  ([#1841](https://github.com/FeRx-NLME/ferx-core/issues/1841)).
+
+### Removed
+- **`estimation::inner_optimizer::set_inner_optimizer` and `set_ebe_warm_start` are
+  removed** (#426). They set process-wide state that a per-call setting has replaced; set
+  `FitOptions::inner_optimizer` / `FitOptions::ebe_warm_start` on the call instead.
+- **`run_from_file` is removed** (#1772). It was a legacy alias of `run_model_simulate`
+  that kept only the `FitResult`; despite its name it simulated from the model's
+  `[simulation]` block and read no data file. Use
+  `run_model_simulate(path).map(|(r, _)| r)`, or `fit_from_files` to fit a data file.
+- **`ferx_core::survival::shi_step_sizes`** (#2437): its only caller was the FOCEI
+  objective, whose non-Gaussian η-Hessian is now exact, or, where it still finite-
+  differences, steps a fixed number of conditional posterior standard deviations from Ω
+  and a pilot of the data term's curvature (see the #2437 fix). ferx-r does not call it.
+- The outer optimizer's "stopped without converging" gradient-gap warning (#2713) is removed:
+  it measured the held-EBE outer-gradient fallback, which no longer exists (#3004).
+- `estimation::mixture::mixture_gradient_fd` is no longer public API (#3004). A mixture
+  fit's outer gradient is always the exact posterior-weighted one, a subject whose plan
+  fails salvaged on its own, so no model reaches the whole-objective central difference;
+  it remains as a test oracle.
+- **Test-only helpers are no longer public API** (#3029): functions that nothing outside the
+  crate's own tests called are now `#[cfg(test)]` (`subject_packed_gradient_iov`, unused even
+  by tests, is deleted). Removed from the public surface:
+  `estimation::inner_optimizer::run_inner_loop`, `estimation::trust_region::optimize_trust_region`,
+  `estimation::sens_outer_gradient::subject_packed_gradient_{foce,foce_iov,iov}`,
+  `io::datareader::read_nonmem_csv_with_covariates_filtered`, `ModelParameters::has_any_fixed`,
+  `PkParams::from_hashmap`, `ScalingSpec::requires_fd`, `pk::absorption::{first_order,
+  inverse_gaussian,transit,weibull,zero_order}_input_rate`, `pk::three_cpt_predict`,
+  `sens::dual2::scalar_div`, `sens::propagate::event_driven_sens_one_cpt_g`,
+  `sens::{two_cpt::two_cpt_conc_g, three_cpt::three_cpt_conc_g}`,
+  `sim::adaptive::DoseAction::to_dose_event`, `stats::likelihood::build_block_diag_omega`, and
+  `survival::{simulate_tte, tte_data_term, tte_nll_from_curves}`. Use `fit()`, `simulate()` and
+  the other entry points instead; `run_imp`, `run_impmap`, `mixture_gradient`,
+  `draw_parameter_samples` and `ModelSource::read_verified` stay public.
+
+### Fixed
+- **`inner_optimizer` and `ebe_warm_start` apply to their own call only** (#426). They
+  were process-wide: every `fit()` set them and none restored them, so a fit in another
+  thread could switch a running fit's, `run_sir`'s or `run_covariance`'s inner solver
+  mid-run, and a later standalone call that re-solves EBEs (`run_covariance`, propensity
+  matching, initial-estimate search) used whichever solver the last fit used. Each call now uses its own options, and
+  a call outside any fit uses the defaults. `run_covariance` takes them from the options
+  passed to it, like `inner_maxiter` / `inner_tol`.
+- **FOCEI with `block_sigma` scores censored and FREM rows with the estimated correlation**
+  (#486). Those rows took the declared starting ρ, not the one being estimated, so the
+  objective disagreed with its own inner problem. The dense correlated FOCEI objective also
+  applies `iiv_on_ruv`'s `exp(2η)` residual scaling, which it previously dropped. IOV fits
+  take their κ columns from the exact stacked Jacobian instead of central differences.
+- **Covariance and Laplace gradients are exact across moving `[odes]` event times** (#486).
+  An estimated `LAGTIME`, a per-route `lag=` or a modeled duration `D{n}` moves an event with
+  the parameters. The analytic ODE walk had expanded that shift only to second order. The
+  FOCE/FOCEI gradient was right, but the analytic R-matrix and the Laplace gradient (both
+  third order) were wrong on such subjects, by up to 3e-1 relative. Each moving event is now
+  crossed exactly. The error is below 2e-6 against finite differences and closed-form twins.
+  A `TAD`-reading right-hand side across a lagged arrival is exact at second order too (#1075).
+- **The inner EBE search no longer runs away from a steep start, and fallback EBEs meet the
+  requested `inner_tol`** (#486; also #2080, #2099).
+  - A first step from the curvature-free metric is capped at the runaway region's radius
+    (10√n prior SDs in Ω's metric). Every FOCE/FOCEI inner solve takes one, and so does a
+    BFGS steepest-descent reset or an L-BFGS start. On `examples/warfarin_ode_lagtime.ferx`,
+    observations on the proportional-variance floor sent the first step 2,700 SDs out and the
+    search on to a stiff region. Three subjects took 1.0–1.7 s each; they now take
+    milliseconds, at the same modes.
+  - The Nelder–Mead fallback's stationarity certificate now takes the Newton step it
+    computes. Before, a fallback EBE could be certified ~1e-9 from its mode at a requested
+    `inner_tol = 1e-12`. On a tightly integrated ODE, a step the objective cannot resolve
+    is taken when the exact gradient verifies it.
+- **A fit minimising against trapped warm EBEs is caught during the run, not after it**
+  (#486, #1565). A trap is when warm-started EBEs sit in a higher individual mode than a
+  cold re-solve finds. The cold re-solve that detects this now also runs at the 32nd,
+  64th, 128th, … feasible evaluation of each optimizer leg. A gap ends the leg for the
+  basin-shift restart, which may now repeat up to three more times on the same budget.
+  On a 10-subject Michaelis–Menten benchmark subset the probe stops the trapped first
+  leg at its 33rd evaluation and the restart converges 4.8 OFV lower. A leg the probe
+  clears continues unchanged.
+- **Cancelling a FOCE/FOCEI/Laplace fit (Ctrl-C in R) no longer waits out the
+  current objective evaluation's EBE pass** (#574). With the NLopt outer optimizers
+  (the default `auto`, plus `nlopt_lbfgs`, `bobyqa`, `slsqp` and `mma`) and the
+  `global_search` pre-search, the pass now checks the cancel flag before each
+  subject, so it stops after the solves already running instead of finishing the
+  whole pass, which can take minutes on a large ODE model. Mixture models still
+  finish the evaluation they are in, and every fit still runs its final EBE readout
+  before returning. Separately, `optimizer = trust_region` previously ignored the
+  flag and now stops at its next iteration.
+- **FREM conversion keeps an `iiv_on_ruv` eta out of the covariate block** (#904):
+  `prepare_frem()` / `ferx_model_to_frem()` used to put the residual-error eta
+  into the FREM `block_omega`, starting it correlated with every covariate eta.
+  It is now emitted as its own diagonal `omega` (keeping `FIX` and a prior fit's
+  value), the structure NONMEM/PsN FREM use. If the base model declares it in a
+  `block_omega` with a PK eta, it stays in the block so that covariance stays
+  estimable (even when initialised at 0), but starts with no covariate
+  cross-terms.
+- **A `.fitrx` bundle now keeps the time-to-event sdtab rows** (#911): the per-record
+  `COXSNELL`, `MARTINGALE`, `DEVIANCE` and `PIT` rows go into a new optional entry,
+  `predictions_tte.csv`, so a restored fit of a TTE model writes the same sdtab as the
+  live one instead of being refused. The format version stays `2`; older readers ignore
+  the entry. A bundle written before this change still loads, and its sdtab is still
+  refused. `ferx_core::io::output::TTE_RESIDUAL_COLUMNS` is now public.
+- **The error/warning code registry is now complete and kept so** (#1051): the
+  code tables in `docs/file-formats/check-report.qmd` and in `src/diagnostics.rs`
+  list every `E_*` / `W_*` code the engine emits — 83 codes were missing from
+  both, and 23 more from one of the two, including whole families
+  (`E_ABSORPTION_*`, `E_BLOCK_SIGMA_*`, `E_AGQ_*`, `W_DERIVED_CMT_*`, the
+  warnings a fit records in `FitResult.warnings`). A unit test now fails when a
+  code is emitted without a row in both tables, or a row names a code nothing
+  emits, so a language binding can treat the tables as the full set.
+- **An adaptive-dosing decision now reads the latest data record, including dose and
+  EVID=3/4 reset rows** (#1148). On a time-varying-covariate or IOV subject, a decision's
+  `ctx.covariates`, its monitored signals and the `F` of a dose it issues all come from the
+  same record: the latest observation, EVID=2, dose or reset row at or before the decision,
+  or the baseline before the first record. Before, a decision after a reset read the
+  record before it (3× off in `F` in the issue's example), a decision after a dose row read
+  the dose row's parameters but not its covariates (under IOV, neither), and a decision
+  before any record read the first record ahead. Trajectories after such a decision change
+  with it. Separately, the state a decision reads just before a reset is now integrated under
+  the reset row, not under the record after it; the reset overwrites that state, so this
+  moves what the controller sees but no prediction at an observation.
+- **An IOV occasion that only an `EVID=3`/`4` reset row carries now gets its own κ**
+  (#1153). The reset re-seeds `init(...)` under that occasion's κ, as NONMEM estimates an
+  `ETA` for it (`nonmem_anchor/reset_init_snapshot_K.ctl`: ferx now matches NONMEM's
+  objective to 1.6e-8, where it used to sit 40 OFV units off at the κ = 0 control). Such a
+  subject used to seed the reset under κ = 0 and, on an ODE model with no time-varying
+  covariates, silently fell back to finite-difference gradients. A `Subject` built in
+  memory without per-row occasion labels now runs its unlabelled dose, pk-only and reset
+  rows under κ = 0 instead of borrowing a neighbouring record's occasion (or occasion 0,
+  for a dose).
+- **ODE gradients no longer pick up a spurious term when an infusion or `zero_order` window
+  ends a few floating-point ULPs before a covariate-changing record** (#1160): e.g. a
+  0.1-long window from `TIME = 0.7` ends at `0.7999999999999999`, just below an observation at
+  `0.8`. The analytic sensitivity read the parameters after that window end from the *next*
+  record instead of the `0.8` one, charging that record's covariate jump to the moving window
+  end — an error of order 1e-2 in `∂f/∂η` of the window length on the reproducer. Both sides of a
+  window end now read the same record, matching finite differences of the predictions.
+- **A dose that lands between a lagged `SS=1` dose's record and its arrival is no longer
+  erased** (#1275). A lagged steady-state dose loads its periodic state at its dose record
+  and carries it to the lagged arrival, which then adds only the new pulse. The ODE paths
+  that do not use the event-driven walk (the default ODE predictor, the adaptive driver,
+  compartment-state output columns, the ODE-accumulated hazard and its simulated event
+  times, and the Markov endpoint) instead re-loaded the steady state at the arrival whenever
+  the lag was at most `II`. That replaced the whole state and erased any dose given inside
+  the window: up to −54 % against NONMEM after the arrival. Every ODE predictor now
+  matches NONMEM to ≤ 9e-12 (the adaptive driver to 3e-4, its own floor;
+  `nonmem_anchor/ss_arrival_flow_*`). Without such a window dose, results move only at
+  solver-tolerance level, with one exception: an EVID=3/4 reset inside the window no
+  longer restores the full steady state at the arrival on those paths. They now agree
+  with the event-driven walk. Since #1587 every engine also cancels the lagged dose at
+  that reset, as NONMEM does.
+- **`W_STEADY_STATE_ABSOLUTE_TIME` no longer fires on a joint PK-TTE model whose
+  hazard reads time through an `[odes]` intermediate** (#1279): `TT = TIME` …
+  `hazard = f(TT)` (or a chain of such intermediates) is now treated exactly like
+  writing `TIME` inline in `hazard =`: the PK block stays autonomous and the
+  spurious warning is gone. An intermediate that any `d/dt(...)` line reads is
+  still counted.
+- **A `--output-format json` fit with undefined diagnostics reads back** (#1331): the
+  JSON writer puts `null` for a non-finite value (e.g. `dw_statistic` when no subject
+  has two IWRES values), which the `.json` readers then refused with "invalid type:
+  null, expected f64". `ferx export-dcm --fit run-fit.json` and a `[priors]
+  from_fit = "run-fit.json"` now read it as `NaN`, through the new
+  `FitResult::from_json_str`, the inverse of `FitResult::to_json_value`.
+- An `ode_solver` warning whose only damage is a rejected analytic-sensitivity (jet) solve no
+  longer ends by recommending a different `ode_method` or looser tolerances, which contradicted
+  its own clause saying a different method will not help; it now points only at units and
+  scaling (#1347).
+- **Regularized `[covariate_nn]` fits now report standard errors of the penalized
+  objective** (#1352): with `nn_l2` / `nn_smooth` set, the covariance step adds the
+  penalty's exact Hessian to the R matrix on both the analytic and the
+  finite-difference route, instead of reporting the unpenalized curvature at the
+  penalized optimum — which floored, or sent to SIR, exactly the weight directions the
+  penalty exists to identify. The fit's scoring record (`ScoringSettings`, and the
+  `.fitrx` `scoring_settings` block) now carries `nn_l2_lambda` / `nn_smooth_lambda`,
+  so `run_covariance()` on a regularized fit reproduces the inline step with default
+  options; a recorded strength wins over the caller's. A `W_COV_NN_PENALTY` note names
+  these as penalized-ML standard errors, or says that `covariance_method = s` cannot
+  represent the penalty, and is replaced, not duplicated, when `run_covariance()` reruns.
+- **A closed-form fit with an `SS=1` dose whose lag is longer than `II` gets the right
+  gradient** (#1353). The exact gradient wrapped the pre-arrival phase and merged the
+  arrival into the steady state, where the predictions (and NONMEM) clamp the phase and
+  add the arriving dose on its own (#1121). So it was the derivative of a different curve:
+  100% off finite differences at a lag of 15 with `II = 12`. A one-compartment IV fit at
+  that lag stayed at its initial estimates (OFV 97.41, macOS arm64). It now reaches the
+  finite-difference optimum (OFV −18.70) in 24 evaluations instead of 705.
+- **Estimating `imp` no longer collapses from a cold start** (#1365): after the
+  closed-form mu-referenced θ update, each subject's stored importance draws are
+  now translated by the same amount the other way (per class under a mixture),
+  so the next iteration samples the posterior it targets. Previously every
+  subject went low-ESS on iteration 2 and the fit diverged; cold-start `imp` on
+  warfarin now reaches −286.0 against NONMEM `METHOD=IMP` −285.69, where it used
+  to reach 1.4e15. Each covariate mu-reference (#619) group step now applies
+  the same translation, under `impmap` as well as `imp`, and each group reads
+  the draws as the previous step left them. This fixes `imp`/`impmap` fits where
+  a later group scored draws that a plain mu-reference shift or an earlier group
+  had moved θ under without re-centring them.
+- **The docs name R functions that exist** (#1367): `ferx_apply_selection()` (not
+  `ferx_selection()`), `ferx_fit(ignore =, accept =, ignore_ids =)` (not
+  `ferx_fit(settings = ...)`) and `ferx_search_space()` (not `ferx_search()`).
+  `ferx_mbma_data()` is marked as planned.
+- **An unbound `theta NAME[COL, ...]` level block now names the public binder** (#1384). The
+  `fit()` refusal and the simulate paths' `E_THETA_LEVELS_UNBOUND` said only a file entry
+  point could bind the block. A caller that reads the data itself can call
+  `bind_theta_levels` between `read_population_for` and `fit`, and both messages now say so.
+  The docs' composable example and the API quick-start called `build_fit_inputs`, which
+  does not exist. They now bind the model and take inits and options from the parsed model.
+  They also pass the file's `[data_selection]` filter and IOV column to the reader, and
+  stamp its `gradient = ...` onto the model, without which `gradient = fd` was silently
+  ignored.
+  The parameters page no longer says the data-driven form needs a file entry point.
+- **FREM covariate rows no longer corrupt the fixed-η σ score** (#1421): the
+  analytic σ gradient that VI and SAEM's `mstep_solver = score_sa` use asked the
+  PK error model for the variance derivative of every FREM covariate
+  pseudo-observation, so a free PK σ picked up a spurious term per covariate row
+  (of order `σ²/σ_cov²`, ~10⁶·σ² at the usual `sigma EPSCOV ~ 1e-6`) while a free covariate σ
+  got none of its own. Those rows now score against the covariate σ alone, and
+  `mstep_solver = score_sa` / `mstep_draws` accept FREM models instead of falling
+  back to `bobyqa` with a warning.
+- **SAEM / IMP covariate mu-referencing sees through `if`/`else` locals and
+  `min`/`max`** (#1422): a covariate local assigned in every arm of an
+  `if`/`else` (e.g. a Cockcroft-Gault / Schwartz CrCL), and a two-argument
+  `min`/`max` of a local (`CRCLM = min(CRCLR, 120)`), are now inlined into the
+  typical value, so a slope such as `(CRCLM/100)^CL_CRCL` joins the eta's
+  covariate mu-reference group and takes the exact group M-step, as it does in
+  NONMEM's `MU_1`, instead of the eta-frozen numerical M-step with a
+  "NO associated ETA" advisory. A local assigned in only some arms, or computed
+  from a theta inside the `if`, is still left to the numerical M-step.
+- **SAEM: a well-identified residual σ is no longer slowed during exploration**
+  (#1464). The #1445 exploration cap on the σ step now applies per component,
+  and only to a component the data identify weakly (standard error of
+  `log σ` above 0.10 at the current draw), such as the minority additive term of
+  a sparse `combined()` model, which it protects. A capped σ that the data
+  pin down still lagged, and that lag reached every θ without an ETA through
+  the shared M-step objective. On a 600-subject busulfan benchmark the no-ETA
+  `TVQ` moved from 11.7–15.3 to 8.8–11.5 and the importance-sampled −2 log L
+  improved by 15.6 (6 seeds). On cefepime the additive σ stays protected (1.22–1.41,
+  against 0.05 on some seeds with the cap removed entirely). The convergence-phase
+  hand-off and every model outside the plain Gaussian scope (IOV, mixture, M3,
+  `block_sigma`, TTE, FREM, `iiv_on_ruv`, …) keep the previous schedule.
+- `simulate_with_uncertainty_diag()` reports parameter draws skipped in the flip-flop regime of a
+  twin-less transit / inverse-Gaussian closed form as one `W_UNCERTAINTY_DRAWS_SKIPPED` warning
+  (new code `uncertainty_draws_skipped`) with the count and the draw indices, and says the
+  remaining draws are a biased, truncated sample — instead of one line per draw. It now refuses
+  with `E_TRANSIT_FLIP_FLOP` / `E_IG_FLIP_FLOP` when the fit's point estimate is itself in that
+  regime (previously `Ok` with most draws silently gone) or when every draw is skipped
+  (previously an empty `Ok`) (#1485).
+- **`simulate*` now refuses a Form C readout of the oral depot amount that dose
+  superposition cannot reconstruct** (#1488): `simulate()`, `simulate_with_seed()`,
+  `simulate_with_options{,_diag}()` and `simulate_with_uncertainty{,_diag}()` return the
+  same `Err` (`E_READOUT_DEPOT_UNSUPPORTED`) as `fit()` and `predict()` for an analytic `[scaling] y = (central + depot) / V`
+  on a subject with an EVID=3/4 reset (#650) or a dose into a non-default compartment
+  (#375). Before, a release build silently returned rows built from a phantom depot amount
+  (e.g. `IPRED` 0.0366 after a reset that empties the system; +43% at t = 1 for a bolus into
+  `CMT=2`) and a debug build panicked. A model that simulated before can now error: reference
+  only `central`, or use an ODE model (`ode(states=[depot, central])`).
+- **A dataset with nothing to score is refused instead of fitted to OFV 0** (#1491): a
+  population with no Gaussian observation and no endpoint (TTE / binary / categorical /
+  Markov) record — every row a dose, every `DV` missing, or every observation removed by
+  `[data_selection]` — used to fit to an objective of 0 with every parameter at its initial
+  estimate, and `ferx check --data` called it valid. Both now report the new
+  `E_NO_SCORED_OBSERVATIONS` error, once for the population. When `[data_selection]`
+  removed observation rows, the message gives the counts and points at its clauses. Otherwise it says
+  what makes a row scored. A population that already failed with a more specific data error
+  (`E_ENDPOINT_NO_RECORDS`, `E_NONFINITE_DV`, …) still fails with that error first.
+- **A fit reports a steady-state non-convergence warning only when its estimates have no
+  steady state** (#1522). The "Steady-state (SS=1) equilibration did not converge" warning
+  was collected from every objective evaluation, including trial points of the EBE search far
+  from the estimates. On a linear one-compartment model with a time-varying covariate, a
+  line-search probe at `CL ≈ 1e-46` raised "no periodic steady state exists" on a fit that
+  matches NONMEM's objective. The warning now comes from the pass at the reported estimates;
+  a multi-start fit reports the winning start's.
+- **An EBE recovered by the Nelder–Mead fallback is reported converged only when it is
+  stationary** (#1527). The fallback used to certify on its simplex's objective spread, so
+  4,088 of 4,109 recovered EBEs across the bundled examples were flagged converged while none
+  met the gradient test, which left `n_ebe_unconverged`, `max_unconverged_frac` and AGQ's
+  per-subject acceptance blind to them. The point is now certified on the gradient norm; on a
+  positive-definite Hessian whose Newton step is within `inner_tol` or whose remaining
+  decrease is below the objective's resolution; or by a gradient polish (with the
+  objective-stall stop on ODE objectives). Fits that relied on the old flag can now see
+  trials rejected by the EBE guard; `examples/ss_oral_q24.ferx` switches to FOCEI because its
+  start values are infeasible under non-interaction FOCE (NONMEM `METHOD=1` stops at
+  iteration 0 there).
+- **`simulate_adaptive()` now refuses a pre-dose window whose `[odes]` right-hand side
+  reads an unanchored `TAD` / `TAFD` through a comparison** — `if (TAD < 5)`,
+  `min(TAD, 24)` — instead of silently taking one branch. An ordering comparison against
+  the unanchored clock is false, so such a window kept a finite state and the run
+  returned numbers that depended on which way the comparison fell: `Ok` with
+  `verify: false`, and with the default `verify: true` only a frozen-schedule replay
+  mismatch that never named the clock. The refusal is now gated on whether the right-hand
+  side's derivative over the window changes when the clock is anchored at the window's
+  end — the earliest a first dose can land — instead of on the window's state going
+  non-finite, so these runs get the same typed error, naming the window, the spelling and
+  the two fixes, with a first sentence that says what was found. A clock that cannot
+  change the derivative still runs: in a branch the window never takes, in a condition on
+  an empty compartment, or in a comparison that only switches for a positive clock
+  (`if (TAD > 5)`, `max(TAD, 0)`), which no schedule can give a pre-dose window — those
+  runs already match `predict()`. A compartment that diverges on its own is still not
+  blamed on the clock (#1535).
+- **A diverging ODE state no longer freezes the other states at finite, wrong values**
+  (#1539). When one state went non-finite (e.g. an unobserved `d/dt(X) = 0.5 * X * X` past
+  its pole), the solver stopped every state and padded the rest of the segment with the
+  frozen last state. A decoupled, observed compartment was then served as a plausible
+  finite number: `central` read `100` instead of `44.93` / `6.08`, 16× high. `predict()`,
+  `simulate()`, `fit()` and the EKF all served it. Those output times are now `NaN` in every
+  state, including the derivative jets on the analytic-sensitivity path. A stop for a finite
+  reason (`ode_max_steps`, `ode_stiff_abort_after`) still freeze-pads, as before.
+  `W_ODE_SOLVER_DIAGNOSTICS` gains a clause saying a state became non-finite, and it drops
+  the `ode_method` / tolerance / `rodas5p` advice when every damaged segment diverged. That
+  advice was wrong for this case, since no stepper can integrate it. `OdeSolverStats` gains
+  `diverged_segments`. `simulate_adaptive()` with `verify: true` no longer counts `NaN == NaN` as
+  agreement in its frozen-schedule replay, so a run with `NaN` rows is not reported as
+  verified. The EKF also stops rewriting a `NaN` mean to `0.0`.
+- **A fit no longer reports `converged` at estimates optimized under trapped EBEs**
+  (#1565). When the final cold re-solve scores more than 0.05 OFV units *below* the
+  objective the optimizer minimised at the same point, some subjects' warm-started EBEs
+  sat in a higher individual mode for the whole fit. The optimizer is now restarted once
+  from that point, and its first inner solve is cold. If no budget is left, or the
+  restart leaves a gap of its own, the fit reports `converged: false` with an
+  `ebe_start_dependent` warning. On a Michaelis–Menten ODE benchmark the reported fit
+  moves from OFV 784.33 to the optimum, 775.39 (NONMEM, `MCETA=200`: 784.349 → 775.414).
+- **`simulate_adaptive()` now rejects a model covariate missing from the data** (#1571).
+  The programmatic (closure-controller) Rust entry point skipped the data checks every
+  other simulate entry point runs, so a covariate such as `WT` with no data column was
+  read as `0.0` and the run returned `Ok`. It now returns the same error as `simulate()`
+  and `simulate_adaptive_from_spec()`. The rest of the simulation data checks (θ levels,
+  covariate levels, endpoint routing, κ and residual weights) now apply there too, so a
+  covariate-selected error model whose selector column is missing reports that column
+  rather than the adaptive `[error_model]` restriction. R users were not affected.
+- **`simulate_adaptive` judges a finite pre-dose window at the dose that came** (#1572,
+  #2089): when an `[odes]` RHS reads `TAD`/`TAFD` before the first dose and the state
+  stays finite, the dose-clock check now waits for the run's first realized dose and
+  asks whether the derivative along the run's actual trajectory changes with the clock
+  anchored there, the anchor `predict()` uses. So `if (TAD < -20)` with a first dose
+  at 36 is refused, where it used to return numbers up to 23.5× off `predict()`. A
+  gate on both a compartment and `TIME` that the trajectory never opens runs, matching
+  `predict()` to 2.5e-12, where it used to be refused. A window whose state went
+  non-finite is judged at once, as before, and its message is unchanged.
+- **Compartment states, ODE-accumulated hazards and drug-driven CTMM generators now read
+  each dose's absorption, lag, `F` and modeled rate at its own dose record** (#1575), as
+  IPRED has since #1569. These passes integrate under one parameter snapshot (the first
+  observation's for compartment states, `TIME = 0` / baseline for the hazard and the
+  CTMM generator), and they used to read every dose quantity there too. The affected
+  quantities are the absorption kernel, pathway fraction `FR`, route lag, zero-order
+  `dur`, compartment lag `ALAG`, bioavailability `F`, modeled `D{n}`/`R{n}` and the
+  steady-state run-in. When a time-varying covariate (or a `TIME`-reading `$PK`) gave one
+  of them a different value at that snapshot than at the dose records, the result could
+  be off by up to the whole dose, with no error or warning:
+  - the sdtab compartment columns, `[derived] compartments[i]`, and a `[derived]`
+    `integral(...)` of a compartment over a grid (which could come back 0 for a dosed
+    subject);
+  - `H`, `h`, `S` from `predict_survival`, the TTE objective, and simulated event times
+    for an ODE-accumulated hazard with a `TIME`-reading `$PK`;
+  - the CTMM objective for a generator driven by an ODE state.
+
+  The disposition (CL, V, …) of these passes is still held at that one snapshot, so
+  compartment states under a time-varying disposition remain approximate
+  (`W_DERIVED_CMT_TV_ODE`), and an ODE hazard's disposition does not follow `TIME`.
+- **A mid-timeline `SS=1` record now resets the system, as in NONMEM** (#1576). A dose that
+  precedes the record (in time, or in an earlier row at the same time) no longer contributes
+  after it, and the `SS=1` dose's implied past pulses no longer reach observations before it.
+  Two engines had this wrong: analytic superposition summed every dose (`SS=1` on every visit
+  read up to 91 % high), and an ODE absorption forcing (`first_order(...)`, `transit(...)`, …)
+  leaked a later `SS=1` record's pulses backwards and kept absorbing an earlier dose. ODE
+  models with an explicit depot state were already correct. Because the reset is keyed on
+  the dose record, analytic superposition also stops an infusion into central and cancels a
+  pending lagged dose at the record, and the ODE forcing stops an infusion into the forcing
+  compartment. Since #1588 and #1586 every engine also resets a co-timed or pending lagged
+  dose and stops an infusion or zero-order window recorded before the record.
+- **An adaptive-dosing decision on a non-finite ODE state now fails with an error naming
+  those states** (#1578). Before, the controller was handed the `NaN` state of a diverged
+  run: an `amt = 10 / C` controller failed as `E_ADAPTIVE_CONTROLLER_ACTION` ("dose amount
+  must be finite"), a threshold controller silently held, and under a `Dv` monitor the
+  assay clamp turned the `NaN` into `0`, so the controller dosed on a value that did not
+  exist and the run returned results. The driver now refuses before the controller runs,
+  whether the value came from the `[odes]` right-hand side or from an `init()` seed, and
+  also refuses a monitor that reads a non-finite value from a finite state. The ODE
+  time-to-event crossing search likewise names a state that went non-finite instead of
+  blaming the step budget or `ode_stiff_abort_after`.
+- **`[derived]` compartment reads on a closed-form transit/IG model are `NaN`, not mislabelled,
+  for a subject its ODE equivalent serves** (#1580). Such a subject (a steady-state or infusion
+  dose, a `TIME`-reading parameter, the flip-flop regime) reported the equivalent's states
+  under the closed form's names: `depot` read the central amount and `central` read `NaN`.
+  Those reads are now `NaN`, in per-observation values and grid integrals alike, and the new
+  `W_DERIVED_CMT_TWIN_ANALYTICAL` warning says so. Before, there was no warning, or a
+  `W_DERIVED_CMT_TV_ODE` that called the states approximate.
+- **An `SS=1` record now stops every infusion and zero-order window recorded before it, on
+  every engine** (#1586). NONMEM stops an infusion still running at a mid-timeline `SS=1`
+  record, never starts one whose row precedes a co-timed `SS=1` row or whose lagged window
+  opens after the record, and stops the running tail of an earlier `SS=1` infusion. The ODE
+  engines (default, event-driven, compartment-state output, adaptive, EKF) and the analytic
+  event-driven walk kept every such window running (+14 % to +175 % against NONMEM), and so
+  did `zero_order(...)` windows on the ODE engines. On analytic models the gradient was
+  wrong even where the prediction was right: a central infusion's value came from
+  superposition (fixed in #1576) while FOCE/FOCEI differentiated the event walk, which still
+  ran it (43–93 % off). Every listed engine's prediction now matches NONMEM to ≤ 2.6e-12
+  (the adaptive driver to 3e-4, its own floor; the EKF on infusion cells only, since it
+  applies no `zero_order(...)` or other input-rate forcing at all;
+  `nonmem_anchor/ss_infusion_stop`). Each gradient walk's value equals its prediction, and
+  its derivatives match finite differences of the prediction.
+- **An `SS=1` record now wipes a co-timed dose in an earlier row, and a pending lagged dose,
+  on every state engine** (#1588). NONMEM resets at an `SS=1` record in row order: a dose row
+  *before* a co-timed `SS=1` row contributes nothing, one *after* it superposes. The static
+  ODE walker and the adaptive driver applied the earlier row's bolus on top of the steady
+  state regardless (up to +127 % against NONMEM), and once the `SS=1` dose carried a lag
+  (`ALAG`) every state engine did — the ODE walkers, the analytic event-driven walk, and the
+  analytic gradients (FOCE/FOCEI) of both. A lagged dose whose record precedes an `SS=1`
+  record but whose arrival follows it is now cancelled too (the `SS=1` half of #1587). At lag
+  0 the gradient walk was already right while the prediction was not, so the objective and
+  its gradient disagreed; they now agree.
+- **An adaptive-dosing decision after two co-timed rows of one kind now reads the last of
+  them, not the first** (#1599). When two observations, two EVID=2 rows or two dose rows share
+  the latest time before a decision and carry different covariates, the decision's
+  `ctx.covariates`, its monitored signals and the `F` of a dose it issues now come from the
+  row listed last in the file, as the rest of the record order already implied. Before, they
+  came from the first (2.4× off in the prediction after an injected dose in the issue's example), and the
+  state integrated past the subject's final record used that row's parameters too. Subjects
+  without such a tie are unchanged.
+- **A zero `omega` / `kappa` now simulates as exactly zero** (#1605). `omega ETA ~ 0.0`
+  (with or without `FIX`) used to be drawn with standard deviation `1e-4` in `simulate`,
+  VPC, `simulate_with_uncertainty`, `simulate_adaptive` and the NPDE/NPD reference
+  simulation, and its `1e-8` regularisation was added to every other random effect's
+  variance as well. Now the zero η draws `0` and the other η draw from their declared
+  variances, matching NONMEM's `$OMEGA 0 FIX` in `$SIMULATION`. This also applies when
+  simulating from a fit, where the `FIX`-ed zero is stored as `1e-8`. Seeded simulations of
+  a model with a zero ω or κ change: by up to about 2e-4 relative in IPRED for the zero
+  random effect, and by about `1e-8/ω` relative in the other η. Fits are unchanged.
+- **`fit()` honours `FitOptions::gradient_method` whoever calls it** (#1613): a direct
+  `fit()` with `gradient_method = Fd` on a parsed model used to run on the analytic
+  gradient, bit-identical to a run without the setting and with no warning, because only
+  the file entry points (`fit_from_files`, `run_model_with_data`, the CLI) copied it onto
+  the model. It now forces finite differences on the inner and outer gradients and the
+  covariance step from any caller, and `run_covariance` / `run_sir` honour the
+  `gradient_method` in the options they are given as well. A model whose own
+  `gradient_method` is `Fd` still runs on finite differences under `Auto` options, and the
+  file entry points' results are unchanged. The composable path in
+  `docs/api/fitting.qmd` no longer needs the hand-written gradient stamp.
+- **Every `simulate*` entry point now refuses a θ vector whose length is not the model's**
+  (#1614, `E_THETA_LENGTH`). A short vector used to simulate `Ok` rows from zeros past its
+  end (every prediction `0.0` on a plain two-θ model given one value), and a long one
+  silently dropped its tail. This covers `simulate`, `simulate_with_seed`,
+  `simulate_with_options(_diag)`, `simulate_with_uncertainty` and both adaptive entries.
+  For a level-block model, re-binding a design with `bind_theta_levels` and simulating it
+  with the fit's θ reads the fitted values at the wrong positions. When the level count
+  differs, the θ-length check now refuses it. When the count matches, nothing refuses it:
+  the θ vector has the right length, so the result is still silently wrong. Use
+  `bind_theta_levels_from_fit` (above), the only safe binder for a fit's θ.
+- **`predict` refuses a θ of the wrong length** (#1615): `predict`, `predict_diag`,
+  `predict_survival`, `predict_categorical` and `compute_npde_npd` now return
+  `E_THETA_LENGTH`'s error, as the `simulate*` paths already did (#1614), when the
+  θ vector is shorter or longer than the model's. Before, a short θ predicted 0 and
+  a long one had its extra values silently ignored.
+- **A fit with no feasible evaluation is no longer reported as converged at the
+  midpoint of its bounds** (#1617): when the EBE convergence guard rejects *every*
+  outer trial — a starved `inner_maxiter` is enough — a gradient optimizer used to
+  minimise the guard's own centre-push penalty, stop with NLopt `Success`, and report
+  `converged: true` with each θ at the geometric midpoint of its declared bounds and
+  each ω at the middle of its log rail. The run now reports `converged: false`, a
+  `Critical` `convergence` warning (`W_NO_FEASIBLE_EVAL`) naming the guard trigger, the
+  worst share of unconverged subjects and the remedy (`inner_maxiter`,
+  `max_unconverged_frac`), and the estimates the fit started from rather than the
+  penalty's minimum.
+- **SAEM and IMP/IMPMAP no longer drive a covariate theta shared by two typical values to its
+  bound** (#1620). When two covariate mu-referenced typical values read the same estimated
+  theta — `CL = TVCL*(WT/70)^THETA_WT*…*exp(ETA_CL)` next to
+  `V1 = TVV1*(WT/70)^THETA_WT*exp(ETA_V1)`,
+  as in `examples/two_cpt_oral_cov.ferx` — the second one used to be declined, and the first
+  one's M-step moved `THETA_WT` with `ETA_V1` left free to absorb the change: SAEM put `THETA_WT` at
+  0.0101 against NONMEM SAEM's 0.6618, and IMPMAP pulled `THETA_CRCL` to 0.358 (NONMEM IMPMAP 0.5630).
+  Typical values that share a free theta now take one joint M-step that fits all of their
+  thetas and re-centres every one of their etas, and the fit says so in a warning naming the
+  etas and the shared theta. Validated against NONMEM 7.6.0 `METHOD=SAEM` and `METHOD=IMPMAP`
+  (`nonmem_anchor/covmuref_shared_{saem,impmap}.ctl`). Models whose covariate mu-references share
+  no theta give bit-identical results.
+- **`run_sir` and `run_covariance` run on the model as it was fitted**
+  ([#1622](https://github.com/FeRx-NLME/ferx-core/issues/1622)). With `model = None` they
+  re-read the data with the model's `[data_selection]` and bind the model from the fit's
+  `data_bindings`. Before, a level-block model panicked, a `center = median` model returned
+  no covariance or a wrong SIR interval, and a fit with `ignore_subjects` got a wrong
+  covariance or a panic. A supplied model with the wrong θ count or bindings, or a
+  population whose subjects are not the fit's, is now refused instead of panicking.
+- **A level block that would estimate no θ is refused under every contrast** (#1624). A single
+  level under `ref` or `sum_to_zero_within`, or groups of one level each under
+  `sum_to_zero_within`, used to bind silently with nothing to estimate; only `sum_to_zero` was
+  refused. When a random effect already carries each group's value, the message says to remove
+  the block.
+- **`examples/emax_pkpd.ferx` no longer forces `gradient = fd`** (#1625). The line and
+  its "required: per-CMT / Form C readout" note were stale: both per-CMT readouts have
+  been differentiated analytically since #439. With FD forced, `optimizer = auto`
+  resolved to BOBYQA. On the bundled data it stopped short in the PD parameters
+  (Linux: OFV −36.698 vs −36.938 for the analytic route, with `TVE0` 3.96 vs 3.21; macOS
+  arm64 stopped further short, at −34.13) and took about 7× as long. Published numbers for
+  this example move to the analytic optimum.
+- **`method = bayes` converges on the two-compartment examples** (#1626). On
+  `two_cpt_oral_base` max split-R̂ was ≈ 1.2 at every chain length. It is now
+  1.005–1.008 at the defaults and 1.001 at 6,000 draws per chain. On
+  `two_cpt_oral_cov` it was 2.7–7.2 and is now 1.004–1.017 at the defaults and
+  1.002 at 6,000. Three fixes:
+  - Random-walk θ proposals outside `theta_lower` / `theta_upper` are rejected.
+    Covariate exponents are no longer drawn down to 5e-9. The conjugate
+    mu-reference move also rejects an out-of-bounds draw instead of clamping it.
+  - Covariate coefficients that enter `log P_i` linearly, such as
+    `TVCL * (WT/70)^THETA_WT * exp(ETA_CL)`, are drawn jointly with the typical
+    values from their Gaussian full conditional. The draw is a
+    Metropolis–Hastings proposal scored on the real likelihood, so the move is
+    exact for any typical value. It accepts every draw when the typical value
+    is linear in its coefficients.
+  - The non-convergence warning names the parameter with the worst R̂. It
+    suggests `n_leapfrog` when that parameter moves with the random effects
+    under the Metropolis η kernel on a model HMC can serve. It says when a
+    random-walk θ is responsible.
+- **A θ read through a gather is now estimated on the default (analytic) gradient** (#1628).
+  When an individual parameter read θ only through a gather (`CL = PLACEBO[PLA_IDX]`, a level
+  block's bare `PLACEBO`, or an intermediate such as `PL = PLACEBO`), its analytic gradient in
+  every gathered θ was zero. The fit then returned the whole block at its initial values, while
+  `gradient = fd` estimated it. Fits of such models now move the block and land at the
+  finite-difference optimum. The same models also no longer warn that every level is "declared
+  in `[parameters]` but not referenced".
+- **IMPMAP no longer keeps a subject in an outdated posterior mode** (#1629). Each
+  iteration's MAP search started only from the previous iteration's mode. When a
+  subject's posterior had two modes and the lower one changed as the parameters
+  moved, the subject stayed in the old basin for the whole fit. Every warm-started
+  MAP search, including the final EBE solve, is now also run from η = 0, and the
+  lower of the two modes is kept. On `two_cpt_oral_cov` the reported IS
+  −2 log L moves from −1177.6 to −1198.7, against −1199.8 from NONMEM IMPMAP.
+  ω²(ETA_V1) moves from 0.176 to 0.110 and ω²(ETA_KA) from 0.228 to 0.179;
+  NONMEM gives 0.109 and 0.178. Estimating `imp` is affected the same way when
+  a preceding chain stage supplies its starting EBEs.
+- **SAEM and IMP/IMPMAP no longer decline a covariate mu-reference whose theta is another
+  eta's anchor** (#1630). A typical value such as `V1 = TVCL * TH_R * (WT/70)^THETA_WT_V1 *
+  exp(ETA_V1)` reads `TVCL`, the mu-reference anchor of `ETA_CL`; it used to be declined with a
+  warning that "one theta cannot take two closed-form updates". When `ETA_CL` has a covariate
+  mu-reference of its own, that anchor never ran, and the decline cost 10–29 OFV units on
+  `two_cpt_oral_cov` (`THETA_CRCL` 0.16–0.24 against 0.556). The two now take #1620's joint
+  M-step and reproduce the reparameterised model (`V1 = TVV1 * …`) to every printed digit of
+  OFV. When the anchor is a plain one (`V2 = TVV2 * exp(ETA_V2)` next to a `V1` reading `TVV2`),
+  it now joins the group as a one-theta member instead of declining it, and the covariate
+  exponent no longer wanders (`THETA_WT_V1` 0.68 / 1.07 / 0.63 over three seeds before, against
+  FOCEI's 0.577). A group is still declined when the anchor's random effect has negligible
+  variance or its typical value is not on a log or logit scale, and the warning now says which
+  of the two and no longer claims the thetas "stay on the numerical M-step".
+- **A θ level block read directly in the prediction keeps the analytic gradient**
+  (#1636). This covers `y = central / V * SCALE[STUDY]` in `[scaling]` and
+  `y = PLACEBO[STUDY] + ...` in a compartment-free model. Before, every subject fell back
+  to finite-difference gradients while `optimizer = auto` stayed on L-BFGS. On a 12-subject
+  ODE example the fit stopped at OFV −56.99, 51 points above the −108.28 that the same
+  model reaches with the read written in `[individual_parameters]`. The closed-form
+  engine stopped at −59.07. Both spellings now fit identically. Such a fit may now
+  converge to different (better) estimates than before. The levels are no longer reported
+  as "declared in [parameters] but not referenced".
+- **A θ level block read where a θ cannot be read is now refused when the model is
+  parsed** (#1637). The four places are the `[odes]` right-hand side, `init(...)`, an
+  ODE-accumulated `[event_model] hazard`, and an error-model selector condition
+  `if (...)`. Before, `KM[2]` in `[odes]` silently read 0. `init(central) = KM[2]`
+  crashed. `KM[K]` drove every subject's objective to the failure value. A selector
+  `if (SCALE[STUDY] > 1.5)` took the `else` branch for every row without a warning.
+  The refusal names the block and gives the remedy: assign it in
+  `[individual_parameters]` for the ODE contexts, or use a data column for a selector.
+  A bare named block in `[odes]` was already refused, but its message named the
+  internal `__level_` column; it now gets the same message.
+- **A θ level block in a residual-error magnitude is estimated under `method = gn`**
+  (#1638). With `DV ~ proportional(PROP_ERR * ERRSCALE[STUDY])`, Gauss-Newton left every
+  level at its initial value; it now estimates them, matching `gradient = fd`. A bare
+  named block (`ERRSCALE` for `theta ERRSCALE[STUDY, ...]`) is now accepted in a
+  magnitude instead of being refused as an undeclared covariate. The levels are no
+  longer reported as "declared in [parameters] but not referenced".
+- **A kappa `weight` that reads an estimated θ level block is refused** (#1639), as one
+  reading an estimated θ already was: an estimated weight can cross zero during the fit.
+  A `FIX` block is still accepted.
+- **Additive and logit ETA/KAPPA rows no longer print a CV%** (#1643). The console, the
+  model summary and the fit YAML printed `CV% = sqrt(variance)·100` for every random effect,
+  so an additive kappa such as an MBMA arm effect (`BASE = TVE0 + ETA_E0 + KAPPA_ARM`) read
+  as `CV% = 1249.1`. A variance now reads on the scale its effect enters: `CV%` (YAML
+  `cv_pct`) for log-normal, `SD` (YAML `sd`) for additive and logit, nothing for any other
+  shape; a weighted kappa's SD is labelled `at weight 1`. Kappas are classified by where they
+  sit in their expression, followed through an intermediate such as `IOVCL = KAPPA_CL`, and the
+  result is carried as `FitResult.kappa_param_types` (parallel to `kappa_names`, also in
+  `.fitrx` bundles) for ferx-r to read.
+- **A `theta NAME[COL, ...]` block's internal `__level_NAME` column no longer shows up in
+  the undeclared-covariate warning or in column lists** (#1644). The "not declared in
+  [covariates]" warning no longer lists it; the block's own columns, such as `STUDY`, are
+  still reported when undeclared.
+  `FitResult.covariate_names`, the "Available covariate columns" list, the GAM covariate
+  screen and the FREM dataset header now hold only the data's real columns. Estimates do not
+  change. A `.fitrx` written before this still lists the column in `covariate_names`; it
+  loads unchanged. `predict` on a model whose level block was never bound now reports
+  `E_THETA_LEVELS_UNBOUND`'s message and how to bind, as the simulate paths do. Before, it
+  reported `__level_NAME` as a covariate missing from the data. A model that *was* bound,
+  given a population that was not, still reports the column that way on `fit`, `predict`
+  and simulate (#1647).
+- **A bound level-block model on a population that was never bound names the binder**
+  (#1647): `predict`, `simulate*`, `compute_npde_npd` and `fit` now refuse with
+  `E_THETA_LEVELS_DATA_UNBOUND`, which says the population was never bound for the
+  `theta NAME[...]` block and names `bind_from_fit` (to run a fit's θ) or
+  `bind_theta_levels` (to fit). Before, the refusal reported an engine-internal
+  `__level_NAME` column as "not found in data". `compute_npde_npd` returned `Ok`
+  with every npd `NaN`.
+- **A one-column level block whose levels each belong to one subject is refused next to a
+  random effect it absorbs** ([#1649](https://github.com/FeRx-NLME/ferx-core/issues/1649)).
+  `theta PLACEBO[STUDY]` with one subject per study and `E0 = TVE0 + PLACEBO + ETA_E0` made
+  each level the same quantity as that subject's η under every contrast; the fit drove ω to 0
+  with a computed covariance and no warning naming the cause. It is now refused at bind time,
+  naming the expression and advising to remove the block or drop the random effect.
+- **`predict_diag()` and the adaptive driver (`simulate_adaptive()` /
+  `simulate_adaptive_from_spec()`) now report the steady-state non-convergence note** (#1652). When an `SS=1` dose on a nonlinear `[odes]` model hit the equilibration
+  cycle cap short of steady state, `simulate_with_options_diag()` and `fit()` said so, but
+  `predict_diag()` and the adaptive driver (`simulate_adaptive()` /
+  `simulate_adaptive_from_spec()`) ran the same capped equilibration and returned the
+  unreliable trough with nothing in `warnings`. Both now carry the note, ahead of the non-fit
+  bundle, and report only their own pass: a note left over from an earlier call is cleared on
+  entry. The `predict()` documentation no longer claims that data-reader warnings are missing
+  from `predict_diag()`; they have been in its `warnings` since #1280.
+- **An additive ETA with more than one other term keeps its SD row** (#1656, #1662). An ETA was
+  additive only as exactly `THETA + ETA`, so `BASE = TVE0 + PLACEBO + ETA_E0 + KAPPA_ARM`, or
+  `E0 = TVE0 + B_FLARE * FLARE + ETA_E0`, classified as custom and printed neither `SD` nor
+  `CV%`. ETAs are now classified the way kappas are: by where the ETA sits, followed through an
+  intermediate variable to where it is used (`ECL = ETA_CL`, `CL = TVCL * exp(ECL)` is
+  log-normal). An ETA beside a second one in `exp(...)`, which used to get no row at all, now
+  gets one; so `iiv_on_ruv = ETA_RUV` is now refused when `ETA_RUV` also sits in a structural
+  `exp(ETA_CL + ETA_RUV)`, which used to fit with the eta silently doing two jobs. The walk stops
+  at a variable a block reads as a parameter — `[structural_model]`, `[odes]`, `[scaling]`,
+  `[initial_conditions]` or an endpoint block — and no longer at one only `[derived]` reports,
+  for ETAs and kappas alike.
+- **A sample-size-weighted log-normal kappa's CV% is labelled `at weight 1`**
+  ([#1666](https://github.com/FeRx-NLME/ferx-core/issues/1666)). The console and `ferx summary`
+  row now reads `(CV% = … at weight 1)`, as the SD rows of additive and logit kappas already
+  did; the fit YAML's `cv_pct` is unchanged and documented as the weight-1 figure. Unweighted
+  rows are unchanged.
+- **`ferx summary` reports block-kappa correlations and kappa shrinkage**
+  ([#1667](https://github.com/FeRx-NLME/ferx-core/issues/1667)). The KAPPA (IOV) section gains
+  `corr(K_i, K_j) = …` lines for a `block_kappa`, and Diagnostics gains a `Kappa shrinkage:`
+  line (plus one per occasion slot), matching what the fit prints.
+- **The closed-form log-normal gradient fallback no longer returns a wrong ∂f/∂η** (#1669). When
+  the compiled individual-parameter program declines (more than 24 θ + η, or an NN width
+  mismatch), the sensitivity providers fall back to `∂p/∂η = p` for each parameter's own η. That
+  was gated on every ETA being labelled log-normal, which is not the same thing: an ETA reached
+  through an intermediate (`TCL = TVCL * exp(ETA_CL)`, `CL = TCL * 1.5`) got a zero gradient,
+  and a second ETA in one `exp` (`exp(ETA_CL + ETA_V)`) a wrong one. The fallback is now used only when the
+  parser has checked that every parameter is `g(θ, cov) · exp(η)` with its η written in its own
+  assignment; otherwise the fit uses finite differences. No example model changes route. (Since
+  #486 the adjoint evaluates the individual-parameter program itself, with no such fallback.)
+- **A reassigned individual parameter is labelled by its last assignment** (#1673). In
+  `CL = TVCL + ETA_CL` followed by `CL = CL * TVV`, the ETA was labelled additive and printed an
+  `SD`, though the `CL` the model uses is a product; it is now custom, as `CL = (TVCL + ETA_CL) *
+  TVV` on one line is. A later `CL = CL + TH` stays additive and `CL = exp(CL)` is log-normal.
+  A statement only reads the value in force where it sits, so a line before the assignment, after
+  a reassignment that replaces it, or in the other branch of an `if` no longer changes the label.
+  Kappas follow the same rule. Labels only: estimates and objective values are unchanged, and no
+  example model's labels change.
+- **A level block whose levels have no effect on the likelihood binds only under a contrast
+  that can carry them** ([#1679](https://github.com/FeRx-NLME/ferx-core/issues/1679)). On
+  `PLACEBO[STUDY, TIME]` read through a factor that vanishes at `TIME = 0` (`PLACEBO * TIME`, a
+  block on `EMAX` in `EMAX * TIME / (TIME + ET50)`, an ODE state at its initial value), each
+  study's `TIME = 0` level estimated nothing and global sum-to-zero bound anyway, leaving a flat
+  direction. `auto` now takes `sum_to_zero_within` there, which codes one such level per study
+  through the others; a contrast that gives one a θ of its own (`none`, `ref` outside the
+  reference, two in one sum-to-zero group) is refused, listing the levels and naming a contrast
+  that works when there is one.
+- **Post-hoc steps no longer run silently on a population the fit never saw** (#1685): a row
+  filter passed to `fit_from_files` (or `ferx_fit(settings = list(ignore = ...))` in R) was
+  dropped when `run_sir` / `run_covariance` re-read the data, so they ran on rows the fit had
+  excluded (measured: 300 observations against the fit's 240, SE(TVV2) 1.17 against 3.29). A
+  supplied population read without a dose-row filter, or never bound for a `theta NAME[...]`
+  level block, also passed, returning a standard error 7,800 times the fitted one, or a flat
+  Hessian and an SIR effective sample size of 298 of 300. And `load_fit` returned the bundled
+  data unfiltered (30 subjects for a fit of 29). Each now re-reads as the fit did or is refused
+  with what differs.
+- **`bind_from_fit` refuses a fit with no recorded bindings even when the model is
+  already bound to other data** ([#1686](https://github.com/FeRx-NLME/ferx-core/issues/1686)).
+  The binder now reads what the model needs from its text, not from its current
+  state. Before, a `center = median` model that `prepare_run` or `bind_covariate_stats`
+  had bound to a simulation design, paired with an older `.fitrx` (or a fit made
+  before #1621), returned `Ok` and drove the fit's θ with the design's median. The
+  same model given a fit whose statistics lack a covariate now names that covariate,
+  as an unbound model does. A level-block model pre-bound to a design is no longer
+  refused when the fit's `auto` contrast resolved to a different contrast than the
+  design's did.
+- **A random effect whose variable is reassigned in an `if` is labelled by the path it
+  takes** (#1689): an `if`/`else` that reassigns the variable in every branch now
+  replaces the earlier definition (`CL = TVCL + ETA_CL`, then `CL = exp(CL)` in both
+  branches, is `LogNormal`, not `Custom`), and a reassignment inside a branch ends the
+  earlier definition for the rest of that branch. Labels only (SD vs CV% row); estimates
+  and OFV are unchanged.
+- **A level block that absorbs two random effects, or whose levels nest in subjects that do
+  not share a key, is refused** ([#1696](https://github.com/FeRx-NLME/ferx-core/issues/1696)).
+  `[STUDY, TIME]` with one subject per study and an η on each of `E0` and `EMAX` (or an η and a
+  kappa on the same baseline, with occasions as periods) bound within-study although the levels
+  then reproduce one of them; it is now refused under every contrast. Two subjects of one study
+  on disjoint times nest the block in subjects too, so a global contrast there is now refused
+  and `auto` takes `sum_to_zero_within`.
+- **SIR resamples a θ that may be negative**
+  ([#1701](https://github.com/FeRx-NLME/ferx-core/issues/1701)). SIR rejected every sample
+  with any θ ≤ 0, whatever the θ's declared bounds. A level block, a covariate slope or a
+  shift declared e.g. `(0, -50, 50)`, and any `[covariate_nn]` model with a negative weight,
+  therefore failed with "All N SIR samples had invalid weights", both in-fit and from
+  `run_sir`. `simulate_with_uncertainty`'s asymptotic draws
+  were silently truncated to θ > 0. θ is now governed by its bounds alone, and only σ and
+  the Ω and κ diagonals must be positive. Models whose θ all have a lower bound ≥ 0 get
+  bit-identical results.
+- **`run_sir` and `run_covariance` work on a `[mixture]` fit with per-class Ω/Σ
+  overrides** (#1704): the overrides are rebuilt from the fit, where `run_sir` used to fail
+  with a covariance dimension mismatch and `run_covariance` returned no matrix. Their
+  fitted values are carried only by the in-memory result of a FOCE, FOCEI, Laplace or
+  Gauss-Newton `fit()`; on a `.fitrx`-loaded, R-built, SAEM, IMP or Bayes mixture fit with
+  overrides both now return an error naming the overrides (#1765). `fitted_params_from_result`
+  now returns a `Result`.
+- **A `method = foce` fit now scores its post-fit steps under FOCE, not FOCEI** (#1710):
+  the model file left the interaction flag at its `true` default, so SIR weighted its
+  draws with the FOCEI objective while centred on the FOCE estimates (on warfarin_iov an
+  effective sample size of 4.9 per 1000 instead of 396, with ω²(KA) outside its own
+  interval), the sdtab CWRES were the FOCEI ones, the FOCE-M3 warning never fired, and
+  the fit reported `interaction: true`. Standalone `run_sir` / `run_covariance` now take
+  the marginal from the fit rather than the caller's options (they reported SE(TVKA) =
+  7576 against the fit's 0.74 on the same model), so FOCE fits saved to `.fitrx`
+  before this release re-score correctly; refit to correct their stored `interaction` and CWRES.
+- A level block whose random effect shares an expression with it, scaled by a
+  factor that varies within a subject — `E0 = (TVE0 + PLACEBO + ETA_E0) * (1 +
+  0.1 * OCC)`, a term such as `+ 0.1 * OCC`, a `TIME` factor or an outer
+  function, in an individual parameter or in the readout — is now refused as
+  unidentified, as the same model without the factor is. It used to bind
+  silently, leaving the block and the random effect to trade off freely. Only
+  the smallest sum or product collecting both has to be constant within the
+  subject (within the occasion, for a kappa) (#1712).
+- **A hand-written Box-Cox ETA, or any `exp(η)` with a `^`, `+`/`-` or function above it, no
+  longer prints a log-normal `CV%`** ([#1714](https://github.com/FeRx-NLME/ferx-core/issues/1714)).
+  An ETA or kappa is labelled log-normal only when nothing but `*` and `/` sits between its `exp`
+  and the parameter, across intermediate variables; `TVV * exp((exp(ETA_V)^L - 1) / L)`,
+  `TVV * exp(ETA_V)^2` and `TVV * exp(ETA_V) + TH` are now custom, so their omega/kappa rows
+  print no `CV%` instead of a wrong one (31.6% at ω = 0.1 against a true 30–45% for Box-Cox
+  and 16.6% for the shift). Labels only: no estimate, objective or residual changes, and no
+  shipped example changes label.
+- **A typical value whose ETA is transformed is no longer reported as having "NO
+  associated ETA"** (#1715): SAEM, IMP/IMPMAP and FREM conversion used to list every
+  estimated θ the closed-form mu-reference shift does not move as ETA-less, and told
+  the user to add an ETA. That included a Box-Cox `TVCL` and its shape θ `LAMBDA`,
+  and a covariate coefficient that shares `CL` with `ETA_CL`. Such θ now get a
+  separate message. It says the ETA is there but not in the `log P = log TVP + ETA_P`
+  form the shift needs, and it advises cross-checking against FOCEI (or IMPMAP)
+  instead of removing the transform. A θ with no ETA in any statement keeps the
+  previous text.
+- Non-interaction FOCE (`method = foce`) now finds each subject's EBEs with the residual
+  variance held at the population prediction f(η = 0), as NONMEM `METHOD=1` without
+  `INTER` does. Fits with proportional or combined error previously scored the variance at
+  f(η̂) during the EBE search, giving different EBEs and an OFV that disagreed with NONMEM
+  (by 0.74 on a non-IOV model and 1.28 with IOV, on `warfarin_iov`, at NONMEM's own
+  estimates); ferx now matches NONMEM there to 1e-6. FOCE estimates, EBEs, CWRES, standard
+  errors and SIR weights change for these error models, as do the OFV, covariance and SIR
+  of any other estimator run with `interaction = false`; additive error and FOCEI are
+  unchanged. The covariance step of such a FOCE fit stays analytic: the adjoint's R-matrix
+  differentiates the frozen-variance objective itself (#486).
+- **An ETA or kappa that enters its scale twice no longer prints a CV% or SD**
+  (#1724): `TVV * exp(ETA_V) * exp(ETA_V)`, `exp(ETA_V + ETA_V)`,
+  `EV = exp(ETA_V); V = TVV * EV * EV`, an intermediate read twice, or a
+  reassignment that adds the ETA again is `2·η` on its scale, whose CV is
+  `√(e^{4ω} − 1)` (70.1% at ω = 0.1), not the `100·√ω` (31.6%) that was
+  printed. These rows are now labelled `custom`. The check measures the
+  coefficient from the model's exact derivatives rather than matching how it is
+  written; a parameter assigned inside an `if` statement is not yet checked.
+  A unary minus inside a product (`TVV * -exp(ETA_V)`) no longer turns a
+  log-normal label `custom`.
+- The FOCE-M3 non-interaction warning now fires for a chain whose last stage is an
+  evaluation-only readout (e.g. `method = [foce, imp]` with `imp_eval_only = true`, or a
+  trailing `agq_eval_only` Laplace stage): it gates on the last estimating stage rather than
+  the chain's last stage (#1726).
+- **`run_sir` / `run_covariance` refuse a supplied model bound on other data when the
+  fit records no bindings** (#1729): for a fit without `data_bindings` (any `.fitrx`
+  saved by a released ferx), a model passed as `model = Some(...)` with a symbolic
+  covariate centre was used as given, so one bound on a simulation design scored the
+  fit's θ centred on the design (measured: SE(THETA_CL_WT) off by 44–64%). Its
+  covariate statistics are now checked against the population being scored. The
+  model bound on the fit's own data still runs unchanged; any other model is refused
+  with the covariate, the statistic and both values.
+- **Binding an already-bound model to other data now binds it as a fresh parse
+  would** (#1730): `bind_theta_levels` and `bind_covariate_stats` read the level
+  blocks and covariate relations from the model text, so a model bound to one
+  dataset no longer keeps that dataset's `auto` contrast or `center = median` when
+  bound to another. Before, a re-bound model could silently keep the first data's
+  contrast and median, or be refused for a contrast the model never declared. A
+  binder keeps the other half only while it still holds on the new data. The
+  deprecated `bind_theta_levels_from_fit` also reads the declared blocks. A model
+  laid out on a fit (`bind_from_fit`, `layout_from_fit`) keeps the fit's bindings:
+  `bind_covariate_stats` leaves it as it is, and `bind_theta_levels` now refuses it
+  rather than re-laying the fitted θ on the data's own levels.
+- **NPDE/NPD now simulate `block_sigma` residuals at the fitted correlation**
+  (#1733): `compute_npde_npd()` and the in-fit NPDE (`npde_nsim > 0`) drew every
+  residual at the ρ declared in the model file and one row at a time, so a fit that
+  estimated ρ was scored at its starting value and a cross-endpoint pair (same time
+  and occasion, or the same `L2` id) as if independent. They now draw at the
+  parameter set's ρ, pairing rows through the dense residual covariance the way
+  `simulate()` does. The adaptive-dosing controller's assay noise reads the same ρ,
+  and so does `simulate()` for a FREM subject, whose rows are drawn one at a time
+  (it used the declared ρ there).
+  `CompiledModel::sim_residual_variance` takes the correlations as an argument.
+  Validated against NONMEM's `$TABLE NPDE` with `WRESCHOL`.
+- **No false `W_UNUSED_PARAM` for a θ a `[covariate_model]` relation declares
+  with `=> NAME(...)` while it waits on a data statistic** (#1738), such as
+  `center = median`. `ferx check` warned the θ was unreferenced, with and
+  without `--data`, although binding puts it in the expression; a genuinely
+  unused θ still warns.
+- **`ferx check --data` reports a `[covariate_model]` statistics-binding failure
+  as `E_COVARIATE_STATS_BINDING` on block `covariate_model`** (#1739) — e.g. a
+  `levels = auto` relation whose data carry a single level. It used to be
+  labelled `E_THETA_LEVEL_BINDING` on `[parameters]`, the level-block code,
+  which pointed at the wrong block. Level-block failures keep their code.
+- **A categorical covariate value outside its relation's levels is refused by
+  the predict, npde, SIR and covariance entry points, not only by `fit()` and
+  `simulate()`** (#1740): `predict()` /
+  `predict_diag()` / `predict_survival()` / `predict_categorical()`,
+  `compute_npde_npd()`, and `run_sir()` / `run_covariance()` on a supplied
+  population used to score an unseen level silently as the reference level —
+  including on a design laid out with `bind_from_fit`. They now return
+  `E_COV_LEVEL_UNKNOWN`'s message, whose advice depends on where the levels came
+  from: a model laid out on a fit is told the fit estimated no θ for the value
+  and to drop or recode the rows or refit (adding the value to written-out
+  levels first), not to switch to `levels = auto`. A missing value still takes
+  the neutral branch.
+- **`ferx check --data` no longer reports an unreadable model file as a level-block error**
+  (#1743): it was `E_THETA_LEVEL_BINDING` on `[parameters]`, even for a model with no level
+  block. The check now reads the model file once (#1752), and a file it cannot read is
+  `E_MODEL_READ`, with no block.
+- **Models with an `[event_model]`, `[binary_model]` or `[markov_model]` endpoint now get
+  a correct per-subject score** (#1744). The score feeds `covariance_method = s` / `rsr`,
+  the gradient-based outer optimizers and Gauss–Newton, and it covered only the Gaussian
+  observations. Under `method = focei` it dropped the non-Gaussian term for every such
+  model. Under `method = foce` it did so when the model also had analytical PK and a
+  single `[error_model]`: a joint PK + TTE model, or a TTE model that carries placeholder
+  PK blocks, as `examples/tte_exponential.ferx` does.
+  - Without random effects the score was zero for every subject. `covariance_method = s`
+    failed as singular, and `rsr` reported SE = 0 with no warning. Under
+    `optimizer = lbfgs`, `slsqp`, `mma` and `trust_region` the fit stayed at the initial
+    estimates, and all except `trust_region` reported convergence. On a TTE endpoint,
+    `method = gn`, and `method = gn_hybrid` with a non-BOBYQA polish, stalled the same way.
+  - With random effects, `rsr` reported wrong SEs that looked plausible: 0.0028 for an SE
+    of 0.0086 on `examples/tte_exponential.ferx`.
+
+  On models without random effects the gradient optimizers now reach the BOBYQA optimum.
+  With random effects they move off the initial estimates but can still stop short of it (#1778).
+  Fits that used `optimizer = auto` (which picks BOBYQA for these models unless they have
+  more than 64 free parameters) and the default `covariance_method = r` were unaffected. On an exponential TTE model with covariates,
+  the RSR SEs now agree with NONMEM's to within 0.14%.
+- **The `ferx amd` final-model table reports Ω and Σ standard errors** (#1748):
+  `ferx_core::io::output::parameter_table` printed `---` for every Ω/Σ SE and
+  labelled rows by position (`OMEGA(1,1)`, `SIGMA(1)`). Rows are now named by
+  their ETA / sigma / kappa names, a block covariance reads `ETA_V × ETA_CL`,
+  and the SE and %RSE come from the covariance step. Covariance rows follow the
+  model's block layout rather than their size: the structural zeros of a
+  diagonal Ω, or between a block and a standalone ETA, are no longer listed as
+  estimates, and a block covariance at zero keeps its row when its estimate,
+  initial value or SE shows it is estimated. (A zero covariance with none of
+  those — a block Ω entry initialised and estimated at zero with no positive
+  SE (no covariance step, or a `FIX` block), or a block-κ covariance at
+  exactly zero — is omitted.) The
+  `Type` column states the scale (`OMEGA var`, `OMEGA cov`, `SIGMA SD`,
+  `KAPPA var`, `KAPPA cov`), IOV κ rows are included, and fixed parameters are
+  marked `[FIX]` with no SE.
+- **Each entry point reads the model file once** (#1752): `fit_from_files`, `prepare_run`,
+  the CLI's fit and `--simulate` runs, `ferx check` and `prepare_frem` used to parse the file
+  and then read it again to bind it to the data, hash it and store its text. An edit made
+  while a fit ran could bind against a different version than the one parsed, and stamp
+  `model_hash` / `model_text` from a file that was never fitted. The one read is now parsed,
+  bound, hashed and stored. A model file that cannot be read is reported as `cannot read the
+  model file <path>: <reason>` (it was `Failed to read model file`, or "for level binding" on
+  a model with no level block), and `ferx check` gives it the code `E_MODEL_READ` (it was
+  `E_PARSE`). New public `ModelSource::read` / `ModelSource::read_verified` give a caller
+  the same single, hash-first read.
+- **A cancelled SIR run no longer spends inner loops on the low-ESS floor probe**
+  (#1754): the probe checks `cancel` before its baseline and before each free
+  Ω / κ variance, and stops without scoring them. The low-ESS warning keeps its
+  ESS and heaviest-draw sentences and leaves out the box-floor sentence.
+- **SIR weights every draw with the objective the fit minimised** (#1755): `run_sir`
+  and `run_covariance` now take `method` from the fit instead of the caller's options
+  (default FOCEI) for every fit — a Laplace fit is scored with its Laplace marginal, and a
+  SAEM, IMP or Bayes fit's `run_covariance` re-solves its EBEs with that method's inner
+  seed, which can move its standard errors slightly — and the in-fit SIR of a method chain such as
+  `[focei, laplace]` scores the final estimating stage rather than the top-level
+  `method`. A `[mixture]` model's draws are scored with the K-class mixture marginal the
+  fit reports, not the one-class objective, which on a class-override fit had left an
+  SIR effective sample size of about 1 and intervals excluding the estimates.
+  `run_sir(fit)` now equals the in-fit SIR at the same settings; `n_agq` and the other
+  SIR settings are taken from the fit's record (#1758).
+- **`sir_seed` is the seed SIR used, and `None` when SIR did not run** (#1758):
+  a fit with `sir = true` and no `sir_seed` now reports the built-in default seed
+  instead of `None`; a fit whose SIR did not run reports `None` even when it was
+  given a `sir_seed`; and `run_sir` now sets `sir_seed` to the seed of its own run
+  instead of keeping the input fit's.
+- **A population bound for other levels than the model's is refused, not read at the
+  wrong level** (#1762): a model with a bound `theta NAME[...]` block, handed a
+  population bound on its own (another dataset's studies or times, or a subset with
+  fewer levels), ran and read each record at whatever level shared its index. Every
+  entry point that checks the θ-level population (`predict`, the simulate and adaptive
+  paths, `compute_npde_npd`, `fit()`, `ferx check`) now checks each record's index
+  against the level its own columns name and refuses a mismatch as
+  `E_THETA_LEVELS_DATA_MISMATCH`. A population only some of whose subjects were bound
+  is no longer told it was "never bound": it gets "`k` of `n` subjects".
+- **`predict_survival`, `predict_categorical` and `compute_npde_npd` refuse what
+  `predict` refuses** (#1763): a covariate the data lacks (read as 0.0 — every
+  survival 1.0 under a multiplicative hazard), an unbound `theta NAME[...]` block, or a
+  population not bound for a bound one returned `Ok` with wrong or `NaN` values. They
+  now run `predict`'s level and covariate checks in its order, returning
+  `E_MISSING_COVARIATE`, `E_THETA_LEVELS_UNBOUND` (its advice naming the entry that
+  refused), `E_THETA_LEVELS_DATA_UNBOUND` or `E_THETA_LEVELS_DATA_MISMATCH`.
+- **Mis-shaped Ω, σ or Ω_IOV are refused instead of panicking or being ignored** (#1764):
+  `fit()`, the `simulate*` and adaptive entry points, `simulate_with_uncertainty`,
+  `compute_npde_npd`, `run_sir()` and `run_covariance()` now return `E_PARAM_SHAPE` when
+  a random-effect or residual block does not match the model. Previously a mis-sized
+  block panicked, a long σ ran to completion without it, and a fit with no Ω_IOV was
+  scored or simulated with the model's initial Ω_IOV (`compute_npde_npd` keeps its
+  documented κ = 0 fallback for a missing one). `fit()`
+  also refuses initial parameters whose θ is not the model's length (`E_THETA_LENGTH`),
+  which used to fit a short θ to a meaningless objective.
+- **SAEM `[mixture]` fits with an `omega(k)` override now use the override as that
+  class's prior** (#1765): the overridden class Ω kept the base Ω's Cholesky factor,
+  inverse and log-determinant, both during the iterations (class draws, MH target and
+  proposals) and at the end (final OFV, EBEs, covariance step), so the override was
+  estimated and reported under the base prior. Estimates of such fits change; the
+  reported OFV now equals a FOCEI evaluation at the SAEM estimates.
+- **A `FitOptions` built in Rust can no longer save a `.fitrx` that does not load**
+  (#1770). `fit()` now refuses, up front, the recorded settings the `.fitrx` reader
+  rejects: `n_agq` outside `1..=21` under any method (`E_AGQ_NODES_ZERO` /
+  `E_AGQ_NODES_TOO_LARGE`), a `sir_df` below 1 when SIR can run (`E_SIR_OPTIONS`,
+  also from `run_sir`), and `ode_stiff_abort_after = Some(0)` even on an analytic
+  model (`E_ODE_SOLVER_OPTIONS`). `save_fit` refuses a result edited into the same
+  state with the new `FitrxError::Unwritable` and writes no file, and writes
+  `sir_seed` from `sir_settings.seed`, so editing the recorded seed before saving
+  gives a bundle that loads. Model files and ferx-r were already held to these limits.
+- A gradient-based outer optimizer (`nlopt_lbfgs`, `slsqp`, `mma`, `trust_region`,
+  `method = gn` without IOV) on a model with an `[event_model]` or `[binary_model]` endpoint and random
+  effects no longer stops short of the optimum while reporting convergence. These models
+  now take the reconverged finite-difference outer gradient, which re-solves the EBEs at
+  every perturbed point, whatever `reconverge_gradient_interval` says. On
+  `examples/tte_exponential.ferx`, `nlopt_lbfgs` reached 166.4983 before and reaches
+  BOBYQA's 166.4394 now. Gradient fits on these models take about 1.5–2.5× as long (#1778).
+- **The FOCEI `log|H̃|` EBE-response term in the fixed-EBE score now declines on every
+  model the closed-form score itself declines** (#1779): joint PK + TTE, binary or CTMM
+  endpoints, M3, IOV, an η on the residual error, a θ-dependent residual magnitude and
+  `block_sigma`. On those models the covariance step's `S` / `R⁻¹SR⁻¹` score assembly
+  still derived the term from the Gaussian rows alone, a likelihood missing the excluded
+  terms. The term is zero today, so no estimate, SE or OFV changes. The fix keeps it from
+  becoming a wrong number once its ω/σ blocks are added (#1817), and those subjects no
+  longer build and discard a per-subject Laplace cache.
+- **`covariance_method = s` now says why `S` is singular** (#1780). The message used to
+  blame "fewer subjects than free parameters" whatever the cause. It now names the
+  parameters whose score is zero, or nearly zero, in every subject, states the rank when
+  there are fewer subjects than free parameters, and otherwise names the parameters whose
+  per-subject scores are collinear (for example two θ the likelihood reads only as a ratio)
+  and how many of them to fix. It advises
+  `covariance_method = r` or `rsr` only for the design case, since in the others `R` is
+  singular along the same direction.
+- **The covariance step after `method = saem`, `imp` or `impmap` on a model with a
+  non-Gaussian endpoint (TTE, `[binary_model]`, CTMM) now differentiates the exact
+  marginal likelihood those methods estimate** (#1781). It used to take `R` and `S` on
+  the FOCEI objective, whose minimum can sit far from the sampler's estimate; `R` was then
+  indefinite there and the eigenvalue floor turned it into SE(TVLAMBDA) of 4–10 under
+  `covariance_method = r` and 1e4–4e4 under `rsr` on `examples/tte_exponential.ferx`
+  (ω²: 2e3–4e3 and 7e6–2e7). The
+  step now uses the 7-node adaptive Gauss–Hermite marginal (the objective of
+  `method = laplace, n_agq = 7`) for up to three random effects and says so in a
+  `W_COV_QUADRATURE_OBJECTIVE` note; SE(TVLAMBDA) is now 0.0079–0.0097 against 0.0082
+  from the exact marginal. A mixture, an IOV model or more than three random effects
+  keeps the FOCEI objective and carries `W_COV_QUADRATURE_DECLINED`. Wherever the `R`
+  being inverted was floored at an estimate its objective never minimised, `r` / `rsr` now
+  fall back to `S⁻¹` with `W_COV_NON_STATIONARY_ESTIMATE` instead of inverting the floor.
+- **`method = laplace` (any `n_agq`) now differentiates the likelihood of subjects whose
+  records are all non-Gaussian** (#1781). Its gradient dropped the event term twice for a
+  TTE-, `[binary_model]`- or count-only subject: the fixed-η score returned before its θ
+  block when the subject had no Gaussian observation, and the quadrature-grid correction
+  used an η-gradient holding only the Ω prior. On `examples/tte_exponential.ferx` the
+  default gradient optimizer stopped at OFV 166.647 where BOBYQA reaches 166.527, and the
+  `S` matrix gave SE(TVLAMBDA) ≈ 0.21 for ≈ 0.008; with only the first omission fixed, the
+  7-node gradient near the optimum still read (1.008, 2.441) against a finite difference of
+  (0.026, 0.0003).
+- A BOBYQA fit (`optimizer = bobyqa`, or `optimizer = auto` when it resolves
+  to BOBYQA) no longer reports `converged: YES`
+  just because its relative `outer_ftol` / `outer_xtol` stop fired. That stop
+  is now followed by up to four polish legs from the best point, at
+  `ftol_rel` ≤ 1e-10 and `xtol_rel` ≤ 1e-7 (tighter user values are kept),
+  and the last leg's stop decides `converged`. A polish that runs out of
+  `maxiter` budget, or is still improving after the fourth leg, reports
+  `converged: NO` with a warning. On `data/two_cpt_iv.csv` a FOCEI BOBYQA fit
+  that stopped at −432.0317 (macOS) / −432.1645 (Linux) now reaches NONMEM's
+  −432.1668. These fits take more evaluations, and their estimates move to the
+  lower optimum (#1782).
+- **`run_sir` and `run_covariance` now score the population `fit()` scored** (#1783).
+  Two kinds of fit returned wrong results with no error. On a fit with a derived
+  `iov_occasion` (`dose` or `time(...)`), `population = None` or the population
+  `prepare_run` reads gave `covariance_status = Failed` and an SIR effective sample
+  size of 1, because no occasions were derived. On a `log(DV) ~ ...` fit, DV was
+  not log-transformed in either population cell, so the step reported
+  `Computed` with standard errors 777 times too large. Both steps now prepare the
+  population as `fit()` does. A fit records the rule it ran under in the new
+  `FitResult::iov_occasion` field, and `.fitrx` round-trips it. A bundle saved
+  earlier has no rule: the steps use the model file's rule when they read the file,
+  and say so in the result's warnings. That guess is wrong for a `fit_from_files`
+  fit whose caller passed another rule; set `fit.iov_occasion` to the rule the fit
+  ran with. With no rule to use, an IOV model whose population has no occasion
+  labels is refused. One caveat for
+  such a bundle: a population you log-transformed yourself as a workaround is now
+  log-transformed a second time, and nothing can detect it without the
+  fingerprint. Pass the natural-scale population instead.
+- **`fitted_params_from_result()` refuses a fit whose Ω_IOV does not match the model**
+  (#1789): a fit with no `omega_iov` on a model with `kappa` used to be rebuilt with the
+  model's *initial* Ω_IOV, so every simulated occasion was under- or over-dispersed with
+  no diagnostic. That fit, one carrying an Ω_IOV on a model without `kappa`, and one with a
+  mis-sized Ω_IOV are now an `E_PARAM_SHAPE` error. The function's error type is now
+  `EngineError` (was `String`), so the code reaches the caller.
+- **`run_covariance()` / `run_sir()` check a supplied population against the model's θ
+  levels on a fit with no population fingerprint** (#1793): on a fit saved before
+  fingerprints (or with a stale one), a model plus a population never bound, partly bound,
+  bound for other levels, or relabelled after binding ran silently — on a `NaN` objective,
+  with every SE shifted, or at the wrong levels. Each is now refused with the
+  `E_THETA_LEVELS_DATA_UNBOUND` / `E_THETA_LEVELS_DATA_MISMATCH` text `predict_diag()`
+  gives; one with levels the fit lacks is told to pass the population the fit was given.
+- **A population never bound for a `theta NAME[...]` block is told so even when it lists
+  the block's index column** (#1795): such a population, built in memory with the name in
+  `covariate_names` but the index on no subject, heard "30 of 30 subjects … were not bound
+  with the rest" instead of "this population was never bound for it". "Never bound" is now
+  decided from the subjects alone, on every entry point.
+- **A subject with no Gaussian observation reads its own level of a `theta NAME[COL]`
+  block** (#1797). A subject with only time-to-event, binary, categorical or Markov
+  records was indexed at the block's first level whatever its columns said, so a
+  TTE-only subject in study 3 silently read study 1's θ in its hazard. It now reads
+  the level its baseline columns name, through `bind_theta_levels`, `bind_from_fit`
+  and the `run_sir` / `run_covariance` re-read alike. When those columns name no
+  level the block has (a study with no Gaussian records, one the fit never saw, no
+  value in a level column, or a block keyed on `TIME`), binding is refused with `E_THETA_LEVEL_BINDING` if what the
+  subject is scored on reads the block, and binds as before if it does not. `ferx
+  check`'s level-index check now covers these subjects too. A fit made before this
+  fix on such data has a different population fingerprint: `run_sir` and
+  `run_covariance` refuse its data as not the fit's, and `load_fit` loads the bundle
+  without its population. That fit read the wrong θ for those subjects; re-run it.
+- **ODE models with many FIX θ keep an exact inner (EBE) gradient** (#1804). FIX covariate θ
+  used to count towards a 24-axis cap that pushed every subject's EBE search onto finite
+  differences. On a model padded past the cap with zero-effect FIX θ, the FD inner had left a
+  subject at a worse EBE and moved the objective by 16 OFV; it now reproduces its 24-axis twin's
+  objective exactly. Since #486 neither loop has a θ cap.
+- `fit()`'s in-fit SIR (and its non-PD fallback) now scores each draw under the settings
+  of the stage that produced the estimates, so a Laplace / AGQ fit's draws reconverge at the
+  tightened `inner_tol` the objective was minimised at, and `sir_settings.scoring` equals
+  `scoring_settings`. On those fits SIR is correspondingly slower (about 4× on warfarin at
+  1000 draws, 0.16 s → 0.70 s); FOCE / FOCEI / SAEM fits are unchanged. `run_sir` on a fit
+  with no SIR record now takes the fit's `scoring_settings` instead of the defaults, so its
+  draws are re-scored under the inner-loop and ODE settings the same fit would have used with
+  `sir = true` (#1806).
+- **An `EVID=2` or `EVID=0, MDV=1` row now starts the clock** (#1809). NONMEM starts each
+  subject's system at its first record of any type. The reader dropped an `EVID=2` row on a
+  subject whose covariates were all constant, and an `EVID=0, MDV=1` row on every subject. So
+  an `[odes]` model whose state moves before the first observation (a production term,
+  `TIME` in the right-hand side, an `init()` that is not an equilibrium) integrated from the
+  first observation or dose, with no warning. The first observation then read the initial
+  state, and every later one inherited the missing window. Whether a subject was affected
+  also depended on whether some unrelated column happened to vary within it. Predictions,
+  objectives and estimates change on such datasets, and now match NONMEM 7.6.0. The same
+  rows now also start the hazard clock of an ODE-accumulated `[event_model]` hazard.
+  Analytical models without IOV are unaffected (for IOV models see #1876), and so is the
+  SDE/EKF objective, which still starts at the first observation or dose. The `TAD` that an
+  `[error_model]` magnitude expression reads, and that `ruvsearch` cuts on, changes for an
+  observation before the first dose: it is measured from the subject's first record, which
+  can now be such a row. Since the reader builds a different subject from the same file,
+  the population-fingerprint scheme is bumped: re-reading a `.fitrx` written before this
+  change warns that the fingerprint is absent, rather than reporting a population mismatch.
+  On a pure-TTE analytical model such a row no longer re-enables the dose-compartment check.
+- **Co-timed records follow file order when an `EVID=2` row is in the tie** (#1810). NONMEM
+  advances the system into a shared `TIME` once, at the first record there in file order
+  and under that record's covariates. ferx ordered co-timed records by type instead. So an
+  observation listed before a co-timed `EVID=2` (or `EVID=0, MDV=1`) row was advanced under
+  the `EVID=2` row's covariates, and an `EVID=2` row listed before a co-timed dose under the
+  dose row's. Every engine and the analytic gradients were affected, on analytical and ODE
+  models alike, wherever a covariate that drives the dynamics changes at the tie. The reader
+  now moves that first record one ULP below the tie, the mechanism #614 already uses for an
+  observation listed before a dose. The `TIME` reported in sdtab and by `predict()` is the
+  value you wrote. Ties that carry an `SS=1` dose or a reset are unchanged. Predictions,
+  objectives and estimates change on datasets with such ties, and now match NONMEM 7.6.0 on
+  #1810's seven tie cases.
+- **SIR with a multivariate-normal proposal now runs and survives `.fitrx`** (#1819):
+  `sir_df = normal` / `mvn` is accepted in `[fit_options]`, and `sir_df = ∞` draws
+  from the multivariate normal instead of rejecting every sample as non-finite. A
+  `.fitrx` bundle writes that `sir.settings.df` as `"normal"` (JSON has no number for
+  infinity) and reads `"normal"` / `"mvn"` back as `∞`, so `run_sir` on a reloaded fit
+  repeats its in-fit SIR; a `null` `df` is refused as corrupt.
+- **A level block read only behind a gate is no longer bound at its first level**
+  (#1822): a subject with no Gaussian observation, at a level the block has no θ
+  for, whose read of the block another θ or a random effect switches off at the
+  initial estimates (e.g. `exp(PLACEBO * GATE)` with `GATE` starting at 0, or
+  `exp(PLACEBO * ETA_CL)`) is now refused with `E_THETA_LEVEL_BINDING` instead of
+  silently binding at index 1, when moving the parameters opens the gate. The read
+  is measured at the dead-level check's two θ points, with each random effect
+  moved by a different amount at the second.
+- **A simulated individual that lands in a twin-less transit / IG closed form's
+  flip-flop regime is now reported** (#1823): the up-front refusal samples η = 0
+  typical values and the `W_UNCERTAINTY_DRAWS_SKIPPED` skip samples each draw's
+  η = 0 θ, so an individual whose *sampled* η pushed `ke` past the tilting
+  abscissa had its entire dose-driven concentration silently clamped to zero —
+  none of its rows carrying any contribution from the doses the subject was
+  given — with nothing said on any channel. Measured at 6.5% of simulated individuals on a 1-cpt transit form at
+  `ke = 0.125`, `KTR = 0.2`, ω²~CL~ = 0.09, where it moved the 5th percentile of
+  IPRED from 0.0322 to 0.0000. `simulate_with_options_diag()` and
+  `simulate_with_uncertainty_diag()` now carry one per-run
+  `W_SIMULATED_FLIP_FLOP` count (typed `flip_flop`) of the **timing-eligible
+  crossers** — those dosed strictly before one of their observations, so a
+  returned row could have carried the dose — naming that eligibility, the family
+  and the ODE `transit()` / `igd()` rewrite, which reroutes per individual. How
+  much a given run is biased is fixture-dependent: a model whose absorption is
+  lagged past the last observation, or whose `f` is 0, is counted but unaffected,
+  since those rows were already undosed. Those rows are **not** reliably `ipred == 0.0` —
+  an `[initial_conditions]` baseline, a Form-C `[scaling] y = <expr>` readout,
+  a log transform or the FREM row override all run after the clamp — so the
+  count is the only dependable way to find them. A twin-carrying model is
+  unaffected: it already reroutes to its ODE twin.
+- **`fit()` honours `FitOptions::bloq_method` whoever calls it** (#1824). Before this, a
+  direct `fit()` with `bloq_method = M3` in the options on a model parsed without the key
+  scored the censored rows as ordinary observations and reported `drop`, with no warning.
+  Only the file entry points copied the option onto the model. **Breaking (Rust API):**
+  the field is now `Option<BloqMethod>`. `None`, the default, fits under the model's own
+  method (the file's `bloq_method`, else `drop`), so an `m3` file fitted with
+  `FitOptions::default()` stays on M3. `Some(m)` overrides the model for that call,
+  including an explicit `Some(Drop)` on an `m3` model. `run_covariance` and `run_sir` score
+  the method the fit reports in `FitResult::bloq_method`. The results of `fit_from_files`,
+  `run_model_with_data`, the CLI and the ferx-tools search runner are unchanged.
+  `check_model_options` honours the field too. A search journal written before this
+  change with caller-supplied fit options will not resume: its settings fingerprint
+  recorded the old field type. Start that search afresh.
+- **Diagnostics about a compartment-free model's `[structural_model]` no longer name
+  `[scaling]`** (#1827). That block does not exist in such a model file. Two messages
+  are affected. The refusal of a weighted kappa in the `y = ...` equation now names
+  `[structural_model]`. So does `W_PER_CMT_UNMATCHED` for a `y[CMT=N]` entry that no
+  observation is recorded on, in both its message and its `block` field. Both
+  diagnostics fire exactly as before; only the block they name changed.
+- **A fit or parameter set whose Ω or σ does not match the model is refused, not
+  panicked on or copied through** (#1833): `fitted_params_from_result` now checks Ω,
+  σ and Ω_IOV against the model (it checked Ω_IOV only), and every reader of a supplied
+  Ω or Ω_IOV — `fit`, `simulate*`, `simulate_with_uncertainty`, the adaptive entries,
+  `compute_npde_npd`, `run_covariance` and `run_sir` — refuses one that is not square
+  with `E_PARAM_SHAPE` instead of panicking in its Cholesky. `run_covariance` /
+  `run_sir` now report a mis-sized Ω as `E_PARAM_SHAPE` too, in place of the uncoded
+  "supplied model has n_eta = …" error. A `.fitrx` bundle whose `iov.omega_iov` is not
+  square, or not one row per κ, no longer loads.
+- A level block that absorbs a random effect without one expression reading
+  both — proportional `if` branches on a condition that varies within a subject
+  (`E0 = S` / `E0 = 2 * (S)` on `OCC > 1`), or a factor distributed over a sum
+  (`(TVE0 + PLACEBO) * F + ETA_E0 * F`) — is now refused as unidentified. It
+  used to bind silently, under every contrast. Where the structural check names
+  no shared expression, the binder now measures the absorption on the data, at
+  the initial estimates and at a nearby point, and the refusal says so. This
+  also refuses a block whose levels each lie within one subject when the
+  subjects are observed once: a random effect on a single record is always
+  proportional to that record's level. The measurement is skipped for hazard,
+  Markov, binary, mixture and EKF models (#1834).
+- **A post-hoc `run_covariance` / `run_sir` on a fit that ran `gradient = fd` stays on
+  finite differences with default options** (#1835). The fit now records the gradient
+  route it took in `FitResult::scoring_settings.gradient_method` (and in
+  `sir_settings.scoring`), and the post-hoc steps take it as a union with the caller's:
+  either side's `fd` wins. Before, a direct `fit()` with `FitOptions { gradient_method:
+  Fd, .. }` followed by `run_covariance(…, &FitOptions::default())`, or any FD fit
+  reloaded from a `.fitrx`, silently built the covariance from the analytic R-matrix
+  (SE(θ₁) 0.8% off on warfarin). `.fitrx` writes `gradient_method` (`auto` / `fd`) in
+  both settings blocks; a bundle saved before this has none and loads `auto`.
+- A level block whose random effect funnel is written as a self-reassignment —
+  `E0 = TVE0 + PLACEBO + ETA_E0` followed by `E0 = E0 * (1 + 0.1 * OCC)`, the
+  usual NONMEM-translated form — is now refused as unidentified, like the same
+  model written through a fresh name (`E0A = ...`, then `E0 = E0A * ...`). It
+  used to bind silently, under every contrast. Each assignment of a parameter is
+  now judged on its own, so the same funnel followed by a conditional
+  reassignment (`if (OCC > 1) { E0 = E0 * 2 }`) is refused too, and an
+  overwritten assignment no longer counts unless another parameter reads it
+  first (#1836).
+- **A level block on a model with no intercept is no longer refused under every
+  contrast** (#1840). When nothing else in the model carries the levels' common mean,
+  as in `E0 = TVE0 * (1 + 0.1 * OCC) + PLACEBO + ETA_E0`, a one-column block whose
+  levels each lie within one subject now binds under `sum_to_zero` and `ref`. Only
+  `contrast = none` is refused, and its message names the contrast that binds. The
+  binder measures whether another θ carries the direction each contrast removes. An
+  explicit global `sum_to_zero` or `ref` on a nested block follows the same
+  measurement. Models with an intercept are refused exactly as before.
+- **`run_covariance` repeats the inline covariance step bit for bit on every engine
+  that has one, in memory and after a `.fitrx` reload** (#1847). Pure Gauss-Newton,
+  SAEM, IMP, IMPMAP and VI used to differ by up to 3.5e-7 relative on an SE, because
+  `run_covariance` started them from a cold inner solve instead of the warm-started
+  EBEs their inline step used. It now uses the cold solve only when the reported EBEs
+  are bit-equal to it. To keep that after a reload, `.fitrx` bundles now write every
+  CSV double (EBEs, κ̂, predictions, conditional distribution) as the shortest text
+  that reads back as the same value, instead of at six decimals (#1631), so
+  `run_sir` on a reloaded fit also repeats the fit's SIR bit for bit. Bundles saved
+  before this still load, and `run_covariance` runs them from the cold solve as before.
+  `load_fit` also accepts a bundle with a `conddist.csv` written by ferx-r, which it
+  refused as corrupt whenever an EBE was not a six-decimal number.
+- **A level block read through a difference of random effects is no longer refused as
+  having no effect** (#1852): the dead-level check now moves each random effect by a
+  different amount at its second point, as the other level checks do, so
+  `exp(PLACEBO * (ETA_CL - ETA_V))` binds instead of failing with
+  `E_THETA_LEVEL_BINDING` ("the block estimates nothing").
+- **A `TIME`-dependent disposition on an ODE-accumulated (drug-driven) hazard is now
+  refused instead of silently frozen** (#1853): the hazard pass integrates one `$PK`
+  snapshot taken at `TIME = 0`, while the Gaussian half of the same objective reads
+  `[individual_parameters]` at every record and the hazard pass keeps the `TIME = 0`
+  value, so the two halves could integrate different concentration curves. Measured on
+  `CL = TVCL · (1 + 0.05 · TIME)` with a drug-driven hazard: `central(20)` read as 13.53
+  against the predictions' 3.07, `H(20)` 10.1 % high, and the hazard term bit-identical
+  whether the `TIME` coefficient was `0` or `0.05`. `fit()`, `predict()`,
+  `predict_survival()` and `simulate()` now return an error naming the parameter and
+  whether the `[odes]` RHS or an `init(...)` seed reads it — the `TIME` axis of the freeze
+  #741 refuses on the covariate axis. The refusal is cut from a dependency slice of each
+  `d/dt(__chz_<cmt>)` row, so three shapes keep fitting: a `TIME`-reading **dose-record**
+  quantity (`MTT`, `ALAG1`, `F`, `D{n}`/`R{n}`, …), read at its own dose record (#1575); a
+  `TIME` read that stays inside the `[odes]` RHS, which the integrator clock resolves at
+  every step; and a `TIME`-dependent parameter the hazard does not depend on — `hazard =
+  H0` with a time-dependent `CL`. On a competing-risks model the error names the endpoint
+  whose own hazard is affected.
+- **A drug-driven CTMM no longer freezes a time-varying covariate on its PK disposition**
+  (#1854): the `[markov_model]` likelihood solves the `[odes]` system once, at the
+  subject's baseline covariates, so a covariate that changed within a subject and reached
+  `CL`, `V` or an `init(...)` seed feeding the states a transition intensity reads was
+  silently read at its baseline value. `fit()`, `ferx check`, `run_covariance()`,
+  `run_sir()` and the other entry points now refuse it with `E_ENDPOINT_TV_COVARIATE` on
+  `[markov_model]`, naming the covariate and the parameter. Covariates on dose quantities
+  (`KA`, `F`, …) and on parameters the generator's states never see are still accepted.
+- **`W_DERIVED_CMT_TV_ODE` and `W_DERIVED_CMT_TV_ANALYTICAL` now also fire for a model
+  whose individual parameters read `TIME`** (e.g. `CL = TVCL * (1 + k * TIME)`) with no
+  time-varying covariate (#1855). Such a model's `[derived] compartments[i]` and sdtab
+  compartment columns were approximate on an ODE model (the disposition held at the
+  first observation; measured up to 290% off IPRED on a multi-dose fixture) and NaN on an
+  analytical one, with no warning. The message now names which cause the fit has —
+  time-varying covariates, `TIME`-reading parameters, or both.
+- **`gradient_method_inner` reports `finite differences` on a time-to-event model**
+  (#1861). Every subject with a TTE record runs the finite-difference inner (EBE)
+  gradient, but on a joint PK-TTE model the label read `analytic (Dual2)`. The
+  "*N* of *M* subjects use finite-difference inner gradients" warning now fires for
+  such a fit, even when every subject has a TTE record, and names the cause for each
+  subject it counts. A subject with a time-to-event record is reported
+  as such, no longer as an unsupported "shape" such as an SDE or a per-CMT `obs_scale`.
+- **A post-hoc step on a pre-#1835 `.fitrx` of an FD fit now says it goes analytic**
+  (#1862): such a bundle records no `gradient_method` and loads `auto`, so
+  `run_covariance` / `run_sir` under default options re-solve the EBEs on the
+  analytic gradient (and build the analytic R-matrix). When the fit's
+  `gradient_method_inner` label reads finite differences, its outer label is not
+  analytic, and the step's own route is analytic, the result now carries a warning
+  naming `gradient_method = fd` as the way to score the fit as it ran. The route is
+  not inferred from the label, which is model-level and also reads finite
+  differences on an `auto` fit outside the analytic scope.
+- **IOV: an `EVID=2` or `EVID=0, MDV=1` row runs under its own occasion** (#1876). Such a
+  row governs the interval that ends at it, and every IOV engine evaluated it with κ = 0, so
+  that interval integrated with the between-subject η only. It now runs under its `OCC` (or,
+  on a subject built in memory without the label, the occasion of the record before it), as
+  NONMEM does. This reaches every IOV subject with such a row, which since #1809 includes
+  rows the reader used to drop. Objectives and estimates change on such datasets, and match
+  NONMEM 7.6.0 on FOCE and FOCEI to within 1e-7 on `warfarin_iov` with these rows added; at
+  the initial estimates, one row per occasion had raised the OFV by 3.6. A `ferx-tools` search
+  journal written before this change for IOV data with such a row refuses to resume, reporting
+  that the dataset changed.
+- **IOV: an occasion that only `EVID=2` or `EVID=0, MDV=1` rows carry gets its own κ**
+  (#1876). A subject's occasions got a κ each only when a dose or a scored observation
+  carried them, so a row labelled with any other occasion ran with κ = 0, and the interval it
+  governs integrated with the between-subject η only. That occasion now gets a κ of its own,
+  as NONMEM gives it an `ETA`, and the subject's κ count grows by one for each such occasion.
+  Objectives and estimates change on such datasets, and match NONMEM 7.5.1 on FOCE and FOCEI
+  to within 1e-7 on `warfarin_iov` with such a row added; a row after the subject's last
+  observation leaves the objective unchanged. `simulate()` draws one κ per occasion from the
+  shared random stream, so on such data a seeded simulation changes from that subject on: it
+  makes one extra draw per such occasion, and the interval that row governs now carries IOV,
+  as NONMEM's `$SIM` draws that `ETA` too.
+- **A level block's absorption check sees an ODE model's carry-over** (#1877):
+  where the binder measures whether a level block absorbs a kappa, it now
+  compares the kappa's effect over the whole subject, against every level of the
+  subject, rather than over the kappa's own occasion. On an ODE model a kappa,
+  and a level, also move the next occasion's records through the drug they leave
+  behind — a dose-only occasion's kappa, through its dose, included — and
+  ignoring that refused some identified models. Closed-form models are
+  unaffected.
+- **A level block now refuses a combination of random effects it absorbs**
+  (#1878): the span certificate measured each random effect alone, so
+  `E0 = TVE0 + PLACEBO + ETA_E0 + (ETA_E0 - ETA_X)² · OCC`, where shifting both
+  random effects together moves `y` only by a constant the level takes up,
+  bound. The measurement is now joint over the random effects at each unit — a
+  subject's ηs, an occasion's kappas — and the refusal names the partners
+  (`` `ETA_E0`, moved together with `ETA_X`, ``).
+- A level block that scales the residual error the same way as an `iiv_on_ruv`
+  random effect is now refused when binding, with a message that names the random
+  effect. Before, the check looked only at the predictions, which that random
+  effect never moves, so the model bound and the fit drove its ω to zero. A block
+  on the prediction, or on only the additive part of a combined error, still
+  binds (#1879).
+- The refusal for a one-column level block that absorbs two random effects no
+  longer advises `contrast = sum_to_zero_within` or dropping one of them, which
+  do not help there: each level lies within one subject (one occasion, for
+  kappas), so the block absorbs each random effect on its own. It now says to
+  remove the block or drop all of them (#1880).
+- A log-normal (or untyped) OMEGA / KAPPA row whose CV% is 1e6 or more now prints
+  it to three significant figures in scientific notation (`CV% = 7.64e35`) on the
+  console, in `format_summary()` and in `format_kappa_rows_from()`, instead of
+  every integer digit of the double (36 digits for a variance near 156). The fit
+  YAML's `cv_pct` is unchanged (#1883).
+- **The THETA BLOCKS report no longer counts `FIX` coefficients as free** (#1891):
+  a level block fixed with `FIX` used to print `PLACEBO  21 free coefficients`
+  on the console and in `format_summary`, and `n_free_coefficients: 21` in the
+  fit YAML. It now prints `PLACEBO  0 free, 21 FIX coefficients`, and a partly
+  fixed block splits the same way. The YAML gains `n_fixed_coefficients`, and
+  each fixed coefficient is listed with `fixed: true` and no SE. A block with no
+  fixed coefficient prints exactly as before. The min, median and max still
+  cover every coefficient.
+- **An individual parameter assigned on every arm of an `if`/`else` can now be read
+  by an ODE `[event_model] hazard =`** (#1897). Such a model was refused with
+  "[odes]: RHS references undefined name(s)", because only `[odes]`,
+  `[structural_model]`, `[scaling]` and `[derived]` counted as readers that make the
+  name an individual parameter (#357). Named endpoints (`[event_model DEATH]`) are
+  covered too. The prediction matches the same value written as a top-level
+  `X = if (…) a else b`.
+- **On an analytical (`pk ...`) model, `[initial_conditions]` and a Form B
+  `obs_scale` now read an individual parameter that no `pk(...)` role binds**
+  (#1898). Such a parameter (`S = 1000`, then `init(central) = S`; or
+  `SCF = WT / 70`, then `obs_scale = SCF`; a modeled-dose `D1` / `R1` included)
+  had no PK slot of its own and silently read `CL`'s value instead: the init
+  deposited `CL`, the scale divided by `CL`. It now takes a free differentiable
+  slot, as a Form C `y = …` readout parameter already did, so predictions and
+  analytic gradients use its own value. Validated against NONMEM 7.6.0
+  (`nonmem_anchor/unbound_reader_{init,scale}.ctl`). A model whose `y`,
+  `obs_scale` and `[initial_conditions]` together reference more such parameters
+  than the model has free slots is now a parse error naming them; inline the
+  expressions instead. Because those named parameters take precedence over the
+  hidden parameters a `y` readout makes for a direct θ/η reference (#486), a
+  model with both can now leave its readout on finite differences; the existing
+  parse warning says so.
+- **A `[individual_parameters]` name that no `pk(...)` role binds no longer corrupts the
+  analytic FOCE/FOCEI gradient or the NCA starting values** (#1899): on an analytical
+  model such a name has no PK slot of its own and carried the placeholder slot `0` —
+  which is `CL`'s. Two lookups read that placeholder as a real slot. The closed-form
+  log-normal sensitivity fallback keyed its `∂p/∂(θ,η)` rows by slot, so an
+  η-carrying intermediate declared after `CL` took `CL`'s row and `∂f/∂η_CL` came
+  back identically `0` — a wrong gradient, with the subject still reported as
+  analytic-supported, no finite-difference fallback and no warning. And
+  `inits_from_nca` resolved a PK role to the first name whose entry matched, so an
+  intermediate declared above `CL` (`CLWT = exp(CLWT_EXP * log(WT/70))`) captured the
+  clearance slot and NCA wrote its pooled CL/F estimate onto the allometric exponent
+  while `ETA_CL`'s variance stayed at the model default. Both now resolve through the
+  individual-parameter program's own slot map, which has no placeholder entries to
+  return, so the answer no longer depends on declaration order. Completes the #1356 /
+  #1379 series alongside #1898.
+- **A branch-only helper named like a block keyword is no longer refused**
+  (#1902): the #1857 check counted the key on the left of `=` in another block
+  as a read, so a helper named `RATE` or `SHAPE` was refused as "named in
+  `[event_model]`" although nothing outside its branch read it. On a
+  `target = expr` line, the target (`rate`, `d/dt(central)`, `init(central)`,
+  `transition A -> B`) no longer counts as a read, and neither do the word
+  values of the endpoint blocks (`family = weibull`, `type`, `clock`, `link`,
+  the `states` labels). Any other line, such as a `pk …(…)` call or `DV ~ …`,
+  still counts whole.
+- **An individual parameter assigned on every arm of an `if`/`else` can now be read
+  by an analytical `[initial_conditions]`** (#1904). It was not made an individual
+  parameter, so `init(central) = S` read `S` as a data column: "S not found in
+  data", or a same-named column's value. It now predicts exactly as the same value
+  written top-level, `S = if (…) a else b`. Completes #1900
+  (#1897), which left `[initial_conditions]` out until #1898 was fixed.
+- **A branch-only helper named like a word value in `[adaptive_dosing]` or
+  `[covariate_nn]` is no longer refused** (#1905): after #1902 the #1857 check
+  still counted the fixed words of those blocks as reads, so a helper named
+  `EVERY`, `FROM` or `TO` (`at = every 12 from 0 to 96`), `INFUSE` or `OVER`
+  (`route`), `TRUE`/`FALSE` (`with_assay_error`), or `TANH` (`activation`,
+  `output`) was refused as "named in" that block although nothing outside its
+  branch read it. Only those fixed words are skipped; any other name on the
+  line, and every name in `observe` or `inputs`, still counts.
+- **A closed-form IOV model with more than 24 `(θ, η, κ)` keeps the exact analytic
+  gradient** (#1907): the `[individual_parameters]` program is now differentiated a few
+  θ at a time beside the `[η, κ]` block, so fixed θ no longer push a model past the
+  dual-number width. Such a model previously reported `analytic (Dual2)` while every
+  subject ran finite differences on both loops — about 30× slower on a 25-axis
+  warfarin IOV model, reaching the same objective. An all-subject inner fallback under an
+  analytic label is now also reported as a warning, as it already was without IOV.
+- **A dose implied by `ADDL` now takes its covariates, `F`, modelled duration `D{n}`,
+  `TIME` and occasion from the record that ends its interval, and its compartment lag
+  from the row that carried `ADDL`, as in NONMEM** (#1909). NONMEM does not evaluate `$PK` at an
+  `ADDL`-implied dose: the interval across it uses the next record at or after the dose,
+  in (`TIME`, file order), while the dose's `ALAG` is the one set on the parent row, read
+  at that row's `TIME`. ferx gave every implied dose the parent row's values. On a subject
+  whose time-varying covariates changed after that row, the parent row's covariates,
+  bioavailability and infusion duration governed every dose of the train, and a
+  `TIME`-dependent `F` or `D{n}` read the parent's time. In the NONMEM anchors, `PRED`
+  after the covariate change was up to 30 % off (`addl_tie`), and 11.8 off where `F`
+  depends on the covariate (`addl_f`). Constant-covariate subjects, and trains
+  whose covariates do not change, are unaffected.
+- **Kappa shrinkage counts only the occasions an observation informs** (#1911):
+  `shrinkage_kappa` and `shrinkage_kappa_by_occ` (console, `ferx summary`, `.fitrx`,
+  `FitResult`) used to average over every occasion group, including a dose-only or
+  `EVID=2` / `MDV=1`-only occasion no observation can see. Its κ̂ is 0 by construction,
+  so it pushed the shrinkage up while leaving the objective unchanged (on
+  `warfarin_iov` plus one trailing `EVID=2` row per subject under a new OCC: 41.2 %
+  instead of 28.0 %). Such a group is now left out; on a model with compartments, a
+  group with no observation of its own still counts when an observation follows its
+  first record (dose carryover). On a compartment-free (MBMA) model only a group's own
+  observations count. A slot no two subjects inform reads `NaN`. Fits where every
+  occasion has observations report bit-identical values.
+- **A `TIME`-dependent disposition on a drug-driven (time-inhomogeneous) CTMM generator is
+  now refused instead of silently frozen** (#1918): the `[markov_model]` scorer solves the
+  `[odes]` system under one `$PK` snapshot taken at `TIME = 0`, so a `CL = TVCL · (1 + KT ·
+  TIME)` reaching a state the transition intensities read left the CTMM term bit-identical
+  whatever `KT` was, while the Gaussian predictions read `$PK` at every record. `fit()`,
+  `ferx check`, `run_covariance()` and `run_sir()` now report `E_ENDPOINT_TIME_DEPENDENT_PK` on block `markov_model`, naming the
+  parameter and whether the `[odes]` RHS or an `init(...)` seed reads it — the CTMM arm of
+  #1853. A `TIME`-dependent parameter the intensities' states do not depend on, a
+  `TIME`-reading dose-record quantity, and a time-homogeneous CTMM keep fitting.
+- **An analytic hazard whose parameters read `TIME` is now refused at parse** (#1919). A
+  `scale` / `shape` / `alpha` / `gamma` / `loghr` in `[event_model]` that reads the `TIME`
+  built-in — directly, or through an `[individual_parameters]` value it references — was
+  evaluated with no time argument and silently read `TIME = 0`, dropping the time term from
+  the fit. The parser now rejects it, naming the parameter whose value depends on `TIME`. Write a
+  time-varying hazard as an ODE-accumulated `hazard = ...` expression instead.
+- **NCA start values no longer write the volume onto `TVCL`** (#1922): `inits_from_nca`
+  routed a PK parameter with no mu-referenced η to the first θ whose name merely
+  *contained* the parameter's name — `V = TVV` resolved to `TVCL`, which then held the
+  volume estimate (often clamped at its bound) while `TVV` stayed at its default. The
+  name fallback now matches whole words only and declines with a warning when two θ
+  tie; the η-name fallback no longer borrows an η that belongs to a parameter the role
+  does not (or cannot be shown to) read; and two roles that still resolve to one θ —
+  any role the model reads, `F` and the transit / inverse-Gaussian absorption
+  parameters included — are both left at the model default with a warning, through
+  the `nca_sweep` / `nca_ebe` sweeps as well.
+- **An `else if` arm under an earlier θ/η-dependent condition no longer folds to a
+  constant on the analytic-gradient path** (#1927): in `[individual_parameters]`,
+  a variable assigned only in an `else if` whose own condition and body read just
+  covariates (e.g. `if (ETA_SW > 0) { … } else if (WT > 70) { FAC = WT / 70 }`) was
+  treated as covariate-only and precomputed with the branches decided at η = 0. The
+  analytic gradient then used the wrong branch's value whenever the earlier η/θ
+  condition was true, disagreeing with the objective. Such a variable is now
+  evaluated per (θ, η) like any other dependent one.
+- **NPDE/NPD now reports reference replicates lost to the flip-flop clamp** (#1928):
+  on a transit or inverse-Gaussian closed form with no ODE twin, a reference
+  replicate whose sampled η crossed into the flip-flop regime had its dose-driven
+  concentration clamped to zero and entered the NPDE/NPD reference distribution
+  as an undosed profile, silently. `compute_npde_npd_diag` and the post-fit
+  NPDE step (on `FitResult::warnings`) now return a `W_SIMULATED_FLIP_FLOP`
+  count of those replicates.
+- **`inits_from_nca` routes each NCA estimate reproducibly, and only to a role that
+  has one** (#1930): a PK parameter's θ is now found through the mu-reference
+  detected on that parameter's own line, so an unrelated `S = THS * exp(IIV_CL)`
+  can no longer capture `CL`'s θ in hash order — the same model on the same data
+  could start from different values on different runs. When two η names still
+  qualify for one parameter and point at different θ, nothing is written for that
+  role and a warning names both. A role bound to a literal (`cl=1.0`) or to `TIME`
+  is no longer matched to a θ by name (a readout coefficient `THCL_A` received the
+  pooled clearance); and `V = TVV * exp(ETA_VOL)` now resolves `V` to `TVV`
+  instead of falling through to the `TVCL` name collision (#1922).
+- **An evaluation-only fit (`maxiter = 0`) of a mixture model with IOV now uses the
+  estimated κ̂** (#1932). Before, it reported the subject's κ̂ as empty, so IPRED, IWRES,
+  CWRES, the per-subject OFV and the `.fitrx` `ebe_kappas` were all computed at κ = 0,
+  and κ shrinkage came back `NaN`. The population OFV was already right. These outputs
+  now match a full fit stopped at the same point, as they have for the converged path
+  since #985. CWRES on any IOV model still linearizes over η only and so differs from
+  NONMEM's (#1948).
+- **The stagnation guard no longer stops a fit that is still descending** (#1934): on a
+  closed-form FOCE/FOCEI model the guard now computes the BHHH Newton decrement (the OFV
+  a Newton step is predicted to gain) at the best point before it stops, and keeps the
+  optimizer running while that exceeds 0.1. A slow creep gains less than 1e-3 per
+  window and used to be stopped and reported `converged`: SLSQP on `two_cpt_iv` started
+  from Q = 0.01 reported OFV −204.41 as converged, against an optimum of −432.17 that
+  it now reaches (NONMEM: −432.17). If a re-armed window ends with the best point
+  unchanged, the guard stops anyway and warns with the unrealised predicted gain. No
+  bundled example's fit changes.
+- **A model can read its `iov_column` or a record column without a `[covariates]`
+  block** (#1936): `if (OCC == 2) …` in `[individual_parameters]` — NONMEM's `$PK`
+  spelling — failed with `E_MISSING_COVARIATE` "not found in data" unless some
+  `[covariates]` block happened to exist. Every column the model references is now
+  read on both paths, so the fit equals the declared one bit-for-bit. A population
+  read without the model (`read_nonmem_csv`) that skipped such a column now gets a
+  message saying the column is in the data and how to read it, instead of "not
+  found in data".
+- `load_fit` now re-reads the bundled `data.csv` of a fit made in memory (`prepare_run` + `fit`,
+  which records no reader settings) with the model file's own reader settings — `[data]` renames,
+  `[covariates]`, `iov_column` and `[data_selection]` — and checks it against the fit's population
+  fingerprint. An IOV fit used to reload with no occasions and its occasion column read as a
+  covariate, so `run_covariance` refused it with "extra `OCC`"; a population the model file cannot
+  reproduce now loads as none, with a note, instead of a wrong one (#1941).
+- **A derived `iov_occasion = dose | time(...)` rule now labels `EVID=3`/`EVID=4` reset
+  rows** (#1944). Before, the rule relabelled observations and doses but not resets, so an
+  `[odes]` `init(...)` re-seed ran under the wrong occasion's κ. With no `iov_column` it used
+  the previous occasion's κ. With one, it used κ = 0, on finite-difference gradients. Both
+  happened without a warning. A reset now takes its occasion from the rule, on the same clock
+  as the rows around it: under `dose`, the occasion of the last dose at or before the reset.
+  The result matches NONMEM.
+- **A model's covariate references bind dataset headers by exact case on every
+  read path** (#1946): with an explicit `covariate_columns` list or a
+  `[covariates]` block, a model reading `wt` no longer silently binds a `WT`
+  header the caller left out — it stays unread and `check_covariates` reports it,
+  as the auto-detect read already did. Names you list yourself, and columns a
+  `[data_selection]` filter references, still match case-insensitively.
+- **`CWRES` under inter-occasion variability now matches NONMEM** (#1948): with `kappa`
+  declared, the sdtab `CWRES` is linearized over the occasion κ as well as η, the same
+  system the IOV objective integrates. It used η alone, which left the κ part of the
+  prediction in the residual and dropped the IOV variance from its covariance. Against
+  NONMEM 7.5.1 the worst `CWRES` gap goes from 0.43 to 1e-7 (FOCEI) and from 0.25 to 4e-8
+  (FOCE). `OFV`, `IPRED`, `PRED` and the EBEs are unchanged.
+- **Simulation now draws IOV κ for a model whose occasions come from
+  `iov_occasion = dose | time(...)`** (#1955). `fit()` derives those occasion labels,
+  but no simulate entry point did, so a population read without an `iov_column`
+  reached the κ draw with no labels and was simulated at κ = 0: no inter-occasion
+  variability, at any Ω_IOV. `SimulateOptions` gains an `iov_occasion` field (default
+  `None`, today's behaviour) that applies the rule before the draw and before the
+  propensity posthoc pass; `simulate_with_uncertainty` applies the fit's own
+  `FitResult::iov_occasion`; and `ferx --simulate` applies the model file's
+  `[fit_options] iov_occasion`, and its sdtab now writes the derived `OCC`. A subject
+  left without an occasion label is still simulated at κ = 0, as NONMEM `$SIM` reads
+  `OCC = 0`, but `simulate_with_options_diag` and `simulate_with_uncertainty_diag` now
+  say so with a `W_IOV_NO_OCCASIONS` warning. Code that builds `SimulateOptions` with
+  every field written out, rather than `..Default::default()`, must add
+  `iov_occasion: None`.
+- **`covariance_method = s` and `rsr` now work on mixture fits** (#1956). The
+  per-subject score was taken from the single-population objective under class 1,
+  so the class-2 θ and mixing-fraction columns of `S` were exactly zero: `s` was
+  refused as singular and `rsr` reported wrong standard errors for every
+  parameter. The score is now that of the mixture marginal, the posterior-weighted
+  sum of each class's score under its own typical values, Ω/Σ overrides and EBEs.
+  As for single-population fits, the EBEs are held at the estimates, whereas
+  NONMEM's `MATRIX=S` re-estimates them. Expect `s`/`rsr` standard errors to differ
+  from NONMEM's (by up to 14 % / 36 % on the 30-subject `mixture_iv` anchor). The
+  held-EBE score is biased at the estimates, so more subjects do not shrink the
+  difference; it is tracked in #1817.
+  The analytic mixture gradient now also covers a `block_sigma` residual
+  correlation, where it was previously one entry short.
+- **A record's `TIME` as data is the `TIME` as written** (#1959, #1796). To keep
+  NONMEM's file order, the reader moves an observation one ULP below a co-timed
+  `MDV=1` / `EVID=2` row or dose listed after it. Three things read that moved time
+  as if it were data:
+  - A `TIME`-keyed level block (`theta PLACEBO[STUDY, TIME]`) grew a spurious cell such
+    as `TIME=1.9999999999999998` next to `TIME=2`, and the fit changed (on
+    `mbma_placebo` with such rows: 30 parameters instead of 24, objective 93.96
+    instead of 97.07).
+  - A `block_sigma` residual pair without an `L2` column lost its correlation when
+    only one of its rows was moved.
+  - The `E_RUV_MAGNITUDE_NONPOSITIVE`, `E_THETA_GATHER_INDEX_RANGE`,
+    `E_THETA_GATHER_INDEX_MISSING` and `E_KAPPA_WEIGHT_NONPOSITIVE` messages named
+    the moved time.
+
+  A stacked-reset subject's later periods now share the earlier periods' `TIME`
+  cells, as NONMEM's `$PRED` sees them, and `E_THETA_LEVELS_DATA_MISMATCH` names
+  one time, not two.
+- A model with two level blocks is no longer refused because the second block
+  was counted with all its levels. `theta B2[OCC]` (sum-to-zero by default) next
+  to `theta PLACEBO[STUDY]` in a model with no intercept used to refuse PLACEBO
+  "under any contrast", while the same B2 written out as θ bound. A block now
+  counts as the contrast it resolves to, so both spellings bind (#1963).
+- **`[individual_parameters]` reading `TIME` now sees the `TIME` as written** (#1969) on an
+  observation or `EVID=2`/`MDV=1` row that the reader orders before a co-timed dose. A step
+  such as `if (TIME >= 24)` at a trough listed before its dose took the earlier branch (1007
+  OFV off NONMEM on a 30-subject induction fixture; now within 2e-8 on Linux). The sdtab
+  individual-parameter columns and kappa `weight` expressions read the same time.
+- **`fd_hessian_step` guidance corrected** (#1975): a smaller step reduces the
+  finite-difference covariance stencil's truncation bias, not its noise. On a smooth,
+  tightly reconverged objective, try `1e-3` instead of the default `1e-2`: at the
+  default, the stencil ran SE(ρ̂) up to 0.30% low on the residual-correlation anchors.
+  Those models now take the exact analytic R-matrix by default, which matches NONMEM's
+  `$COV MATRIX=R` to 4e-6.
+- **`simulate()` refuses every residual correlation `fit()` refuses** (#1976): a
+  `correlation` ρ at or past either edge of its valid range (`car1` ρ ≥ 1, `ar1`
+  |ρ| ≥ 1, `cs` ρ ≤ −1/(n−1) for the largest block, any kind at |ρ| ≥ 1) is now
+  an `E_RESIDUAL_CORRELATION_RANGE` error instead of rows silently drawn from a
+  clamped, different covariance; and `ar1` / `car1` blocks with tied TIMEs or
+  spanning an EVID=3/4 TIME reset are refused with `E_RESIDUAL_CORRELATION_TIES` /
+  `E_RESIDUAL_CORRELATION_RESET`, as `fit()` and `ferx check` already did.
+- A one-column level block next to a random effect it absorbs is no longer bound
+  under a contrast whose coded levels are a combination of the model's other θ.
+  `TVB * D2` (a θ on one study's records) used to bind such a block under `ref`,
+  and a hand-coded region effect `TVB1 * (R1 - R2)` under `sum_to_zero`: both are
+  aliased models, and both are now refused with "not identified under any
+  contrast" (#1977).
+- **Post-hoc NPDE/NPD of a model whose IOV occasions come from `iov_occasion = dose |
+  time(...)` now draws κ** (#1980). `stats::npde::compute_npde_npd` read occasion labels
+  only from the population, and a population read without an `iov_column` has none, so
+  its reference distribution was simulated at κ = 0 (the #734 under-dispersion) with no
+  warning. It now takes an `iov_occasion: Option<&IovOccasionRule>` argument, derived as
+  `fit()` derives it: pass `FitResult::iov_occasion`. The new `compute_npde_npd_diag`
+  also returns `W_IOV_NO_OCCASIONS` when a `kappa` model's subject is still unlabelled.
+  `fit()`'s own `npde_nsim` step was not affected. Callers of `compute_npde_npd` add a
+  trailing `None` to keep the old behaviour.
+- **A θ level block with some levels `FIX` is no longer falsely refused under
+  `sum_to_zero`** (#1992). When the binder checked whether a random effect is
+  identified, it coded a fixed level as minus its group's last level, a column
+  for a θ that does not exist. The extra column could only widen the span, so a
+  partly fixed block (through `ModelParameters::theta_fixed`, or a θ ferx froze)
+  could be refused when the model is identified. That held for the block itself
+  and for any other block counted alongside it. A fixed level now contributes no
+  column. Models that bound before bind the same way.
+- **The stagnation guard no longer stops an ODE fit that is still descending without
+  saying so** (#2001): the #1934 check — keep going while a Newton step from the best
+  point is predicted to gain more than 0.1 OFV — now runs on ODE models too. A model that
+  `auto` solves exactly by matrix exponential gets it as a closed-form model does; an
+  integrated one (and a closed-form model with an integrated absorption twin) has the
+  prediction formed at a tight solver tolerance, so the integrator's own error is not
+  mistaken for remaining gain. On the ODE twin of `two_cpt_iv` started from Q = 0.01,
+  SLSQP used to report OFV −204.41 as converged and now reaches −432.17 (NONMEM:
+  −432.17); an L-BFGS run under `rk45` that its own optimizer abandons at the same point
+  now carries the guard's "predicted to lower the objective" warning instead of a silent
+  `converged`. No bundled example's fit changes.
+- **`--simulate` on an IOV model without an occasion rule gives advice that can
+  work** (#2005): a model with `kappa` and no `iov_occasion` rule is now refused
+  before anything is simulated, and the message names `iov_occasion = time(...)`,
+  with a breakpoint inside the `[simulation]` `times`, as the fix. It used to give
+  the dataset advice, asking the user to set `iov_column`, even in a model that
+  already set it, although a `[simulation]` design has no dataset column to read.
+  The message also says why `iov_occasion = dose` cannot help there: each
+  simulated subject receives a single dose. The data path's message is unchanged.
+- **ODE models predict both of two observations at one `TIME`** (#2010): when an EVID=2 row or a
+  lagged dose sat at that `TIME` after the first observation, the second got no prediction and the
+  OFV came back `NaN`, for any tie at `TIME ≤ 8`. The extended Kalman filter left the same record at
+  a zero prediction instead. Analytic models, and subjects with time-varying covariates, were not
+  affected. EKF fits with an observation each side of a co-timed dose now take one update for the
+  pair, so their objective moves.
+- **`inner_restarts` now acts on an estimating fit's first evaluation, not only on its
+  final re-solve** (#2014). The outer loop starts the inner solve from η = 0, and the
+  multi-start treated that start as warm, so it was skipped. A subject the multi-start
+  would move to a deeper EBE mode stayed in the shallower one while the estimates were
+  optimized. The final cold re-solve then found the deeper mode, and the #1565 restart
+  re-entered the shallower one, so the fit reported `converged: false` with an
+  `ebe_start_dependent` warning. On a flip-flop oral fixture the fit now converges at
+  `TVCL` 1.066269 instead of 1.065939, the optimum of the trapped objective. The extra
+  scans cost wall time on some models: `examples/schnider.ferx` goes from 0.88 s to
+  1.68 s (macOS arm64), while `examples/warfarin.ferx` is unchanged. The probes of a
+  `global_search` pre-search do not scan, so its cost is unchanged. Set
+  `inner_restarts = 0` to turn the scan off.
+- **FREM models: every fixed-EBE per-subject gradient now uses the covariate σ on
+  covariate rows** (#2023). The closed-form per-subject gradient read the variance
+  of each covariate pseudo-observation off the PK error model. The covariate σ got
+  no score and the PK σ got a spurious one. Every consumer of that gradient used
+  it. Under `method = gn` / `gn_hybrid` it and its BHHH Hessian disagreed with the
+  objective the line search evaluates. Under `optimizer = trust_region` it fed the
+  per-subject gradients and Hessian. Under `covariance_method = s` or `rsr` it fed
+  the score matrix of a FOCE or FOCEI fit. It was also the outer FOCE/FOCEI
+  gradient of a subject the adjoint declines, and the per-class score of a
+  `[mixture]` model. FREM subjects now take the finite-difference gradient of the
+  objective.
+- `run_covariance` now repeats the inline covariance step when the fit reported EBEs that
+  are not a cold solve — the `W_EBE_START_DEPENDENT` case where re-solving cold scored worse
+  than the optimizer's own EBEs. It used to re-solve the EBEs cold and return a different
+  covariance and different standard errors from the fit with `covariance = true`. It now
+  starts from the reported EBEs, and for `covariance_method = s` / `rsr` it also rebuilds
+  their `∂f/∂η`. A fit reloaded from `.fitrx` stores EBEs to six decimals, so for this kind
+  of fit a reload is still not bit-identical to the inline step (#2026).
+- **A blank level cell in a population read with the model-blind `read_nonmem_csv*`
+  readers is now refused with `E_LEVEL_MISSING_LABEL`** (#2036). Those readers do not know
+  a nested model's level columns and fill a blank cell from the record before it, so the
+  record silently joined the previous record's group. Every CSV reader now notes such a
+  filled cell in the new `Subject::filled_cells`, and `fit()`, `ferx check --data` and the
+  `simulate*` entry points refuse a level column listed there. A dataset with a label on
+  every record is unaffected. The filled cells enter the population fingerprint
+  (scheme 6), so `run_covariance` / `run_sir` and a resumed model search refuse a
+  population with a blank level cell that a fit of the written-out file would otherwise
+  vouch for; a fingerprint from an earlier scheme is not compared, with a warning.
+- **`W_NONFINITE_OBJECTIVE` names the subjects behind it, and no longer calls
+  every finite objective past the cutoff the divergence sentinel** (#2038): when a
+  subject's own objective contribution is unusable, the warning ends by naming
+  it, with the contribution and the `TIME` of its first observation whose `IPRED`
+  or `PRED` is not finite. The warning's `details` gain an `unusable_subjects`
+  array listing each one. An objective past the `1e14` cutoff but below the
+  `1e20` clamp is now reported as "too large to be a fit" rather than "at the
+  divergence sentinel", since usually no subject was clamped.
+- A subject whose `CL` or `V` is `NaN` from some record on, on the 1-, 2- and 3-compartment
+  event-driven closed form a time-varying covariate selects, is now served `NaN` predictions
+  there, as on the superposition and ODE engines, and the fit reports `W_NONFINITE_OBJECTIVE`.
+  It used to be served predictions of 0 and scored against them, so with an additive error the
+  fit returned a finite objective and no warning (#2039). The transit and inverse-Gaussian
+  absorption walk is not covered by this fix (#2134).
+- **The docs now state which model operations are guarded, and how** (#2040): `/` and `mod`
+  by a divisor below `1e-30` return `0`, `log` and `sqrt` floor their argument (a `NaN`
+  included), and `logit` clamps its argument, all silently; `exp` and `^` are not guarded.
+  The individual-parameters page compares this with NONMEM's opt-in `$ABBR PROTECT` and
+  documents `a mod b`, which never returns a negative value, unlike Fortran's `MOD`. Two
+  passages that contradicted the guards are corrected: an unguarded power of a missing
+  covariate is `NaN`, not `0`, and a `log` or `sqrt` cannot go `NaN`.
+- **The data reader's missing-covariate warning now carries a code, `W_COVARIATE_MISSING`, and
+  reads cleanly** (#2041). It had two runs of 14 spaces in mid-sentence and no `W_` token, so
+  `ferx check` relayed it as `W_DATA` and a caller could not route it; it is now classified
+  `data_quality` whatever the covariate is called. The text no longer promises the subjects
+  evaluate to `NaN`: through `log`, `sqrt`, `min`, `max` or a comparison a missing covariate
+  gives a finite value, and the message now says so.
+- **`--simulate` refuses a single-occasion `iov_occasion` rule before simulating**
+  (#2052): on a model with `kappa`, `iov_occasion = dose` (each `[simulation]`
+  subject receives one dose) or a `time(...)` rule with no breakpoint inside the
+  `[simulation]` `times` derives a single occasion, which the fit refuses as
+  unidentifiable. That refusal used to come after the whole population was
+  simulated, and advised `iov_column` and a multiple-dose design, neither of which a
+  `[simulation]` design can use. It now comes first, and names only
+  `iov_occasion = time(...)` with a breakpoint inside `times`. The data path's
+  message is unchanged.
+- **The pre-fit covariance cost note and `covariance_n_evals_estimated` follow the route
+  the step will take** (#2054): on the #1514 salvage route, where only a minority of
+  subjects is outside the analytic R-matrix, the note now says the `2n²` OFV evaluations
+  cover just those subjects ("… OFV evaluations expected over 1 of 40 subjects …"), and
+  the note is worded as an expectation. Fits whose R-matrix is expected to be fully
+  analytic already carry no note, no count and no large-problem reroute to
+  `covariance_method = s`.
+- **`covariance_method = rsr` above 100 free parameters now says what it costs**
+  (#2055): on the finite-difference route the sandwich builds the same `R` as
+  `covariance_method = r`, `2n²` re-converged objective evaluations, but only an
+  explicit `r` was warned and told to set `covariance_method = s` if the step does
+  not finish. `rsr` now gets the same warning, naming `rsr`; with parameter priors
+  declared it names `covariance = false` instead, since `s` cannot carry a prior.
+  `rsr` is still never rerouted, and no fitted number changes.
+- **A `.fitrx` bundle of a VI fit now loads, and keeps its VI result** (#2058). Under
+  the default `vi_final_ofv = none` a VI fit's `ofv`, `aic` and `bic` are `NaN`; they were
+  written as `null` and then refused on load (`invalid type: null, expected f64`). They
+  now read back as `NaN`, and `fit.json` gains a `vi` block carrying `FitResult::vi`
+  (ELBO and its halves, traces, diagnostics and per-subject posterior means and
+  covariances) in the layout of the YAML `vi:` section, so it is no longer lost on a
+  round trip. Bundles without the block load as before.
+- Steady-state non-convergence notes are now collected per `fit` / `simulate` / `predict` run, so
+  concurrent fits (model-search candidates, parallel callers) no longer report each other's notes
+  or lose their own (#2067).
+- **A default-feature build no longer warns about unused parser items** (#2075): four
+  helpers read only by the joint PK-TTE refusal are now compiled only with the
+  `survival` feature, so builds without it (including ferx-r's) are warning-free.
+- **A failed event-time solve no longer aborts a drug-driven TTE simulation** (#2087):
+  when the ODE-accumulated hazard of one simulated subject cannot be solved (for
+  example an `[odes]` state diverges, or the hazard goes negative, for that subject's
+  parameter draw), that subject is censored at the observation window (every cause,
+  under competing risks) and named in a new `W_TTE_SOLVE_FAILED` warning. The warning
+  gives the solver's reason, names a diverged `[odes]` state by its name, and points at
+  the `[odes]` block or the `[event_model]` hazard depending on which one failed.
+  The rest of the population still simulates, with the rows it would have had if that
+  subject had not failed. Previously the whole `simulate` call panicked; from R it was
+  an error.
+- **`gn`, `gn_hybrid` and `optimizer = trust_region` now report
+  `W_EBE_START_DEPENDENT`** (#2097). `trust_region` checks its final EBEs on the same
+  rules as the NLopt optimizers. A cold re-solve is compared against the optimizer's
+  own EBEs. When the cold solve misses them materially, the fit reports the best of the
+  cold solve, a re-solve seeded from the optimizer's EBEs, and those EBEs themselves,
+  and warns. A cold solve materially *better* reports the fit `converged: false`, and
+  the subjects the `inner_screen` Sobol screen moved are named. `gn`, and `gn_hybrid`
+  when it keeps the GN result, run the same check for diagnosis only: they raise the
+  same three warnings (including `converged: false`) but keep reporting their own
+  EBEs and OFV.
+- **`method = gn_hybrid` now reports the warnings of its FOCEI polish** (#2098):
+  when the polish improves on the Gauss–Newton phase and its estimates are the
+  ones reported, the warnings raised by the polish — `W_EBE_START_DEPENDENT` from
+  its final cold EBE re-solve, an unconverged or stopped outer optimizer — now
+  appear in the fit's `warnings` alongside the GN phase's. They were previously
+  dropped, so a `gn_hybrid` fit could report clean where `focei` at the same
+  estimates warned.
+- **A dense-BFGS inner solve no longer takes an unbounded steepest-descent step after a
+  non-descent BFGS direction** (#2099). The step after the reset is bounded too. The reset
+  starts the search over from a curvature-free metric. Without a preconditioner, which is
+  how the IOV inner solve runs, that metric gave a step as long as the gradient, `‖g‖`. So
+  did the next step, until a BFGS update had learned curvature. From a steep start, that
+  could leave the line search with no acceptable trial and send the subject to the
+  Nelder–Mead fallback. Every step from such a metric is now bounded the same way as the
+  solve's first step: scaled by `1/‖g‖` on the identity metric, and capped at the runaway
+  radius under a preconditioner.
+- **A cold multi-start seed that stops short is no longer reported converged** (#2100):
+  when an `inner_restarts` seed (or an `inner_screen` draw) replaces the EBE because it
+  reaches a lower objective, the subject now carries that seed's own convergence flag.
+  A seed that ran out of `inner_maxiter` iterations is still kept, but the EBE counts as
+  unconverged in `n_ebe_unconverged` and `max_unconverged_frac` instead of inheriting
+  the converged flag of the point it replaced.
+- **A non-positive or non-finite `CL` or `V` gets the same prediction on both closed-form
+  engines** (#2104), for the 1-/2-/3-compartment IV and oral models. A subject with a
+  time-varying covariate is served by the event-driven walk, which used to skip the
+  elimination step when `CL` or `V` was `≤ 0`, so the dose stayed in the body: a `CL ≤ 0` on an
+  IV model served `AMT / V` from the dose on, where a subject with constant covariates
+  (superposition) was served 0. Both engines, the analytic gradients and the exported
+  closed-form functions (`one_cpt_iv_bolus`, `one_cpt_predict`, …) now drop such a dose and
+  serve 0, `+inf` included (it used to give `NaN` on one engine and 0 on the other). A `NaN`
+  `CL` or `V` now gives `NaN` on both from the first dose's arrival on — including an
+  observation exactly at a bolus or the start of an infusion — and 0 before any dose. The
+  transit and inverse-Gaussian models are unchanged. A fit whose final estimates put a
+  non-positive or non-finite `CL` or `V` on any record, reset rows included, now warns
+  (`W_DEGENERATE_CL_V`, code `degenerate_clearance_or_volume`), since NONMEM would reject that
+  record rather than predict.
+- **`W_COV_RSR_ONE_SUBJECT_LEVELS` counts the records of discrete-state endpoints**
+  (#2111): a θ level block read only by a `[binary_model]` predictor or a DTMM
+  `[markov_model]` was counted as read by no subject, so an `rsr` covariance step never
+  warned about its single-subject levels. A DTMM chain's first record, which its
+  likelihood does not score, is not counted as a read.
+- **`min_obs_for_convergence_check` counts non-Gaussian records** (#2111): a subject's
+  count was its Gaussian observations only, so every binary-, time-to-event- or
+  Markov-only subject counted as having none. Its unconverged EBE never counted toward
+  `max_unconverged_frac`, and a profiled fit never named it in the finite-difference
+  fallback warning. The count is now the Gaussian observations plus the non-Gaussian
+  records, so such fits can report, and stop on, unconverged EBEs they used to hide.
+- **An `init(...)` that reads a time-varying covariate is seeded from the subject's first
+  record in file order** (#2121), as NONMEM seeds `A_0`. When an `EVID=2` row and an
+  observation share the subject's first `TIME` with different covariates, `predict()` and
+  `fit()` read the observation's instead of the row written first (on a 20-subject
+  NONMEM anchor the objective was 222.41 instead of 172.84). Adaptive simulation also ignored
+  dose rows when picking the seed, so a subject whose first record was a dose was seeded
+  from its first observation; the frozen-replay check could not see either, because it
+  shares the seed.
+- **A `kappa` model with a residual `correlation` line now fits with L-BFGS under
+  `optimizer = auto`** (#2122). Previously `auto` picked BOBYQA on this route. BOBYQA
+  stopped at a different objective for each starting value of the correlation, sometimes
+  above the optimum of the same model without the line, and reported converged. The
+  route now has the exact analytic gradient (#486), so `auto` takes L-BFGS by its general
+  rule. An explicit `optimizer = bobyqa` is still honoured.
+- **`simulate_adaptive` no longer refuses an observation listed before a co-timed
+  `EVID=2` row** (#2123): with time-varying covariates, such a subject failed with
+  "event time … lies within 1e-15 of another break time" whenever the time was at most 8.
+  It now runs and reads the observation before the row, as NONMEM does. The refusal
+  remains, reworded, only for a record that falls within 1e-15 after an infusion end or
+  an `EVID=3`/`EVID=4` reset without matching it exactly.
+- **A trough listed before a co-timed dose reads pre-dose on ODE models at the subject's
+  first and last record times** (#2124): an observation written before a dose at the same
+  time is read one ULP earlier, but when that time was the subject's first record time (at
+  any time) or its last observation, every ODE engine applied the dose first, so the trough
+  read post-dose. At other times this happened too, whenever the time was at most 8, on
+  `simulate_adaptive`'s time-varying path. This hit `predict()`, `fit()` (through its
+  gradient's walk too, so the objective scored the wrong value), the sdtab state columns,
+  `[derived]`, the survival hazard pass and `simulate_adaptive`. NONMEM reads the
+  observation before the dose, and now so does ferx.
+- **Adaptive simulation no longer refuses a run whose first decision comes before the
+  subject's first record** (#2125). When that decision issued no dose, the frozen-replay
+  verifier started integrating at the decision instead of at the first record, disagreed
+  with the (correct) reactive run, and failed the run with "prediction 0 diverges from the
+  frozen-schedule replay". This affected both constant and time-varying covariates, for
+  example a loading-dose controller consulted before the first sample. The reactive
+  predictions themselves were already right and are unchanged; they match NONMEM.
+- **`simulate_adaptive` honours `[scaling] obs_scale`** (#2129): on a Form A / Form B
+  model (`obs_scale = V`, `obs_scale[CMT=n] = …`) the adaptive trajectories, the
+  signal an observe-less monitor (a `MonitorSpec`, or `with_assay_error`) hands the
+  controller, its `Dv` assay σ, and the `auc_target` exposure metric used to come back
+  as the bare amount — `V`× too high for `obs_scale = V`, with no warning. They now
+  divide by the same scale `predict()` / `simulate()` apply, per decision window under
+  IOV, so a holding controller reproduces `simulate()` row for row.
+- **A `[STUDY, TIME]` level block no longer refuses a random effect that only one arm
+  reads** (#2131): with two arms of a study at one visit sharing a level, the binder
+  took the two records as replicates and called every random effect reaching `y`
+  absorbed, so an η on the drug effect (`DRUG = TRT * EMAX * exp(ETA_EM) * ...`) was
+  refused with "absorb `ETA_E0` and `ETA_EM` together". Records at one time now count
+  as replicates only when no dose or reset lies between them (a trough listed before a
+  co-timed dose is not a replicate of the sample after it, nor, on a model with a lag
+  time, a trough listed before a lagged arrival) and their occasion,
+  compartment and record covariates agree;
+  otherwise the binder measures, row by row, whether the levels reproduce the random
+  effect. An η read alike by both arms is still refused.
+- The covariance eigenvalue-floor warning no longer prints `|min eig|/max eig = 0.00e0`
+  next to a positive `min eig`. The ratio clause now appears only when the floored Hessian
+  is indefinite (`min eig < 0`), so every printed number is the quantity its label names;
+  severity, SEs and the floor are unchanged (#2132).
+- **ODE compartment states (sdtab state columns, `[derived]` `compartments[i]`) now seed
+  `init(state) = expr` from the subject's first record** (#2133): the state pass evaluated
+  `init()` at the first *observation's* `$PK` and re-seeded every `EVID=3`/`4` reset from
+  that same snapshot, so a subject whose first record is a dose or an `EVID=2` row, or whose
+  reset row carries a different covariate, got states off by the seed's covariate ratio
+  (2× on `nonmem_anchor/init_seed_tie`) while `IPRED` was right. The seed now follows the
+  first record of any kind and each reset's own row, matching `IPRED` and NONMEM.
+- A subject whose `CL`, `V` (or `V2`), or absorption parameter (`n`, `MTT`, `MAT`, `CV²`) is
+  `NaN` on a transit or inverse-Gaussian absorption model is now served `NaN` predictions from
+  the record the `NaN` starts on, as on every other engine, and the fit reports
+  `W_NONFINITE_OBJECTIVE`. It used to be served predictions of 0 and scored against them, with
+  a finite objective and no warning; under a time-varying covariate the records *before* the
+  `NaN` read 0 as well (#2134).
+- A fit with a `profile`d θ level block now does the same housekeeping as an
+  unprofiled one. It freezes a structural θ the objective never reads, with the
+  usual warning. It writes checkpoints, with the levels at their solved values. It
+  writes `optimizer_trace` rows. When the profile objective's Hessian is not positive
+  definite, it gives `covariance_fallback = sir` a proposal. All four were silently
+  skipped before. A subject that falls back to finite differences at runtime now gets
+  the reconverged outer gradient rather than the fixed-EBE one, which could stop the
+  profiled L-BFGS early (#2136).
+- **ODE compartment states (sdtab state columns, `[derived]`) now read an observation listed
+  before a co-timed dose at the subject's first time pre-dose** (#2139), as `predict()` and
+  NONMEM do. The state pass returned the seed plus the dose at that row (30 against NONMEM's
+  28 on the issue's fixture) while IPRED was right.
+- The covariance step's eigenvalue floor no longer depends on the units of an identity-packed
+  θ (one with a negative lower bound). Writing such a θ in large or small units — e.g. a volume
+  in units of 1e-5 L — used to make `covariance_method = s` fail as "S singular or
+  rank-deficient" and `r` / `rsr` report standard errors up to 2000× too small under a "severe"
+  regularization warning. The floor now rescales those coordinates before testing the spectrum,
+  so every SE is the same whatever the θ's units, while a genuinely flat direction is still
+  caught (#2145).
+- **An identity-packed θ far from unit magnitude no longer stalls the outer optimizer
+  at its initial value while the fit reports convergence** (#2146): a θ with a
+  negative lower bound and `|θ₀| > 10` — warfarin's volume written as `TVV_S = 1e6`
+  in units of 1e-5 L, say — reached L-BFGS, SLSQP and BOBYQA in raw units, so it
+  barely moved and the fit stopped up to 20 OFV units above the minimum with
+  `Converged: YES`. Under the default `parameter_scaling = auto` and under `abs`,
+  such a θ is now divided by `|θ₀|` in the optimizer's scale vector; every other
+  coordinate, and `none` / `rescale2`, are unchanged. The `parameter_scaling` row of
+  the fit-options docs also no longer claims that `auto` applies `rescale2` to the
+  gradient-based optimizers: it applies `abs`.
+- **Covariance-step finite differences no longer step a small identity-packed θ
+  through zero** (#2147). Every FD step on a packed coordinate was `eps·(1 + |x|)`,
+  which on a θ with a negative lower bound is about `eps` in the θ's own units: a θ of
+  0.0077 under the default `fd_hessian_step = 1e-2` was stepped to −0.0024, the
+  objective came back as a finite penalty, and every SE was reported ~1000× too small
+  (`analytic_cov_hessian = false` and every model outside the analytic R-matrix's
+  scope). Such a θ, when its declared initial value θ₀ is non-zero and below 1 in
+  magnitude, is now stepped by `eps·(|θ₀| + |x|)` — in the R stencil and its step
+  probe, the profiled-levels covariance, and the per-subject score behind
+  `covariance_method = s` / `rsr` (the Sheiner–Beal, Laplace and FD-fallback scores
+  and the quadrature score's reconverged FD). A mixture's mixing-probability
+  derivative, which differences θ in its own units for any packing, now steps
+  `1e-6·max(|θ|, |θ₀|)` for such a θ instead of `1e-6·max(|θ|, 1)`, in the mixture
+  score and the analytic mixture outer gradient. The Gauss–Newton and trust-region outer
+  steps share those score functions and move with them for such a θ. Every other
+  coordinate's step is unchanged bit for bit.
+- **`x mod 0` is now `0` in every block** (#2149): `[derived]`, survival hazard,
+  Markov transition and mixture-weight expressions returned `NaN` for a modulo by
+  zero (`|b| < 1e-30`) while `[individual_parameters]` returned `0`. All
+  evaluators now apply the same guard as `/`.
+- **An `η` or `θ` inside `a mod b` is now estimated** (#2150): the analytic
+  derivative of `a mod b` was taken as `0`, so a random effect entering a
+  parameter through `mod` was never moved by the inner optimizer — the fit
+  reported convergence with 100 % shrinkage on that `η` and its ω at the initial
+  estimate (and a `θ` inside `mod` likewise had a zero outer gradient). Between
+  its jumps the derivative is now `1` in `a` and `−q` in `b` (`q` the integer
+  quotient), in both the symbolic differentiator and the dual VM.
+- **`E_DOSE_ATTR_NONFINITE` no longer misstates what a non-finite modeled
+  `D{n}` / `R{n}` does** (#2151): the message said the value "never reaches you
+  as a NaN" and that the fit would return finite, silently wrong numbers, which
+  stopped being true in #1284 — the subject's predictions come back `NaN` and it
+  is repelled, like a non-finite lag or `F`. All four attributes now carry that
+  one consequence, without the engine internals the old text named. The cause
+  text also names a covariate missing at the record and a fractional power of a
+  negative value, alongside an overflowing `exp(...)`.
+- **Adaptive-dosing simulation now returns FREM covariate rows as `θ + η`** (#2156):
+  `simulate_adaptive` and `simulate_adaptive_from_spec` (and their `_with_inputs`
+  variants) reported the ODE readout — a concentration — on a `FREMTYPE > 0` row of a
+  FREM model, where `simulate()` reports the covariate pseudo-observation
+  `TV_<cov> + ETA_<cov>`. The adaptive trajectory rows now carry the same value as
+  `simulate()`, with and without inter-occasion variability.
+- **A profiled fit's covariance-step failure is no longer reported as non-convergence**
+  (#2158): "Covariance step failed: the profile solve did not converge at the estimates"
+  is now classified `covariance_failed` in `warnings_structured`, not `convergence`.
+  Every warning that starts "Covariance step failed" now gets that class whatever its
+  reason says; optimizer non-convergence warnings are unchanged.
+- **A θ with a negative lower bound started close to zero is estimated again**
+  (#2159). Such a θ is optimised on its natural scale, so one started at, say,
+  1e-5 was a coordinate whose useful moves sat far below the outer optimizer's
+  step and stopping tolerances: on warfarin with `V = TVV_S / 1e-6` BOBYQA stopped
+  at OFV −205.97, SLSQP at −198.95 and L-BFGS at −269.47 against the minimum,
+  −286.00, each reporting convergence. Before the NLopt optimizers start, each
+  such θ with |θ₀| < 0.1 is now evaluated at two nearby points inside its
+  bounds; when the three objectives predict its minimizer within ten times |θ₀|,
+  the θ is divided by |θ₀| in the optimizer's scale vector. The probe uses the
+  penalized objective the optimizer minimises (priors, NN regularizer), and the
+  decision does not change with the number of subjects or observations. All
+  three optimizers now reach −286.00. A covariate exponent
+  started at 0.001, which the objective barely sees at that size, keeps the unit
+  scale, so `two_cpt_oral_cov` with both exponents started there still reaches
+  −1199.33. `[mixture]` models are probed on the mixture objective (a two-class
+  model with the same volume: 303.06 → 301.58 under BOBYQA). Applies under the
+  default `parameter_scaling = auto` and under `abs`.
+- **Simulating a `[mixture]` model now draws each subject's class** (#2163). Before, every
+  subject was simulated as class 1, with the base Ω and Σ, whatever the mixing
+  probabilities were. Now each subject's class is drawn from its mixing probabilities at
+  its own covariates. The draw is repeated for each replicate and each uncertainty draw.
+  The subject is then simulated under that class's `MIXNUM`, Ω and Σ. This applies to
+  `simulate()`, `simulate_with_seed()`, `simulate_with_options()`,
+  `simulate_with_uncertainty()`, adaptive-dosing simulation, and the NPDE/NPD reference
+  simulation. The class draw uses its own random stream, so the η and ε draws of a seeded
+  run are unchanged. Propensity-score matching on a mixture model is now refused with
+  `E_PROPENSITY_INPUT`, since it would estimate every subject's posthoc η under class 1.
+  Parameters for a mixture model that lack per-class Ω/Σ (`mixture: None`), or carry
+  per-class blocks of the wrong count or shape, are refused with `E_PARAM_SHAPE` on
+  every simulation path instead of being simulated at the base Ω and Σ or panicking.
+  A residual-error magnitude that reads `MIXNUM` is now checked under every class, so a
+  magnitude that vanishes in one class is refused with `E_RUV_MAGNITUDE_NONPOSITIVE`
+  (naming the class) rather than collapsing that class's residual variance. The
+  twin-less transit / IG flip-flop refusal (`E_TRANSIT_FLIP_FLOP` / `E_IG_FLIP_FLOP`) is
+  likewise checked under every class, so a class whose typical values cross into the
+  flip-flop regime is refused (or its uncertainty draw skipped) instead of simulating
+  zero profiles.
+- **A nested `level` column is no longer reported as an undeclared covariate**
+  (#2166): with a `[covariates]` block, `level ARM by ARM in STUDY` no longer
+  warns that `ARM` is used but not declared. A level column that a model
+  expression also reads is still reported.
+- `run_covariance` on a fit with a `profile`d level block now repeats the fit's own
+  covariance step bit for bit, in memory and after a `.fitrx` reload. Before, the
+  standard errors differed at round-off (2.6e-12 relative on the MBMA placebo
+  example, 7.6e-7 on a one-evaluation fit at NONMEM's optimum, macOS arm64) (#2173).
+- SIR intervals no longer depend on the units of an identity-packed θ (one with a negative lower
+  bound). The proposal's eigenvalue floor saw such a θ in its own units, so writing it in large
+  units — e.g. a volume in units of 1e-5 L — floored every other direction ("carry no
+  uncertainty"), shrank the intervals to a single point, or rejected every draw, and in small
+  units reported the θ itself as not identified. The proposal is now conditioned with the θ
+  rescaled, as the covariance step's floor is since #2145, and so is the proposal SIR falls back
+  to when the covariance step fails (#2179).
+- **A covariate counts as present only when every subject carries it** (#2181). An
+  in-memory `Population` that listed a model covariate in `covariate_names` but left it
+  off some or all subjects passed the covariate check, and `predict`,
+  `simulate`, `fit` and the `[adaptive_dosing]` `observe` signal read the missing value
+  as 0. It is now refused with `E_MISSING_COVARIATE`, whose "Available covariate
+  columns" list no longer names a covariate it reports missing. The `observe` check also
+  now accepts a covariate every subject carries but the population does not list, as the
+  model-covariate check already did. CSV-read populations are unaffected.
+- **Finite-difference gradients step a small θ relative to its size** (#2187): the
+  reconverged FD outer gradient (`reconverge_gradient_interval`, IOV outside the
+  analytic scope or under `gradient = fd`, the per-subject salvage, and the
+  reported `final_gradient` of a derivative-free fit), the mixture FD gradient, and
+  the SAEM M-step / VI ELBO θ differences stepped an identity-packed θ (or, for
+  SAEM/VI, any θ) by an absolute `eps` in its own units. On a θ of 8e-4 the outer
+  gradient was off by 15 %, and below 1e-4 it stepped through zero. These steps now
+  scale with the θ's declared magnitude when that is below 1, as the covariance
+  step's do since #2147; every other coordinate keeps its step bit for bit. The
+  mixture FD gradient also keeps its probes inside the parameter bounds now, so a
+  parameter sitting on a bound is differenced one-sidedly within them.
+- **A VI fit reports exactly the estimate its `packed_estimate` unpacks to** (#2187): its
+  closed-form Ω could sit one ULP off its own packed vector depending on where the fit
+  stopped, so `run_covariance` on a reloaded VI fit sometimes re-decomposed Ω instead of
+  repeating the inline covariance step bit for bit. A VI fit with no FIXed parameter now
+  always repeats it; one with a FIX keeps each FIXed value as declared and, as before,
+  takes the fallback.
+- **The inner gradient label no longer reports finite differences for a model with
+  a custom residual magnitude and a correlated residual** (#2209): a residual
+  magnitude (`weight =` or any magnitude expression) combined with `block_sigma` or
+  `correlation` now reports `gradient_method_inner: analytic (Dual2)`, in the fit
+  YAML, the startup banner and the R package's `print(fit)`. The EBE search already
+  ran on the exact gradient; only the label was wrong. Non-IOV subjects of such a
+  model now search on the dense-`R` analytic kernel instead of the adjoint's exact
+  gradient, and the estimates move by a few 1e-9 in η or less.
+- **A profiled fit's covariance step guards and times its re-profiling solve** (#2214):
+  the solve that re-profiles the θ levels before the stencil, in `fit()` and in
+  `run_covariance`, now goes through the same EBE guard as an optimizer evaluation, so a
+  re-solve that leaves too many subjects unconverged (`max_unconverged_frac`), or rejects
+  any subject at its inner start whatever that fraction is, fails the step with a warning
+  naming the counts instead of feeding the standard errors.
+  `covariance_wall_time_secs` now includes that solve, and is no longer `0.0` when it
+  fails.
+- **An IOV fit's first outer evaluation now starts at the start-point mode it is
+  told it starts at** (#2217): the flat-theta pre-flight handed the first
+  evaluation each subject's η̂ but dropped its κ̂, so on a model with `kappa`
+  (an `iov_column`, nested `level … in …` variability, or kappa with a residual
+  `correlation`) every occasion's κ restarted at 0 although the start was
+  certified as the mode. The pre-flight now hands over the whole mode (η̂, κ̂).
+  IOV fits can end at slightly different estimates; non-IOV fits are unchanged.
+- The console parameter tables (`print_results`, `format_summary`, and the
+  public `format_kappa_rows_from` / `format_omega_rows_from` that ferx-r prints
+  through) now show a non-finite standard error as `N/A`, the same as a missing
+  one, instead of `SE = NaN` / `inf`; a THETA row prints `N/A` in both its SE
+  and %RSE columns (#2225).
+- **sdtab IPRED / IWRES of an ODE FREM fit on covariate rows** (#2259): a
+  `FREMTYPE > 0` row now reports `θ_k + η_m` as its IPRED (and its IWRES against
+  that), instead of the ODE readout. The objective and PRED were unaffected.
+- **`W_NONFINITE_OBJECTIVE` reads its label from the subjects, and names the
+  largest contributions when only their sum fails** (#2265). The label ("at the
+  divergence sentinel" or "too large to be a fit") was drawn on the population
+  total at `1e20`, so an unclamped subject past `1e20` read as clamped and a
+  subject refused at `1e18` (IOV combined with FREM) read as unclamped. When the
+  subjects' contributions are the objective's terms and add up to it, the label
+  now follows whether any subject was clamped or refused, and the new
+  `reason_read_from` detail says which reading it is. A warning whose
+  contributions are each usable but sum past the cutoff, which named nobody, now
+  lists the ten largest, largest first, with their share of the sum when there are
+  more, and carries them as `largest_subjects` in its details.
+- **`W_NONFINITE_OBJECTIVE` names the record whose own likelihood term is unusable**
+  (#2266): for each subject it names, the warning now leads with the observations
+  whose own term in the FOCEI data term at the EBE (as the scorer computes it:
+  fitted residual variance and correlations, SDE process noise, `iiv_on_ruv`
+  scale, M3 term, the subject's mixture class) is unusable, with the `TIME`, `DV`
+  and `IPRED` of the first. On a runaway EBE this is the `TIME 0` record a
+  proportional error cannot score at a prediction of `0`, and both engines name
+  it, where the first non-finite prediction pointed at a later record on the ODE
+  and at none on the closed form. The structured `details` gain `unusable_terms`
+  and `first_unusable_term_time`.
+- The sdtab `IWRES`, `CWRES` and per-subject objective contribution of a mixture fit
+  are now scored under each subject's fitted class (`MIXEST`) Ω and Σ, not class 1's,
+  so a subject is named by `W_NONFINITE_OBJECTIVE` only when its own class's residual
+  model cannot score it (#2266).
+- A warning's structured `details` payload (e.g. `W_NONFINITE_OBJECTIVE`'s
+  `unusable_subjects`, `flip_flop`'s subjects) is no longer Rust-only: the fit
+  YAML lists it in a new `warning_details:` block, and a `.fitrx` bundle stores
+  it in `fit.json:warning_details` so it survives a save and reload. The YAML
+  `warnings:` entries are now JSON-escaped, so a message containing a quote no
+  longer breaks the document. The "and N more" clause of
+  `W_NONFINITE_OBJECTIVE` names the outputs that carry the full list (#2268).
+- **An NLopt restart no longer rescales a grown near-zero θ back to its starting
+  size** (#2272): a restart leg (after a basin shift or a mid-descent stall)
+  reused the identity-θ scale probed at the initial estimates, so a θ probed at
+  0.001 that had reached 2000 by the stall restarted as a coordinate of 2e6. The
+  probed scale is now a floor under the θ's current magnitude; the first leg is
+  unchanged.
+- The covariance step's unit-free eigenvalue floor (#2145) no longer rescales the weights of a
+  `[covariate_nn]` block. A weight is identity-packed but has no user units, so it keeps the
+  floor it had before: a weight the data does not identify is still clipped and reported in the
+  "Covariance step regularized" warning, instead of getting a finite SE and passing the
+  `max_condition_number` / `max_correlation` model-selection gates (#2273).
+- The covariance step's eigenvalue floor no longer depends on the units of an additive η in a
+  `block_omega`. An Omega Cholesky off-diagonal carries its η's units, so a block correlating an
+  additive η (a PD baseline, `V = TVV + ETA_V`) in small units could make `covariance_method = s`
+  fail as "S singular or rank-deficient" and `r` / `rsr` report a spurious "regularized" step
+  when another direction was weakly determined. Each off-diagonal is now tested divided by its
+  row's estimated Cholesky diagonal, which is unit-free; on other block-Omega models standard
+  errors the floor was already binding on can change in their last digits (#2274).
+- **SIR scores each draw with the fit's own inner EBE solve** (#2279): the warm
+  re-solve behind the importance weights now uses the fit's inner Hessian seed and
+  keeps a starting EBE the inner convergence certificate already accepts, so at the
+  estimates it reproduces the fit's EBEs and objective bit for bit on every platform.
+  Previously a Nelder–Mead fallback could nudge an EBE by ~1e-14, leaving a FOCE or
+  Laplace objective a few ULP off depending on the platform's math library. The
+  change to the weights is at rounding level.
+- **A profiled fit no longer reports `converged: true` while still descending**
+  (#2285): with no `outer_ftol` set, the L-BFGS or SLSQP outer loop of a model with a
+  `profile`d block stops on a relative objective change of `1e-8` instead of the
+  unprofiled `1e-6`. On the profiled MBMA anchor, nearby starts had stopped
+  converged up to 3.9e-4 OFV above NONMEM's optimum.
+- **A profiled L-BFGS or SLSQP fit is reported converged only once its stop is
+  verified** (#2285): a fresh leg from the best point must lower the OFV by no more
+  than `1e-6`, whatever NLopt's status, and every leg runs at `xtol_rel ≤ 1e-6`.
+  NLopt's stops are tests on one iteration, which L-BFGS meets while still descending:
+  over 34 starts of the profiled MBMA anchor, one had reported `converged: true` 2.2e-5
+  OFV above NONMEM's optimum, and three that reached the optimum on NLopt `Failure`
+  were reported not converged. Costs about 5–20 more objective evaluations per fit.
+- **A condition on a covariate-network output now takes the right branch in the exact
+  gradient** (#2293). In `[individual_parameters]`, an `if` whose condition reads a
+  `[covariate_nn]` output (e.g. `if (TYPICAL_PK.CL > 1.0) { … }`) was evaluated without
+  the network's outputs inside the adjoint recordings, so it read 0 and took the other
+  branch. The production predictor took the right one, so the exact gradient differed
+  from the objective it was supposed to differentiate. The outputs now reach the
+  conditions as arguments, and the gradient matches finite differences of the
+  objective.
+- **A profiled fit with `optimizer = bobyqa` no longer reports `converged: true` at its
+  first tolerance stop** (#2336): as in an unprofiled BOBYQA fit (#1782), the stop is
+  polished from the best point at `xtol_rel ≤ 1e-7` / `ftol_rel ≤ 1e-10`, and the fit is
+  converged only once a polish run lowers the OFV by no more than `1e-6` (at most four
+  runs). On the profiled MBMA anchor such fits had stopped converged up to 32 OFV above
+  NONMEM's optimum; with the polish, all 18 starts landed within 2e-6 of it. Costs about
+  2.4 times the objective evaluations (1.4–10× per start).
+- **A THETA driven onto the internal `1e-10` log-packing floor is no longer reported as
+  converged** (#2339): on that floor the optimizer's gradient is `1e-10` times the real
+  slope, so a fit could stop `converged: true` far from the optimum (the profiled MBMA
+  anchor from a baseline start of 55: 171.9 OFV above NONMEM's optimum, profiled and
+  unprofiled). After a FOCE-family fit, a free THETA on the floor whose objective falls just
+  above it is restarted from its start value, and the fit is reported converged only if the
+  restart lands off the floor at a lower objective. A THETA whose objective rises off the
+  floor is a genuine boundary estimate and is left alone.
+- **A profiled L-BFGS / SLSQP fit no longer reports `converged: true` from a creeping
+  verification leg** (#2340): a leg that stopped on its step tolerance (`XtolReached`)
+  while it was still moving is now followed by another leg, even when its objective gain
+  was under the verification threshold. On the A2 MBMA anchor one of 98 starts used to
+  settle 1.24e-5 above NONMEM's optimum this way; it now lands within 1e-7. One other
+  start takes a few more evaluations and stays where it was, and the 98 fits cost 0.6%
+  more evaluations in total. A fit whose legs keep creeping until the leg cap is reported
+  not converged, with a warning that says so.
+- The profiled outer optimizer's "stopped without converging", leg-cap and spent-budget
+  warnings, and BOBYQA's polish-leg-cap warning, now classify as `Critical` /
+  `convergence` instead of `Warning` / `general`, so consumers keying on the convergence
+  category no longer miss a fit reported `converged: false` for these reasons. The
+  profiled spent-budget warning now also says the fit "is not reported as converged"
+  (#2341).
+- **An `ADDL`-implied dose now takes a route's own lag from the row that carried `ADDL`**
+  (#2367), as it already did for the compartment `lagtime`. ferx used to read the route lag
+  at the implied dose's governing record, so when a covariate in the lag changed along the
+  train, the implied dose arrived at the wrong time. A first-order route lagged by `L` with a
+  constant `KA` is a depot dosed with `ALAG = L`, and NONMEM fixes that `ALAG` at the parent
+  row; `first_order(ka=…, lag=L)` is checked against NONMEM and finite differences. Every
+  other lagged kind reads its lag from the same per-dose value, so it follows too
+  (`zero_order(dur=…, lag=L)` is tested for it).
+- **A time-to-event, count or discrete-state row, and an observation row skipped for its
+  missing `DV` (`W_MISSING_DV`), are now records of the PK model, as in NONMEM** (#2368).
+  NONMEM has no endpoint kinds: every data row runs `$PK`, its covariates and occasion
+  govern the interval ending at it, it can be the record that governs an `ADDL`-implied
+  dose, and it can start the integration clock. ferx kept these rows out of the PK
+  timeline, so on a joint model whose covariates changed at an endpoint row the next
+  Gaussian observation's covariates governed that interval instead, and an `ADDL`-implied
+  dose before it took that observation's covariates. A row skipped for its missing `DV` is
+  now read exactly as the `MDV=1` row the warning says it stands for, so a leading one
+  starts the integration clock. An endpoint row ahead of every other record still starts
+  none, so a subject with only endpoint rows integrates from 0 as before.
+  With nested levels, an endpoint or missing-DV row with a blank level cell is now refused
+  with `E_LEVEL_MISSING_LABEL`, as an `EVID=2` row already was: it is a record, so it
+  needs a group.
+- **Adaptive dosing under IOV: an `ADDL`-implied base dose takes its governing record's
+  occasion** (#2371): since #1909 such a dose takes its covariates and `TIME` from the first
+  record at or after it, but `simulate_adaptive` still drew its κ from the decision window
+  holding the dose itself. When a decision fell between the dose and that record, the dose
+  was parameterised by two different windows, and the trajectory drifted from `simulate()`
+  on the same regimen (5.6 % at the next observation on the regression fixture). It now
+  takes that record's window, as the static engine takes its `OCC`.
+- **A finite-difference gradient probe the EBE guard rejects is no longer differenced as a
+  value** (#2378). The reconverged FD outer gradient and the reported final gradient
+  scored such a probe at the objective's `1e20` wall, and the IOV per-subject salvage
+  gradient scored an unusable subject at the `1e20` sentinel; both are finite, so one
+  component of the gradient came out near `1e23` (measured on an ODE + IOV model whose
+  inner solves hit `inner_maxiter`). A rejected probe now counts as missing: that
+  component takes the one-sided difference from the other side, or is zero when both sides
+  (or the centre) are rejected.
+- **SIR no longer scores a draw at a rejected inner start** (#2382): on an ODE model
+  with IOV, a draw whose warm EBE re-solve rejected a subject at its inner start was
+  scored from that subject's unoptimised start with a zero H-matrix, which gave the
+  draw no weight. That subject is now re-solved cold and the draw scored from its cold
+  EBE (a `[mixture]` draw is re-scored cold as a whole). A draw with a subject rejected
+  even cold has weight 0, and the all-draws-rejected error counts such draws. A
+  nested-level IOV warm start that cannot be compacted now keeps η̂ rather than
+  starting the subject cold (unreachable from a parsed model).
+- **The `E_FIT_INPUT_MISSING` refusal for a `[mixture]` fit without its override
+  values no longer blames ferx-r** (#2386): ferx-r now carries `mixture_overrides` on
+  the live fit and in the `.fitrx` bundles it writes, so the message names only the
+  real causes — a bundle saved before #1765 / #1815, or written by ferx-r before
+  FeRx-NLME/ferx-r#655.
+- A fit with a `profile`d θ level block now reports subjects that fell back from the
+  analytic outer gradient to finite differences, with the same warning an unprofiled fit
+  gives, and says correctly that those subjects took the reconverged gradient. Before, a
+  profiled fit never reported them (#2394).
+- **Finite-difference steps on `[covariate_nn]` weights and small σ** (#2406):
+  a network weight's initial value no longer sets its FD step floor — any
+  weight below 1 in magnitude (most Glorot draws) had a floor below its
+  natural scale, leaving the reconverged-FD gradient off the exact one (6.4e-3
+  relative on a first-layer weight at 1e-4, against 1.1e-8 now); it keeps the
+  unit floor. The forward-differenced σ score used under
+  M3 censoring when the exact data score declines now steps σ relative to
+  itself, so its error no longer grows as σ shrinks (5e-3 relative at an sd
+  of 0.003 before, 1.5e-5 now).
+- **Finite-difference step on a small θ with an O(1) effect** (#2406): a θ
+  declared at `0 < |θ₀| < 1` (identity-packed) is stepped relative to `|θ₀|`
+  (#2187), which was too small a step for a covariate exponent declared near
+  0 — the reconverged gradient in it was up to 53% off, and its
+  finite-difference standard error up to 96%. The reconverged FD gradients and
+  the FD covariance R-matrix now re-solve such a coordinate's probes at a
+  hundredth of the tolerance and keep the step only when the two differences
+  agree; otherwise the step grows ×10, at most to the step of a θ declared
+  at 1. On a covariate exponent declared at 1e-4 the gradient error falls
+  from 0.28% to 6e-9 relative. Other coordinates are stepped as before, and so
+  is a `TVV/k` volume whose sensitivity does scale as `1/k`. At its estimate,
+  where the gradient is near zero, growth stops once the larger step's
+  truncation error shows, so it keeps the first step there too. If the
+  tighter re-solve does not converge at any step, the first step is kept.
+- **Uncertainty draws hold a profiled level the covariance step held on its bound** (#2418):
+  asymptotic draws (`simulate_with_uncertainty`) and SIR now keep a level listed in
+  `profiled_levels_at_bound` at its bound, as they keep a `FIX` θ. Before, the asymptotic
+  sampler drew it about 1e-4 around the bound, and about half the draws fell outside the
+  declared box.
+- **`run_covariance` on a profiled fit reports the levels its matrix is at** (#2419): when
+  it is handed level estimates that are not the profile solve's (edited after the fit),
+  the step re-profiles them before it runs. The
+  result now reports those re-solved levels and their standard errors, so a level moved
+  onto its bound shows the bound as its estimate next to `at_bound: true`. A new
+  `W_COV_PROFILED_LEVELS_RESOLVED` warning counts the levels that moved and names the
+  largest move. Before, the result kept the incoming values.
+- **A profiled covariance step's second re-solve goes through the EBE guard** (#2420): when
+  a level sits on its declared bound, the step re-solves the levels a second time with
+  that level held. That re-solve now fails the step, with the guard's warning, when too
+  many subjects' EBEs stop short (`max_unconverged_frac`), as the first re-solve already
+  did. On the exact route every Hessian block is read from that solve.
+- **The FOCEI objective of a non-Gaussian model with η is smooth in θ** (#2437): the
+  η-Hessian in the `½ log|H̃|` term of an analytic-family TTE (exponential, Weibull,
+  Gompertz; single or repeated events), binary and time-homogeneous CTMM data term is now
+  exact. Each likelihood is written once over a generic number type: the objective's value
+  runs it on plain floats, and the Hessian runs the same code on second-order dual numbers
+  in η, so there is no separate derivative formula to drift from the value. It replaces a
+  finite difference on a Shi (2021) ε^⅓ step (~5e-6) re-derived from the data-term
+  gradient at every θ. At that scale the second difference was mostly roundoff (~1e-5
+  against closed-form Hessians), which made the objective rough in θ. The exact Hessians
+  agree with a Richardson stencil of the objective's value to 2e-9, up to 48 η, and the
+  objective no longer depends on η's units (`K * ETA` with `ω/K²`, equal to 9e-16). A
+  Gompertz `γ(η)` estimated at exactly 0 keeps its γ-curvature (the cumulative hazard's
+  `0/0` limit takes a series there), and a CTMM's value and Hessian share one matrix
+  exponential. Endpoints the duals do not reach (a drug-driven hazard, a time-inhomogeneous
+  CTMM, more than 48 η) keep a finite difference, on a step of `2.4e-3` conditional
+  posterior SDs (`0.1` for a time-inhomogeneous CTMM, whose adaptive occupancy integration
+  is the limit there). OFVs of these models shift slightly. On a flat direction the point
+  where an optimizer stops can move further: on `examples/ctmm_pd_2state.ferx`, whose
+  LQ01 / CL / V ridge runs to the LQ01 bound, BOBYQA now reaches OFV 709.07 (711.68
+  before) and L-BFGS 709.40.
+- **`method = gn` now says why it stalled when the data have fewer subjects than free
+  parameters** (#2438). Gauss–Newton's BHHH information is one rank-one term per subject,
+  so with fewer subjects than parameters it is singular by construction, and its steps can
+  stall short of the optimum. On the joint PK + TTE example (6 subjects, 7 free parameters)
+  it stopped above the optimum, reported as not converged. An unconverged `gn` fit now warns
+  why and points to `method = gn_hybrid`, which reaches the optimum there. A fit with
+  parameter priors or the covariate-NN penalty does not get the warning, since their
+  curvature fills the missing rank.
+- SAEM, IMP, IMPMAP and VI no longer clamp the model prediction to `1e-12` before
+  scoring an observation, so a model whose prediction is legitimately negative (an
+  additive baseline-minus-effect model, a change-from-baseline endpoint, a signed
+  biomarker) is now fitted against its actual likelihood and reaches the same
+  objective as FOCE/FOCEI/Laplace. Previously these estimators optimized a different
+  objective on such models and could stall or drift to the parameter bounds. Under
+  log-transform-both-sides with a θ-dependent residual magnitude, the SAEM/VI
+  θ gradient is also correct again where a log prediction falls below zero. A
+  non-finite prediction now scores as the `1e20` rejection sentinel instead of as
+  `1e-12` (#2440).
+- **The objective no longer depends on the units of `DV`** (#2441): every residual
+  variance used to be clamped at an absolute `1e-12`, so under proportional error a
+  prediction below about `1e-6/σ` (or an additive `σ ≤ 1e-6`, e.g. `DV` in large units)
+  was scored at `ln 1e-12` instead of its own variance, and the same data in ng/mL and
+  mg/L gave likelihoods that differed by more than the `2·n·ln k` a change of units
+  owes. Only a variance that cannot be scored (`NaN`, `≤ 0` as at `f = 0` under
+  proportional error, or subnormal) is now replaced. Fits with predictions near zero
+  under proportional error, or with `σ_add ≤ 1e-6`, change their OFV — toward NONMEM's,
+  which has no such floor.
+- `method = gn` on a model with inter-occasion variability (`kappa` / `block_kappa`) no
+  longer stops near its initial estimates while reporting convergence. GN now steps along
+  the same IOV outer gradient the gradient-based NLopt optimizers use:
+  `examples/warfarin_iov.ferx` ended 22.9 OFV above the optimum and now stops 0.013
+  above it (#2455).
+- **SAEM mixture fits now estimate the class-switched typical values and the
+  mixing fraction at the maximum-likelihood estimate** (#2458). Under SAEM a
+  subject almost never changed class once its η was drawn inside one, so
+  `p(1)` stayed at the starting share and a class-switched clearance
+  (`CL = if (MIXNUM == 1) TVCL1 * exp(ETA_CL) else TVCL2 * exp(ETA_CL)`) was
+  biased. On the two-class NONMEM anchor, `TVCL2` was 3.14 and `p(1)` 0.54. Each
+  E-step now also moves the class together with its η, holding the individual
+  parameters fixed, and a log-mu-referenced class-switched value takes the
+  closed-form mu-referencing shift. The anchor's 10-seed mean is now within
+  0.2 % of NONMEM IMPMAP on both clearances (`TVCL2` 2.824 vs 2.819, `p(1)`
+  0.472 vs 0.473), and every seed classifies all 30 subjects as NONMEM does.
+  SAEM mixture estimates change for every model with such a value. Where SAEM
+  still cannot move the class (under IOV, with `mu_referencing = false`, or with
+  a negative lower bound on a class theta), the fit now warns that the estimates
+  may stay near the starting classes, and says what to do.
+- **A fit that ends above its own starting objective is no longer reported converged**
+  (#2461): when the EBE convergence guard rejected the starting evaluation — on a small
+  population one unconverged subject is enough — the optimizer never ranked the start and
+  could walk off it. Started at the optimum of a hand-written transit ODE, L-BFGS reported
+  `converged: true` 12.9 OFV above where it began. Such a run now reports
+  `converged: false` with a `W_ABOVE_START` convergence warning naming both objectives and
+  the guard's subject count.
+- **A fit restarted off the log-packing floor, or after a stall or basin shift, is no
+  longer reported converged above where it started** (#2461): the `W_ABOVE_START` check
+  compared each optimizer run with its own first evaluation, so a restart — which starts
+  from wherever the fit had walked to — passed against that point. On the hand-written
+  transit ODE of #2461 on Linux x86_64 the floor restart reported `converged: true` 36.8
+  OFV above the fit's start. The check now runs once, on the result the fit reports,
+  against the fit's first evaluation.
+- **An unprofiled FOCE / FOCEI fit with L-BFGS or SLSQP no longer reports `converged: true`
+  from a stop above the optimum that its inner-loop noise hid** (#2462). Every stop that
+  would be reported converged is now checked by a verification leg at a tight inner
+  tolerance (`1e-10` for that leg only), started from the best point with fresh EBEs. The
+  stop is converged once a leg stops improving. Four legs that keep improving, or a spent
+  budget, report not converged, with a warning. On the unprofiled A2 MBMA anchor, 16 of 80
+  starts used to stop 1.7e-4 to 5.3e-4 above NONMEM's optimum as converged; all 80 now
+  land within 5.1e-7. A fit already at its optimum takes one leg and reports the same
+  estimates; the leg's inner solves are tighter, so a fit can take noticeably longer (the
+  80 A2 fits went from 9.7 s to 20.7 s).
+- **The parse-time individual-parameter derivatives now cover statement-level
+  `if` blocks** (#2471). A parameter assigned inside `if { … } else { … }` gets
+  each branch's derivative, selected by the branch the subject takes; before,
+  it had none, and a later line reading it treated it as a constant. Initial
+  estimates (`suggest_start`) read these derivatives to tell which random
+  effect a parameter uses.
+- **IOV fits with a time-to-event, binary or CTMM endpoint optimise the right objective** (#2482):
+  under IOV the FOCE/FOCEI marginal omitted the endpoint's data term although the EBE search
+  included it, so these fits optimised a different objective than their EBEs were modes of.
+  Their OFV and estimates change. Binary endpoints with IOV, rejected before because of this
+  mismatch (`E_BINARY_IOV_UNSUPPORTED`), are now accepted.
+- **M3 (BLOQ) likelihood uses an accurate normal CDF** (#2482): `log Φ` was computed over an
+  approximation of `erf` good to ~1.5e-7, and below z = −5 over a truncated asymptotic series
+  off by up to 2.7e-4, while the exact gradients used the derivative of the true `Φ`. The
+  value now matches what its gradient differentiates; M3 fits' OFVs move in the 7th digit.
+- **A fit warm-started at a converged optimum now reports converged** (#2506): a
+  bootstrap sample or refit started at a previous fit's estimates does not move, and
+  was reported `converged = false` with `W_STALLED_AT_INIT`. When the outer optimizer
+  (NLopt, the built-in BFGS loops, `trust_region` or Gauss–Newton) does not leave its
+  start it now restarts the optimizer from a perturbation of that start, and reports
+  the restart's own result. If the restart converges back to the same objective
+  (within 0.01), the start was an optimum: the fit is not flagged, passes
+  `Strictness::default()` when the restart converged, and records it in the new
+  `FitResult::stationary_start`. If the restart finds a lower objective, the start was
+  a stall: it is still reported, and flagged, as one, with a warning naming the lower
+  objective the restart reached. Any model and objective is
+  covered, AGQ and mixtures included; the cost is one extra optimization, paid only by
+  a fit that did not move.
+- **A warm start at an optimum now reports the start, not a slightly worse point**
+  (#2506): when a fit started at an optimum (a bootstrap replicate under
+  `update_inits`, a refit from earlier estimates) is verified by its restart probe,
+  the reported estimates and OFV are those of whichever of the start and the probe
+  is lower. Before, the probe's end point was always reported, and it could sit up to
+  0.01 OFV above the start it confirmed.
+- **An observation listed before a same-`TIME` steady-state dose reads pre-dose**
+  (#2510): like any other co-timed dose, an `SS=1` dose listed after an
+  observation no longer reaches it. The observation reads the amounts carried
+  from the previous record, as NONMEM does: the initial state before a first SS
+  dose (0, or the `init()` value), the history so far before a later one. Before,
+  it read the post-dose steady state. A covariate-change row listed before an
+  `SS=1` dose likewise governs the interval ending at it. On the SDE (EKF) path,
+  an observation listed before a dose at the subject's first `TIME` no longer
+  reads the post-dose mean, and an observation read after an `SS=1` dose at its
+  own `TIME` now conditions on the steady-state covariance instead of the
+  pre-dose one. An ODE state read less than `1e-12` before the
+  subject's first record (a TTE or CTMM time, or a `[derived]` grid point) now
+  reads the initial state instead of `NaN`.
+- A fit with a `profile`d θ level block is now held against its own starting objective, as an
+  unprofiled FOCE-family fit already was: a fit that ends materially above its start carries
+  `W_ABOVE_START` and is no longer reported as converged. The typical cause is an EBE guard
+  that rejects the start, so the outer loop is pushed away from it (#2519).
+- **Adaptive dosing: a decision no longer reads covariates that are not yet recorded**
+  (#2528). An `ADDL`-implied base dose carries the covariates of the record that follows it
+  (#1909), and the adaptive driver counted it as the latest record before a decision. So a
+  decision between the dose and that record saw the later value in `ctx.covariates`, its
+  readout and the `F` of the dose it injected (an injected dose's `F` halved and IPRED 31 %
+  low on the issue's reproduction). Implied doses are no longer records for what a decision
+  reads; the decision reads the latest data record, as for any dose written as its own row.
+- `predict_survival` returns each subject's rows in ascending CMT order on every call,
+  and multi-endpoint objectives no longer vary in their last bits between runs. Named
+  blocks (`[event_model LABEL]`, …) are read in a fixed order, so a joint PK-TTE model
+  with several ODE-driven hazards gets one ODE state layout and the same parse error on
+  every run (#2531).
+- `simulate_adaptive` with inter-occasion variability or time-varying covariates: a trough
+  listed before a co-timed pre-scheduled dose at a later time read the post-dose level, off by
+  the dose amount, and so did a decision at that time. The dose now lands at its own time,
+  after the trough and after the controller has decided (#2532).
+- **A trough listed before a co-timed dose reads pre-dose when a lag arrival lands one ULP
+  below the dose** (#2534): on an ODE model, `predict()`, `fit()`'s objective and the
+  compartment states fired the dose at the arrival's break, so the trough read post-dose,
+  while the analytic gradient read it pre-dose. Every walk that applies a lag now fires a
+  dose at its own break, as NONMEM's record order does.
+- The `W_COV_NON_STATIONARY_ESTIMATE` warning after SAEM, IMP, IMPMAP or VI suggested
+  `methods = [saem, focei]`, which the model parser rejects; it now says `method = [saem, focei]`,
+  states that the polish moves the estimates, names the subject and parameter counts when the
+  score matrix S is singular by design, and offers `sir = true` for intervals. The singular-`S`
+  message under `covariance_method = s` no longer recommends `r` / `rsr` without saying when
+  they fail, and the docs' method-chaining examples use the `method = [...]` spelling the
+  parser accepts (#2536).
+- **`method = laplace` is the Laplace approximation exactly** (#2538). Its `½log|H|` term
+  was taken of the Hessian plus a relative `10⁻⁶` diagonal jitter, which raised every
+  subject's objective by about `10⁻⁶·d` and moved the estimates with it (9.0·10⁻⁵ OFV above
+  NONMEM's `METHOD=COND LAPLACE` on `profile_mbma`; now 4·10⁻⁸). The anchor Hessian is now factored as
+  is whenever it is positive-definite, for every `n_agq`; the jitter and the prior-scale
+  fallback remain only for an anchor that does not factorise. Laplace and AGQ OFVs move by
+  about `10⁻⁶` relative; the exact gradient and covariance follow the same rule.
+- **A profiled fit near its optimum keeps the exact level gradient** (#2539): an inner
+  solve that ended on a Nelder–Mead fallback certified stationary was treated as off its
+  mode, so near the optimum (where a warm start leaves BFGS no step to take) some subjects'
+  profiled-level gradients fell back to reconverged finite differences and the fit warned
+  `W_PROFILE_FD_GRADIENT` (4 of 12 subjects on `profile_mbma` started at NONMEM's optimum).
+  A certified fallback now keeps the adjoint gradient, as a converged BFGS solve does; a
+  fallback that is not certified still takes the finite differences. Estimates are
+  unchanged on `profile_mbma`; elsewhere they can differ at most at the level of the
+  finite-difference noise in the level gradient.
+- **SAEM now takes the closed-form update for an additive typical value**
+  (#2540): `E0 = TVE0 + ETA_E0` is shifted as `TVE0 += γ·mean(η)` on the natural
+  scale, whatever its bounds, instead of being left to the η-frozen numerical
+  M-step. That M-step sat on a ridge between TVE0 and mean(η) and stopped 1–11 OFV
+  units above the exact MLE on the `mbma_placebo` example, with ω² inflated up to
+  6×. A typical value summed with other terms in one line (`BASE = TVE0 + PLACEBO
+  + ETA_E0`) is still not mu-referenced; the SAEM warning now says to split it.
+  Single-population SAEM only: under `[mixture]` an additive anchor still takes the
+  numerical M-step.
+- A `saem`, `imp`, `impmap` or `vi` fit whose covariance R matrix is positive definite at an
+  estimate that is not a stationary point of R's objective now warns
+  (`W_COV_NON_STATIONARY_ESTIMATE`) instead of reporting standard errors silently. The
+  covariance step takes the objective's gradient at the estimate and warns when its Newton
+  decrement exceeds 1 OFV unit (the estimate is more than one standard error from the
+  minimum). On `mbma_placebo`, SAEM with `seed = 2` (decrement 14.9) reported SEs 3–5× the
+  FOCEI ones with no caveat (#2541).
+- **Laplace and AGQ no longer stop short on a slow descent** (#2549): a quadrature fit's
+  relative objective-change stop is accepted only where a Newton step from the best point is
+  predicted to gain no more than `1e-3` OFV (the BHHH decrement of the incumbent's own
+  per-subject scores); otherwise the fit is polished from its best point, as a BOBYQA
+  tolerance stop is. Laplace on a 26-parameter, five-random-effect model stopped 0.10 OFV above
+  its optimum; it now reaches it. Fits already at their optimum stop as before.
+- **The optimizer trace's `method` column names the objective a fit scores** (#2552):
+  an unprofiled `method = laplace` fit was traced as `foce`, and a `focei` fit with
+  `n_agq > 1` as `focei`. Rows now read `laplace` at one quadrature node, `agq` above
+  one, and `foce` / `focei` otherwise — the same label in the unprofiled and profiled
+  outer loops (a profiled AGQ fit was traced `laplace`).
+- **`inner_optimizer = nelder_mead` reports a subject converged only at its mode** (#2557):
+  the primary Nelder–Mead search set an EBE's convergence flag from its own simplex-spread
+  stop, so every subject read converged (measured: 108 of 177 across the bundled examples
+  at a gradient norm above 1e-3, up to 12.4). Its end point is now certified the way the
+  Nelder–Mead fallback's is, polished by BFGS when it is not stationary, so
+  `max_unconverged_frac`, AGQ's per-subject acceptance and the profile solve's choice of
+  gradient see the true state. Fits under this option can move slightly, to the
+  stationary EBEs.
+- Competing-risks TTE simulation with a fixed seed is now reproducible across runs. When
+  two or more causes were right-censored at a subject's last time, the data reader emitted
+  their records in a random order on each read, and the simulation draws each cause in
+  record order; those trailing censored records now follow the order of each cause's last
+  row in the data file (#2569).
+- **A Laplace/AGQ fit that stalls short of its optimum is no longer reported converged**
+  (#2585): where a polish leg's line search fails without gaining although a Newton step is
+  still predicted to gain more than `1e-3` OFV, the fit ends `converged = false` with a
+  warning naming the predicted gain — the signature of individual modes switching between
+  local minima. On a hard five-random-effect Laplace fit, four of ten perturbed starts ended
+  39–285 OFV above the optimum reporting convergence; they now say they did not converge.
+- **`total_ebe_fallbacks` counts the EBEs a fallback returned** (#2589). Before, it
+  counted every inner solve in which a fallback ran, even when a multi-start candidate
+  (`inner_twin_seed`, `inner_screen`, `inner_restarts`) then replaced the fallback's point.
+  Under `inner_optimizer = nelder_mead`, such a solve could be counted in both
+  `total_ebe_fallbacks` and `total_ebe_nm_polished`; it is now counted in at most one of
+  them. The count only changes on fits that run a cold multi-start, and it can only go down.
+- **A profiled fit warm-started at its own optimum now reports converged** (#2591): a
+  model with a `profile`d θ block runs the #2506 start check too. Before, a refit or
+  bootstrap sample started at a previous fit's estimates carried `W_STALLED_AT_INIT`
+  and failed `Strictness::default()`, and an L-BFGS `Failure` stop at that start could
+  leave it `converged = false`. A model whose only estimated parameters are the
+  profiled levels (every structural parameter `FIX`) is one profile solve, and is now
+  reported converged and not a stall. A fit that stalls at its initial estimates is
+  still flagged as one.
+- **`W_COVARIATE_MISSING` is raised only for a covariate the model reads** (#2599):
+  a dataset column with missing values that no relation reads — a lab value or ID
+  the model never touches — no longer prints a warning claiming the objective goes
+  `NaN`, even when the column is declared in `[covariates]` or listed in
+  `covariate_columns`. Reads from every block count, `[derived]`, `[output]` and
+  a numeric `[data_selection]` comparison included; a string comparison such as
+  `FLAG == DROP` reads the raw text, so a label column is not reported. The
+  model-blind `read_nonmem_csv*` readers, which cannot tell what a model reads,
+  still warn for every column.
+- A fit with a `profile`d θ level block whose first profile solve fails outright — a small
+  `inner_maxiter` — is now held against its own start too: the start is re-scored once,
+  evaluation-only, at `inner_maxiter = 200`, and a run that ends materially above it carries
+  `W_ABOVE_START` and is no longer reported as converged. Before, such a start was skipped,
+  and the run could end far above it with `converged: true` (#2619).
+- On binary- or Markov-only data, a `theta NAME[COL]` level block that no level-defining
+  endpoint reads through its implicit index is no longer refused as "the data carries no
+  observation rows". The `E_THETA_LEVEL_BINDING` refusal now says why the block has no
+  levels:
+  - The block is not read at all: it says nothing reads it, and that a data-driven
+    block is read bare, as `NAME` (a subscripted `NAME[COL]` read is refused at parse
+    since #2744).
+  - The block is read bare, but only by a Gaussian prediction, a CTMM generator or a TTE
+    hazard: it says that none of them defines a level on this data.
+  - The block is read bare by a binary or DTMM endpoint the data has no record for: it says
+    that too.
+
+  (#2623)
+- When a kappa declared with `weight = ...` is referenced in more than one block
+  outside `[individual_parameters]`, the refusal now names every such block, sorted,
+  in one message. It used to name only one, and which one changed from run to run
+  (#2624).
+- A fit whose log-packing floor restart (#2339) stopped with a THETA just above the floor,
+  where the objective still fell as that THETA rose, was reported `converged: true` with the
+  restart's success warning, up to 68 OFV above the optimum. It is now reported
+  `converged = false`, and its `convergence` warning names the THETA "below 1/1000 of its
+  start" with its value and the lower objective at that point (#2629).
+- **FOCE / FOCEI fits no longer stop `converged` above a lower optimum the verification legs
+  could not reach** (#2645). After the legs settle, a cold solve at the verified point looks for
+  subjects in another EBE mode, and the BHHH Newton decrement looks for a remaining descent; each
+  that finds something runs one more round of legs from there, and the fit keeps a round only if
+  it ends lower. A 24-subject 3-compartment benchmark now ends at −3039.288 (NONMEM −3039.288;
+  was −3038.980) and a 458-subject 2-compartment one at 4306.989 (was 4309.774). A fit with
+  neither finding pays one inner pass and one gradient pass; one that runs a round takes longer.
+- **The reported OFV no longer sits above the best objective the fit saw** (#2646): the final
+  cold EBE re-solve was accepted whenever it landed within `1e-3·(1 + |OFV|)` of the best-seen
+  objective, which is 4.3 units at OFV 4,310 and 186 at OFV 186,000, so the optimizer's better
+  EBEs were dropped silently. The bound is now an absolute 0.05 OFV units, also tested per
+  subject, and a subject another candidate beats by that much keeps the lower EBEs. `W_EBE_START_DEPENDENT` fires at the
+  same bound and names the subjects. OFV, EBEs and sdtab change on fits with such a gap, and
+  those fits gain the warning. A subject's kept EBE can be a higher individual mode that wins on
+  `log|H|`, which `docs/estimation/foce.qmd` explains.
+- **A parameter that moves an `[odes]` `if` switch is no longer silently frozen** (#2649):
+  an `if` that switches during the integration at a time a parameter can move, such
+  as `if (tau > LAGT)` or `if (central / V > CT)`, puts a jump in the sensitivities
+  that the branch-wise right-hand side does not contain. A θ reaching the equations
+  only that way got an analytic gradient of exactly zero and stayed at its initial
+  value, sometimes with `converged: true`. The integrator now locates such a switch,
+  ending a step on the crossing, and applies the sensitivity jump there, exactly to
+  second order, so these models keep exact gradients and covariance. Their
+  predictions move by about the solver tolerance, since no step straddles the switch
+  any more. `min`, `max`, `clamp` with literal bounds, an inline `if` whose arms meet,
+  and clocks compared against literals have no jump and are integrated as before.
+- **`imp` no longer blows up at iteration 2 on correlated subjects** (#2650): capping
+  the proposal covariance at Ω now rescales the covariances too, so the matrix stays
+  positive definite, and a proposal with no usable curvature really does fall back to
+  Ω instead of an SD of 1e5. On four models where `[focei, imp]` jumped by a factor of
+  10⁴ or more and never recovered, fits now track NONMEM's `METHOD=IMP`. IMP results
+  change on any model where the cap was reached.
+- **`imp_proposal_df = normal` now evaluates a real multivariate-normal proposal** (#2651).
+  On the `imp_eval_only` path and in the final marginal of an estimating `imp` run, it used to
+  give `−2 log L = inf` with ESS 0 for every subject, whatever `imp_samples` was. Both the
+  η-only and the joint (η, κ) evaluators now handle it, as do mixture models, and the fit YAML
+  writes `proposal_df: .inf`. A `NaN` proposal df is now refused by `imp` and `impmap`.
+- IMP and IMPMAP fits no longer report `converged: true` on a collapsed run. `fit()` now also
+  checks the importance-sampling marginal: a `NaN`, infinite or diverged value demotes the fit
+  with `W_NONFINITE_MARGINAL`, and a final marginal far above the lowest value the iterations
+  reached demotes it with `W_MCEM_OBJECTIVE_ROSE`. The first check also applies to an
+  `imp_eval_only` readout, and a chain ending in an `agq_eval_only` readout now publishes the
+  marginal and gets both checks (#2652).
+- The importance-sampled marginal `−2 log L` no longer reads high on sparse subjects
+  (#2653). Under `imp_eval_only` and after an estimating `imp` or `impmap` stage, each
+  subject's proposal is now adapted over pilot passes and keeps a prior component before
+  the marginal is drawn. On cefepime the marginal goes from 4306.5 to 4297.1 at K = 3000
+  against an independent reference of 4297.2; NONMEM's default `EONLY=1` reads 4301.8 there
+  and 4297.2 with `DF=4`. Reported marginals change, and a marginal now costs 6× the
+  draws. The new option `imp_adapt_passes` (default 5, `0` restores the old proposal) sets
+  the passes. The result and fit YAML report `adapt_passes`, and a fit warns when a
+  subject's effective draws are too few to trust the marginal.
+- **A covariate missing from one record of a population built in code is now refused
+  instead of read as 0** (#2671): the run-start presence check (`E_MISSING_COVARIATE`)
+  looked only at each subject's static covariate map, while an `[adaptive_dosing]`
+  `observe` or dose expression — and a model covariate at that record — reads the record's
+  own map, so `start_dose = 15 * WT` could dose 0 mg with the run reporting success. The
+  check now requires every record map (including binary, categorical and DTMM endpoint
+  rows) to carry the covariate, in `fit`, `simulate`, `predict` and both adaptive entry
+  points. Such a population, read from a file and then edited, is refused as missing the
+  covariate rather than as a column the reader did not take. Populations read from a CSV
+  file unchanged are unaffected: the reader fills every record map.
+- **Finite differences on a small θ are now resolved in AGQ scores and the profiled
+  covariance step too** (#2678). A θ declared below 1 is stepped relative to its magnitude,
+  which is too small for its re-solved probes to follow when the objective's sensitivity to
+  it is O(1), such as a covariate or Hill exponent declared near 0. The #2406 resolution gate
+  now also covers the AGQ/Laplace finite-difference score (which now shares the outer
+  gradient's stencil), the profiled `A_p` stencil, and a declined subject's `Aᵢ`. On a Hill
+  exponent declared at `1e-4`, the profiled covariance step used to fail as not positive
+  definite, and now matches the exact route. The AGQ score's error falls from 3e-3 to 5e-10.
+- **A starting point the EBE convergence guard rejects is re-solved warm before it is
+  judged** (#2682). When too many subjects' inner loops fail to converge from the cold start
+  (`max_unconverged_frac`), the first evaluation is solved once more from the EBEs it just
+  found, and the fit proceeds from it if that solve passes the guard; fits with a profiled
+  θ level block re-solve their first profile solve the same way. Before, the warm-start
+  cache stayed cold until an evaluation was accepted, so every later trial failed the same
+  way and the fit walked toward the middle of its bounds. With `verbose = true`, a rejected
+  evaluation now prints as a rejection with its unconverged count instead of as an
+  `OFV = 1000000…` line.
+- IMP and IMPMAP fits no longer report `converged: true` when the run stopped at its iteration
+  limit without finishing. `fit()` and a direct `run_imp` or `run_impmap` call now read the floor
+  of the trailing objective, and demote the fit with `W_MCEM_NOT_SETTLED` if that floor was still
+  falling, stayed well above the final marginal, or left too few finite iterations to read. A run
+  of fewer than 30 iterations is too short to test, keeps its verdict and gets
+  `W_MCEM_SETTLING_UNTESTED` (#2686).
+- **`imp_eval_only` on IOV models now scores the likelihood IMP/IMPMAP estimate** (#2689,
+  #2627). With `imp_adapt_passes = 0`, the joint (η, κ) evaluator used its own copy of the
+  observation likelihood. That copy left out FREM covariate rows and TTE / binary /
+  categorical endpoints, and ignored `imp_defensive_alpha`, so the readout could differ from
+  the marginal the estimators use. The SAEM and method-chaining docs now show
+  `imp_eval_only = true` for scoring a fit with `method = [saem, imp]`; without it the `imp`
+  stage re-estimates the parameters.
+- **A failed `save_fit` no longer damages an existing bundle** ([#2696](https://github.com/FeRx-NLME/ferx-core/issues/2696)):
+  the bundle is written to a temporary file and renamed into place, so a failure leaves
+  the old file intact and no partial file behind.
+- **An `[odes]` `if` whose arms meet at its switch keeps analytic gradients** (#2700): the
+  route change in #2649 also caught continuous conditionals such as Friberg feedback,
+  `if (rb < CIRC0) (CIRC0 / rb)^0.16 else 1.0`, which then ran on finite differences.
+  These models now stay analytic like the same function written with `max`, with no
+  warning. An `if` the sampled check cannot show to meet stays on finite differences.
+- FOCE/FOCEI on the finite-difference route no longer scores an ODE model far off at default
+  tolerances. The FD Jacobian in the objective's determinant term now uses a step of `1e-3` and
+  integrates at no looser than `ode_reltol = 1e-8` / `ode_abstol = 1e-10`, while predictions and
+  the EBE search keep the fit's tolerance. On an 8-state neutropenia model the OFV moved from
+  -4283 to -5744 at the default tolerance, against -5733 on the analytic route. Any method whose
+  final OFV uses this term, such as SAEM, moves with it. A subject whose Jacobian solve cannot
+  meet its tolerance falls back to the fit's settings, and `W_FD_JACOBIAN_NOT_TIGHTENED` reports
+  it (#2701).
+- A basin-shift or mid-descent restart that reached the optimum was reported
+  `converged: false` when its own step in θ was small, because it had not left its own start.
+  Such a restart is now checked by restarting the optimizer from a perturbation of its point,
+  as a warm start at an optimum is, and reported converged when that comes back to the same
+  objective. When the perturbed run goes lower instead, its result is reported, and the
+  restart's notice says so. When the check runs out of the evaluation budget, the fit reports
+  the budget spent and the "increase maxiter" advice. On a simulated flip-flop population this costs about 110 more
+  objective evaluations (#2707).
+- **Standalone evaluation runs no longer report `W_STALLED_AT_INIT`** (#2716): a
+  `method = imp` run with `imp_eval_only = true`, or a `method = laplace` run with
+  `agq_eval_only = true`, evaluates the marginal at the initial estimates by request, so
+  it is now exempt in the same way as `outer_maxiter = 0`. A stalled estimator followed
+  by such a readout still warns.
+- **`iscale_min`, `iscale_max` and `imp_auto` now warn under `imp_eval_only`** (#2717):
+  an evaluation draws at proposal scale 1 and a fixed `imp_samples`, so these options
+  never reached it, and nothing said so. Setting one now adds a warning naming what does
+  work (`imp_adapt_passes`, `imp_samples`), and the docs state the scope of each option,
+  including that `imp_defensive_alpha = 0` needs `imp_adapt_passes = 0` to give a plain
+  proposal on a reported marginal.
+- **IMP and IMPMAP no longer leave θ and σ at their start values on models with many
+  coordinates in the weighted M-step** (#2718): the solve now takes SAEM's local first
+  step and tolerance from #1415, on single-population and mixture models alike. Estimates
+  from `imp` and `impmap` change on any model with σ or non-mu-referenced θ. A θ or σ the
+  solve never moves although moving it would pay is now named by `W_MCEM_MSTEP_FROZEN`,
+  an NLopt failure of the solve gives `W_MCEM_MSTEP_FAILED`, and either reports the fit
+  `converged: false`.
+- An observation listed between a co-timed `EVID=3` reset and a dose (reset, sample, dose,
+  all at one `TIME`) is now scored on the reset state, as NONMEM does. It was scored on the
+  state from before the reset, with no warning, and the objective could be thousands of
+  units off. Anchored against NONMEM 7.6.0 (`nonmem_anchor/reset_trough_tie`). (#2728)
+- **`inner_restarts` now works on subjects with occasions in a `kappa` model** (#2730):
+  the guarded multi-start used to be skipped on these subjects, so the option had no effect
+  and a fit could sit in a worse individual mode than NONMEM. It now scans the random effects
+  and each occasion's `kappa` on cold solves. A subject that moves changes its EBEs and the
+  OFV; a unimodal subject is bit-identical. Cold solves of `kappa` models cost more at the
+  default `inner_restarts = 1`, and `inner_restarts = 0` restores the old behaviour.
+- **Compartment on/off records now work on `[odes]` models** (#2732): an `EVID=2` row with
+  `CMT=-N` used to be ignored silently, which left urine and other collection compartments
+  accumulating and gave wrong predictions. It now zeroes the amount and holds it there until
+  an `EVID=2`, `CMT=N` row, a dose arrival or a reset turns the compartment back on, matching
+  NONMEM 7.5.1. A negative `CMT` on any other record, an observation of an off compartment,
+  and a model that cannot honour the row are refused with an error rather than run wrong.
+- `method = gn` no longer reports `converged: true` when its trust radius has collapsed: a small
+  OFV change on a step taken at a radius below 1e-3 is no longer taken as convergence, so the
+  run ends on the collapse or the iteration budget with `converged: false` (previously e.g.
+  `warfarin_bloq` stopped 10.6 OFV above FOCEI as converged). A collapsed or cancelled run also
+  no longer carries the contradictory "max iterations reached without convergence" warning; the
+  collapse warnings now read "… trust radius collapsed without convergence" and are classified
+  critical/convergence (#2738, #1049).
+- **`method = gn` (and `trust_region`) now steps along the true gradient on Gaussian
+  FOCEI models** (#2740): every subject with random effects takes its exact total
+  derivative, the adjoint at the mode or a reconverged finite difference. Before, GN used
+  the fixed-EBE score plus a θ-only correction, or no correction at all for M3 BLOQ, IIV
+  on RUV, a θ-dependent residual magnitude, `block_sigma` and FREM. That gradient could
+  disagree with the objective in sign, so the trust region collapsed and GN stopped well
+  above the FOCEI optimum. `warfarin_bloq` stopped 10.6 OFV above it; it now reaches the
+  optimum. Each GN iteration costs more.
+- **Adaptive dosing now applies a residual-error magnitude to the controller's `Dv`
+  reading** (#2741): `simulate_adaptive` and `simulate_adaptive_from_spec` drew the
+  reading from the bare sigma, so a magnitude expression (`proportional(PROP * WT)`), a
+  `weight =`, a `power(...)` exponent or a magnitude on a `CMT=N:` line was dropped from
+  the signal while the run reported success. The reading's variance is now the one
+  `simulate()` gives an observation row at the decision: the covariates in force there,
+  the `TIME` as written and the time after the doses given before the reading. A magnitude
+  that is not positive and finite at a decision fails with `E_RUV_MAGNITUDE_NONPOSITIVE`.
+  A model without a magnitude draws exactly what it drew before.
+- On data whose only records are time-to-event or count records, a `theta NAME[COL]` level
+  block with no levels is no longer refused as "the data carries no observation rows". The
+  `E_THETA_LEVEL_BINDING` refusal now names each record kind the data carries and says it
+  defines no level, then gives the same reason as on binary-only data (#2623): nothing
+  reads the block, or its only bare readers define no level here. When the data has no
+  binary or DTMM record either, it also says that no reader can define a level on this
+  data, in place of the `[binary_model]` advice where the message gave it. (#2751)
+- **Adaptive monitors read the `TIME` as written after a reset that restarts `TIME`**
+  (#2756): an `observe` expression or a `[scaling]` readout that reads `TIME` used the
+  engine clock at a decision and in an `auc_target` window. In a restarted period the
+  controller was given a value shifted by the reset offset, which no output row reports.
+  It now reads the written `TIME`, as observation rows and `predict()` do. Runs without a
+  restarting reset are unchanged.
+- **A censored (M3) row whose limit is astronomically far on the certain side no
+  longer poisons the objective** (#2762). The normal CDF behind the M3 likelihood
+  returned `NaN` at `±∞` and at any `|z|` beyond about `1.9e154`, so an LLOQ of
+  `1e300` on a `CENS=1` row (or a ULOQ of `-1e300` on a `CENS=-1` row) sent the
+  objective to the 2e20 divergence sentinel. That row now scores as the certain
+  observation it is (contribution 0). The same applies to a `binary_model` probit
+  record whose linear predictor exceeds about `1.9e154`: its likelihood term is
+  now 0 instead of `NaN`. The `pnorm()` expression function and the probit link's
+  simulated probability already handled `±∞` and are unchanged. No objective
+  changes for any smaller argument.
+- **A θ used only in a `[mixture]` mixing expression is no longer reported unused**
+  (#2766): `check_unused_parameters` now scans the mixing expressions (`logit(1) = MIXL`,
+  `p(1) = P1`) alongside `[individual_parameters]` and `[event_model]`, so a mixing-
+  fraction θ no longer draws `W_UNUSED_PARAM` in `ferx check` or `FitResult.warnings`.
+- **The analytic inverse-Gaussian absorption (`pk one_cpt_ig` / `pk two_cpt_ig`, and
+  an infused dose into an `igd()` input) is correct for a narrow absorption-time
+  distribution** (#2769). Below a CV of about 5 % (`cv2 ≲ 0.0028`) predictions were
+  wrong — about `1e48` at CV 0.05 and infinite from CV 0.03 down — because a log-scale
+  normal tail was floored at `ln(1e-300)`. From a CV of about 7.5 % down, the exact
+  second derivatives of these predictions were `NaN` even where the predictions were
+  still right. Both now match a high-precision reference down to CV 0.01 (predictions
+  to ~4e-13). Predictions at CV ≥ 0.06 change only in the last digits (≤ 1.4e-14
+  relative).
+- **An M3-censored row whose limit is astronomically far on the certain side no longer
+  turns the objective into the `1e20` sentinel** (#2772). Once `φ/Φ` underflows to 0,
+  the censored row's gradient and curvature coefficients (and its `iiv_on_ruv` cross
+  terms) are 0, not `0·∞ = NaN`: a `LLOQ` around `1e307` (CENS = 1) now scores the
+  row as certain, as #2762 already did for `1e300`.
+- **A cancel during a reconverged finite-difference gradient now returns promptly**
+  (#2776). The gradient's re-solves do not poll the cancel flag, so the #2406 resolution
+  gate kept growing a small θ's step through every remaining one, up to ~44 population
+  re-solves per floored coordinate. Once the fit is cancelled, the remaining probes are
+  now treated as missing and nothing more is solved. A `run_covariance` cancelled during its
+  stationarity gradient reports no Newton decrement rather than one taken on the part of
+  the gradient that finished.
+- **`method = gn` no longer collapses its trust region on a bound-active parameter**
+  (#2777): a parameter on its bound whose gradient points out of the box is held for the
+  iteration, and each step is judged against the reduction predicted for the step actually
+  taken after clamping. `examples/one_cpt_transit.ferx` under `method = gn` stopped on
+  "trust radius collapsed" at OFV 1513.94; it now ends at 1492.17 with no collapse. GN also
+  stops a single subject whose EBE response dominates the gradient from stalling the trust
+  region: after three unclamped rejections in a row that subject's raw score is used, with a
+  warning naming it.
+- **`[output] MIXNUM` on a `[mixture]` model now tables the class** (#2784): the
+  simulated class where the data were drawn under one, else the fitted `MIXEST`, as
+  NONMEM's `$TABLE MIXNUM` does and as `MIXNUM` reads in every expression. It used to
+  echo a data column of that name — silently, and blank on binary/TTE rows — or be
+  refused with `E_OUTPUT_UNKNOWN_COLUMN` when there was none. A data column named
+  `MIXNUM` now raises `W_OUTPUT_MIXNUM_IS_CLASS` from both `fit()` and `ferx check`,
+  on a simulated dataset the sdtab carries one `MIXNUM` column instead of two, and
+  `MIXNUM` / `MIXEST` are refused as `[derived]` names (`E_DERIVED_NAME_CONFLICT`).
+- **`converged: true` now requires a stationary point for FOCE, FOCEI, Laplace / AGQ and
+  Gauss–Newton fits** (#2785). The covariance step already measured the Newton decrement
+  `½·gᵀH⁻¹g` at a sampler's estimate; it now does so for these methods too, and a decrement
+  above 1 OFV unit (one standard error) reports `converged: false` with a
+  `W_NON_STATIONARY_OPTIMUM` warning naming the coordinates with the largest Newton steps,
+  in standard errors — whatever the optimizer's own stop said, including a bare NLopt
+  `Failure` the plateau check had accepted. The fit YAML and `FitResult` gain
+  `newton_decrement` and `optimizer_stop` (the NLopt stop state). A coordinate on a bound
+  its descent would leave through is held out of the test, and fits without an unfloored
+  covariance R (no covariance step, `covariance_method = s`, an eigenvalue floor) are not
+  tested.
+- The SDE (EKF) covariance step is now Crank–Nicolson, stable at every step length. It
+  was explicit Euler, which diverged for a diffused compartment with a rate above `1/Δt`
+  (e.g. an absorption `KA > 2` per hour), so SDE steady-state subjects declined to finite
+  differences under AGQ. SDE objective values move (#2786).
+- A modeled infusion rate driven toward zero under steady-state overlap no longer exhausts memory: the
+  count of still-running earlier pulses is now computed in closed form and only the stop times
+  inside the integrated span are listed, instead of materialising one per pulse (#2786).
+- A search tool's cached fit (`ferx modelsearch`/`covsearch`/… with `--resume`) whose results
+  contain a non-finite value (written to the cache as JSON `null`) now reloads with `NaN` there,
+  instead of being treated as unreadable and refitted (#2786).
+- **Steady-state doses with a modeled or moving infusion window have the right gradient** (#2786):
+  on the ODE steady-state run-in the infusion window's derivative was counted twice (also in the
+  lagged steady-state seed); the closed-form event walk did not guard a moving window-end order
+  (a FOCEI gradient 0.29 off); and the closed-form steady-state cycle dose dropped `F` (0.35 off).
+  An `SS=1` infusion under an estimated lag time on the closed-form walk now also gets the exact
+  gradient instead of finite differences.
+- **More models get exact gradients from compiled plans, and fewer fits fall back to finite
+  differences** (#2786): a per-CMT `obs_scale` on an ODE model (including under IOV) is now
+  served by the adjoint; a right-hand side that is not affine in the state declines the exact
+  linear path instead of condemning the subject; a lagged or estimated-window steady-state dose
+  keeps one plan across a fit instead of recording again at every point; coincident moving
+  infusion ends decline that point only; a steady-state call the recorder cannot take, and a
+  parameter-dependent gather index, now fail the recording instead of continuing with a
+  substituted state or `NaN`. The compiled `ln Γ` jets (`Exprel`, `LnGamma`) were `NaN` in a
+  compiled plan and are fixed.
+- The analytic gradient of a model whose ODE right-hand side reads `TAD`, dosed with a lagged
+  `SS=1` record, no longer drifts from the objective after the first dosing cycle: the
+  gradient's `TAD` clock re-anchors at every later steady-state cycle start through the same
+  rule the predictions use (#2786).
+- **Exact derivatives for models that used finite differences** (#2786): an ODE `if` whose
+  switch moves with a parameter but feeds only states nothing observed reads (e.g.
+  `examples/warfarin_ode_time.ferx`), an infusion into a compartment fed by a built-in
+  absorption kernel (also when its window moves: a rate-defined infusion under an estimated `F`,
+  a modeled `RATE=-1`/`-2` dose, or a compartment or per-route lag), and a lagged or modeled dose into a compartment switched on and off by
+  data rows. The SAEM M-step and VI ELBO fixed-η score of M3, TTE/binary/CTMM and `block_sigma`
+  models is the exact plan-based score.
+- **Steady-state infusions on a `TIME`-reading right-hand side get the exact window-length
+  derivative** (#2786): in the steady-state run-in the quiet leg's `TIME` restarts at the
+  infusion's end, which moves with the duration (`D{n}`, `zero_order(dur=)`); the plan held that
+  clock at the window's value, so the second derivative in the duration was wrong (0.63 relative
+  on a zero-order SS dose). Values are unchanged.
+- A FOCE/FOCEI/Laplace/AGQ subject whose empirical Bayes estimate sits off the mode with an indefinite or singular inner Hessian is now walked to the mode by damped Newton steps on the exact gradient and Hessian and given the exact outer gradient there, instead of a held-EBE or finite-difference score; a singular Hessian at a stationary mode uses the pseudo-inverse response (#2786).
+- FREM covariate rows under inter-occasion variability now have the exact inner Hessian the
+  Laplace/AGQ quadrature anchors on, instead of a finite-difference one. The exact-anchor
+  Hessian and the non-Gaussian curvature of FOCEI take a finite difference only where the plan
+  failed at a point the objective scores; every other decline is a point the objective repels
+  too. A subject whose gradient was taken after the mode polish has its polished empirical Bayes
+  estimate (and `H`) written back into the estimate store, so the next objective starts from the
+  mode the gradient differentiates; the quadrature objective is evaluated there too (#2786).
+- **SDE/EKF models take exact derivatives** (#2786): the likelihood no longer finite-differences
+  the state Jacobian. The filter is written once over a number type (`T = f64` for the value, the
+  recording type for plans) and takes the exact forward tangent of the compiled `[odes]` right-hand
+  side, with `p_obs` within 1e-10 (relative) of the finite-difference path it replaces. FOCE/FOCEI
+  outer and inner gradients and the inner Hessian are exact: the process-noise variance is recorded
+  as extra kernel rows with σ as plan inputs. AGQ/Laplace (the node predictions carry the variance
+  rows), the covariance R-matrix, the held-EBE and fixed-η scores, IOV, `[scaling]`/LTBS and
+  time-varying covariates are exact on an SDE model too, as are an SS dose, a modeled `RATE`/`D`
+  dose and a rate-defined infusion under an estimated `F` (the filter's moving window end carries
+  its derivatives through the mean solve's span and the covariance quadrature's sub-steps).
+- **SDE models with IOV: the EBE now minimises the objective the fit differentiates** (#2786): the
+  inner objective of an IOV subject on an SDE model omitted the extended Kalman filter's
+  process-noise variance that its marginal includes, so the EBE solved a slightly different
+  problem (a 1.4e-4 FOCEI gradient gap). Estimates of IOV + `[diffusion]` fits move accordingly.
+- **Closed-form PK is smooth where absorption meets a disposition rate** (#2786): the 1–3
+  compartment oral closed forms (single dose and steady state), the event-driven oral
+  propagators and the `[derived]` peripheral amounts switched to a L'Hôpital limit inside
+  `|KA − λ| < 1e-6` (`1e-9`, `1e-12` in places). Inside the band their derivatives were wrong
+  (the 1-cpt `∂C/∂KA` dropped a term; 100% error in the Hessian), just outside it the quotient
+  lost up to 6 digits, the 2/3-cpt propagators dropped the depot's contribution entirely, and
+  the peripheral amounts read 0. Each is now one smooth function through `KA = λ`, within 1e-13
+  of a 60-digit reference in value and 1e-11 in second derivatives. Infusion and
+  steady-state factors no longer lose digits at a slow elimination rate, and the 3-cpt rates'
+  derivatives no longer pass through `acos` (Hessian error at two roots 1.2% apart: 1.5e-6
+  before, 1.3e-7 now).
+- **Weibull and transit absorption with an estimated lag now get exact gradients** (#2786):
+  a `weibull()` or `transit()` bolus under a compartment `ALAG` or a per-route `lag=`, for every
+  shape (including `β < 1` and `0 < n < 1`, where the onset is singular), is served by the
+  analytic FOCE/FOCEI gradient instead of finite differences: the segment after a moving onset
+  is anchored at the true onset, and a Weibull with `β < 1` is integrated as the absorbed mass.
+  Predictions of every other model are unchanged; the framed Weibull's move only at the
+  integrator's tolerance (at most 7e-7 relative at `reltol = 1e-10`).
+- **Weibull and transit infusions under an estimated lag now get exact gradients** (#2786):
+  an infusion into a `weibull()` or `transit()` absorption compartment under a compartment
+  `ALAG` or a per-route `lag=` is served by the analytic FOCE/FOCEI gradient for every shape
+  (a `weibull` infusion used to fall back to finite differences, and a `transit` infusion with
+  `n < 1` was served with a gradient off by 4e-3): the segment after the lagged onset and
+  after the window end is anchored at the true boundary. Predictions are unchanged.
+- **`SS=1` infusions longer than their interval (`T_inf > II`) are at steady state on every
+  engine** (#2786): the closed-form event walk, the ODE solver and the SDE filter equilibrated
+  such a record to an empty system (−98% on a 2.5·`II` infusion), and only the analytical
+  superposition carried the overlapping pulses. Every engine now runs the `m` always-running
+  pulses through the cycle and carries the earlier pulses still infusing past the record, and
+  matches an exact pulse-train superposition (`nonmem_anchor/ss_infusion_overlap_*`) to
+  rounding. `W_STEADY_STATE_INFUSION` is retired.
+- **Coincident moving breaks get exact gradients** (#2786): two infusion window ends that land on
+  one instant under an estimated lag (`0+2` and `1+1` both shifted by the lag), a window
+  opening as another closes, a dose landing on a window end, a modeled `D`/`R` window end on a
+  fixed dose or window, a break on a reset or a covariate-change record, and a sample on
+  several coincident breaks are all served by the analytic FOCE/FOCEI gradient instead of
+  finite differences: the walk crosses every break of the group at its own jet, on the side of
+  a fixed record the value path puts it. Predictions of every model without such a
+  coincidence are unchanged.
+- **The exact gradient walks to the mode from any start** (#2786): a subject whose
+  random-effect estimate sat in a saddle region (an indefinite inner Hessian) used to be
+  given up after a few damped Newton steps, because the walk judged each step by the size
+  of the inner gradient, which grows along a downhill step off a saddle. It now also accepts
+  a step that descends the inner objective (the trapezoid estimate of its change), so the
+  analytic FOCE/FOCEI gradient is served instead of the held-estimate fallback. A lagged
+  Weibull or transit onset that lands on another event at the same instant is anchored like
+  any other, and its Hessian and covariance are exact (they were off by up to 1.7e2).
+- `ferx covsearch` no longer loses its backward phase on a model that reads `D1` by name for
+  `RATE=-2` doses: model edits now keep the dose attributes the engine reads by name (`D{n}` and
+  `R{n}` on analytic and ODE models, `F{n}` and `ALAG{n}` on ODE models), with their θ and random
+  effects, where they used to prune them as unused. A backward phase that ends with effects it
+  could not test now says so in the summary, the notes and `final.ferx`, instead of reading like
+  a completed search (#2789).
+- On data whose discrete-state records are all CTMM state rows, the `E_THETA_LEVEL_BINDING`
+  refusal for a `theta NAME[COL]` level block with no levels no longer advises reading the
+  block in a `[binary_model]` predictor or a DTMM transition. A CTMM row defines no level
+  whatever reads it, and its CMT has no other endpoint, so that advice could not be acted
+  on. The advice is now given only when the data has a record on a binary or DTMM endpoint;
+  otherwise the refusal says that no reader can define a level on this data. (#2808)
+- **Adaptive runs under a time-varying covariate or IOV no longer refuse a compartment
+  off row inside an `ADDL` train** (#2811): the off row stops the rest of the train, and
+  the run did that correctly, but the frozen-schedule check that every adaptive run
+  passes through still applied the cancelled doses, so it reported `frozen-schedule
+  replay verification failed` and returned no result. The same error came from a subject
+  built in memory with an off row at exactly a dose's time. Both now run. Results that
+  were returned before are unchanged.
+- **SIR and the profiled `covariance_method = s` step now hold a guard collapse as
+  `FIX`** (#2816): a variance the covariance step held on ferx's internal lower guard
+  (#2797) is no longer sampled by SIR (`fit()`'s SIR and `run_sir`), so its ESS, CIs and `SIR:` notes equal the same fit with that variance
+  `FIX`; and a profiled `covariance_method = s` fit now conditions the other standard
+  errors on it, as the unprofiled step already did, instead of reporting a marginal
+  matrix.
+- **A `.fitrx` bundle or `FitResult` JSON with an unknown `held_at_bound` reason or
+  parameter family now loads** (#2817). Before, the whole `load_fit` failed. A reason
+  added by a later ferx reads as `unknown` and the entry still shows its standard error
+  as `N/A`. An entry of an unknown parameter family is dropped. Only readers built from
+  this release on are protected.
+- A variance that the outer optimizer stopped just above its internal lower guard, while the
+  objective is lower on the guard, is now resumed from the guard instead of being reported
+  `converged = true` at a point that is not a minimum. This applies after every outer
+  optimizer; derivative-free BOBYQA is where it was seen. On a two-class `[mixture]` fit the
+  class-2 override used to stop 0.159 OFV above the optimum, and the resumed fit reaches it
+  with an `optimizer_health` warning naming the variance. A resumed run that ends no lower,
+  or that stops short of a guard again, leaves the fit `converged = false` (#2832).
+- **`ode_method = auto` no longer demotes a stiff segment back to `rk45` mid-way** (#2845):
+  the mid-segment switch is now one-way (explicit to stiff). A periodic re-probe that read a
+  relaxing binding mode as non-stiff used to swap the rest of the segment onto `rk45`, so on
+  stiff-ish TMDD models `auto` carried `rk45`'s OFV error and a θ-dependent jitter instead of
+  matching `rodas4`.
+- `n_iterations` now counts the one probe evaluation a fit spends when it stops with a θ on
+  the internal lower floor, also when the probe finds no lower objective and no restart
+  follows (a genuine boundary estimate). Before, that evaluation was counted only when a
+  restart followed. A probe that scores non-finite is counted too. No estimate changes (#2850).
+- **An explicit `optimizer = bobyqa` on a `[mixture]` model no longer warns that
+  it "was replaced by BOBYQA"** (#2852): BOBYQA is an optimizer the mixture path
+  runs, so the request was honoured all along and only the warning was wrong. The
+  fit itself is unchanged. An explicit `trust_region` (and, from the Rust API, the
+  built-in BFGS / L-BFGS) still runs under the optimizer `auto` resolves to on a
+  mixture and still says so,
+  now naming the requested optimizer as a model file spells it (`trust_region`,
+  not `TrustRegion`).
+- The positive Durbin–Watson warning on a compartment-free model whose occasions
+  follow one another in time (visits, study periods) now suggests
+  `correlation ar1(RHO) by ID`, a line whose block is the whole subject (#2858).
+  It used to suggest a line `by` "any data column that labels the group" and a
+  `level` with a kappa, on a model that already declares that grouping. Written
+  `by` the occasion column, the line cannot correlate rows of two occasions: with
+  one row per occasion it left the objective unchanged and the statistic `NaN`.
+  With a text `ID`, which a `by` column cannot read, the warning asks for a
+  numeric column with one value per subject, and the subject column is named as
+  the file spells it (`by id` for a header `id`). No estimate or objective
+  changes.
+- **The `inner_screen` descends from starts spread across its 32 lowest points** (#2863):
+  it descended from its three lowest Sobol points, and a larger screen puts more points
+  around the mode a subject already has, so all three descents could land back in it. The
+  starts are now up to three of the 32 lowest points, lowest first, each more than 0.5 from
+  those before it in the Ω⁻¹ metric, with at most the same number of descents. On
+  `data/two_cpt_oral_cov.csv` with the issue's model, `inner_restarts = 20,
+  inner_screen = 2000` now reaches the lower mode (OFV −913.67) that `inner_restarts = 8,
+  inner_screen = 400` finds, instead of stopping at −901.37. A larger screen is still not
+  guaranteed to reach a mode a smaller one does (`inner_screen = 4000` does not on that
+  fit). Every bundled example gives the same OFV as before.
+- **`gn_hybrid` and `vi` at `maxiter = 0` are checked like the other methods
+  that search** (#2865): both run a search whatever `maxiter` says, but the
+  start-side checks treated them as evaluation-only. A `theta` that starts
+  outside its own declared bounds (`E_THETA_INIT_OUTSIDE_BOUNDS`), a free
+  variance that starts on the lower rail (`E_OMEGA_INIT_AT_RAIL`) and a start
+  outside an internal rail (`W_INIT_OUTSIDE_BOUNDS`) are now reported for them
+  at `maxiter = 0`, as they already were with `maxiter > 0` and for `saem`,
+  `imp`, `impmap` and `bayes`.
+- **The documented default thread count now includes the two-worker floor**
+  (#2866): the `fit()` and `PoolPlan::from_budget` API docs and the "Fitting"
+  book page said "available cores minus one, capped at 8"; the default is
+  available cores minus one, at least two where two cores exist, capped at 8.
+  Documentation only, the count itself is unchanged.
+- **A finite-difference inner (EBE) gradient no longer stops the search short of the mode on an
+  adaptively integrated ODE model** (#2868). Under `gradient = fd`, or for a subject the analytic
+  recorders decline, the EBE search differenced the integrated objective with a step of
+  `1e-7·(1 + |η|)`, which read the jump between two adaptive step sequences as slope. On the
+  full-TMDD fixture of #2845 at the default tolerances that left the objective up to 109.3 OFV
+  above the analytic route's under `rk45` and 19.9 under `auto`, and 2.0 under `rodas4`. The
+  step is now `1e-3` at the default `ode_reltol`, as the FD Jacobian's is (#2701), and shrinks
+  as `ode_reltol^(1/3)` at a tighter tolerance; the worst points are 0.125, 0.0093 and 0.0059
+  OFV off.
+  `[odes]` models on the exact matrix-exponential path difference exactly as before, and so do
+  closed-form models, except where a transit or inverse-Gaussian absorption subject is solved
+  on its ODE twin: that solve integrates, so it takes the new step too.
+- **`sqrt` at a zero argument has one derivative on every engine** (#2892): the
+  outer adjoint, covariance step and non-Gaussian jets now treat `sqrt(x)` at
+  `x ≤ 0` (an exact zero, or a value floored there) as flat — zero derivative —
+  as the inner η gradient and Hessian already did, instead of producing an
+  `inf`/`NaN` jet that declined the subject to finite differences.
+- **An adaptive run now equals `predict()` on its realized doses plus a record at each
+  decision** (#2895). Every decision is a record: the interval that ends at a decision
+  runs under that decision's parameters, whether the controller doses or holds. Those are
+  κ of its own occasion under IOV, `TIME` at the decision, and a covariate row chosen by
+  the new `[adaptive_dosing]` key `decision_covariates = locf | nocb`
+  (`AdaptiveSimulateOptions::decision_covariates` in the programmatic API). The default,
+  `locf`, is the row the controller reads. Before, such an interval ran under the next
+  *data* record, however many decisions later. Trajectories, decisions and metrics change
+  for layouts with no data record on some decision. Under IOV they change by up to 2.1e-2
+  in the #2895 fixtures, where a sparse layout let most of the drawn κ have no effect.
+  With a time-varying covariate they change by 1.6e-2, and with a `TIME`-reading PK by
+  2.2e-4. An `ADDL`-implied dose that falls between a decision and the next data record
+  is now governed by the decision. `nocb` keeps the old covariate rule, though not the
+  old κ or `TIME`. A layout with a data record on every decision, including every shipped
+  example and mrgsolve anchor, does not change.
+- **Adaptive `round_to` no longer moves a dose that is already on the grid** (#2927).
+  The ties-up rounding used a tie nudge that grew with the dose's grid index and reached
+  half a step at `dose / round_to = 5e8` (`round_to = 0.000001` at a 500 mg dose), so
+  from there every placement moved an on-grid dose up one step. The tolerance is now sized
+  to the few ulps a tie actually misses by, and is capped below a half, so an on-grid dose
+  is a fixed point at every grid index. Ties still go up (`0.35` on a `0.1` grid gives
+  `0.4`), except a tie reached by a decrease of more than about 95% at a non-integer
+  percentage (`decrease 96.2%` from 250 at `round_to = 1` lands on 9, not 10): there the
+  percentage's own decimal error is larger than the tolerance. The threshold the
+  `W_ADAPTIVE_STEP_ABSORBED` warning reports for a very small `increase N%` follows: at `round_to = 1`, `increase 0.001%` now starts raising at
+  50000 (was 49996). Realistic regimens are unaffected.
+- `vpc_tte()` and `vpc_rtte()`: a Kaplan–Meier curve is now undefined past its last
+  time also when it has reached 0, on the observed side and in every replicate. Before,
+  a replicate that reached 0 still added a 0 to the band past its follow-up, which held
+  the band's lower edge at 0 late in the curve, so the observed curve could not fall
+  below it and the misses were one-sided. Late observed values that were 0 are now
+  `None`; a late band point is now `None` where fewer than `min_curves_for(probs)`
+  replicates are still followed up, and where enough are, its values can rise, since
+  the replicates past their follow-up no longer pull it toward 0. The public
+  `ferx_core::stats::km::KmCurve::at` returns `None` past the last time where it
+  returned `Some(0.0)` for a curve that had reached 0 (#2930).
+- **The "finite-difference inner gradients" warning no longer counts subjects with no
+  observations** (#2939 benchmark report): a subject with only dose and `EVID=2` records has a
+  prior-only inner problem and no data term to differentiate, but was counted as a
+  finite-difference subject, so the warning appeared on datasets with dose-only subjects (for
+  example "16 of 100 subjects") while every fit was on exact gradients.
+- Two-compartment closed-form models whose parameters change between records (a time-varying covariate, or `TIME` inside an individual parameter) and `EVID=4` + `SS=1` doses with `F` and `iiv_on_ruv` no longer fall back to finite differences (`W_PLAN_FD_FALLBACK`, "value read"); they take the exact plan gradient again (#2949).
+- **The BOBYQA θ/σ M-step of SAEM, IMP and IMPMAP runs to its tolerance** (#3001): BOBYQA's budget was
+  `mstep_maxiter·(n+1)` evaluations — a gradient method's accounting, of which BOBYQA's own
+  first `2n+1`-point design took most — so with many numerical θ nearly every M-step stopped on
+  the budget far from the maximiser (a nine-θ model: 126 −2 log L worse than its
+  mu-referenced fit). The budget is now a cap of 100 evaluations per interpolation point and the
+  solve stops on its tolerance — NLopt's rule, a decrease below `1e-7` relative to the
+  objective's size or below `1e-7` absolute, the same for BOBYQA and Newton, so an objective
+  near zero does not collapse the tolerance; `mstep_optimizer = lbfgs` and mixtures keep the old
+  budget.
+  Fits with several numerical θ cost up to about twice as many instructions and move toward
+  the maximum-likelihood estimate.
+- **`sqrt` in `[odes]` no longer sends subjects to finite differences** (#3002): the
+  compiled plan recorded the right-hand side's `sqrt` as branches on the sign of its
+  argument, and a branch is a guard, so a segment recorded at a positive argument
+  declined once the argument reached zero. On a QSS TMDD fit that was 23 of 36
+  subjects on `W_PLAN_FD_FALLBACK`, and the fit took 6.8× as long (485 s against
+  72 s, same OFV). It is now one total node with the interpreter's value and its
+  flat derivative, unguarded as `x^0.5` already was.
+- An IOV model whose subjects carry an analytic TTE / binary / CTMM / DTMM endpoint is no
+  longer reported as using finite-difference inner gradients: the EBE search already served
+  it exactly, only the route report and its `W_` warning said FD. The public inner loop and
+  `optimize_population` also give a nested-level population its level cells instead of
+  refusing every subject (#3004).
+- A CTMM subject whose trial point the objective repels (an intensity whose gap-scaled rate
+  overflows, an observed transition whose probability underflows, a negative off-diagonal
+  rate) no longer makes the fit report `W_PLAN_FD_FALLBACK`: one such line-search step used
+  to condemn the subject's plan for the rest of the fit (23 of 60 subjects on
+  `examples/ctmm_pd_2state.ferx` under L-BFGS). The point is declined, not counted as a
+  failed plan (#3004).
+- **A subject the analytic outer gradient declines at a trial point is no longer given the
+  biased held-EBE gradient** (#3004). It is re-solved to its EBE at that point and given the
+  exact adjoint gradient there (reconverged finite differences where that fails too), so every
+  step carries the EBE-response term, and the reported final gradient stays `analytic` when
+  every declined subject was served exactly. A profiled θ-level that log-packs, and the
+  fixed-η Jacobian of an SDE model, are served exactly as well.
+- A subject with a `RATE > 0` infusion into the compartment of an `igd()` input kernel is
+  now served by the exact derivative plans instead of falling back to finite differences
+  (`W_PLAN_FD_FALLBACK`, and a fit that ran for minutes at `maxiter = 2`); VI with
+  `vi_eta_grad = analytic` no longer declines such subjects (#3004).
+- A linear-ODE subject whose trial point overflows the matrix exponential's squaring (an
+  extreme η during the inner search) no longer makes the fit report `W_PLAN_FD_FALLBACK`:
+  the value path cannot score that point either, so its recording is declined, not counted
+  as a failed plan (#3004).
+- **A subject served exactly at its re-solved EBE is no longer reported as a fallback, and is given the mode its gradient was taken at** (#3004):
+  where the re-solve is polished inside the gradient pass, the polished mode (not the unpolished re-solve) is what
+  comes back, and on an evaluation that becomes the incumbent the store adopts it as the next warm start, so the
+  subject does not decline again from the same off-mode η̂ (a rejected trial point's modes are not kept, as for any
+  gradient pass, and a model with nested levels keeps its store unchanged). A fit whose declines were all served
+  exactly emits no outer-gradient fallback warning; a subject that contributed zero is described as such, with one
+  sentence for a repelled point and one for a point the #1520 guard dropped; and a mis-shaped IOV mixture class mode
+  no longer panics the gradient, nor does an IOV mixture gradient pair a warm-started η̂ with a cold κ̂.
+- An IOV subject carrying FREM rows is now reported as finite-difference in the inner-solve
+  route label and the FD-fallback warning, as its search already ran (#3004).
+- An IOV subject refused for its FREM rows is reported as that, and the non-Gaussian cause
+  names every record kind without an exact channel (#3004).
+- A variance that the outer optimizer threw far below its initial value, and left
+  there while the objective still falls as it rises, is no longer reported
+  `converged = true`. Variances are optimized on a log scale, where such a point
+  reads a near-zero gradient without being a minimum. On a linear C-QTc model the
+  default L-BFGS took ω²_slope from 600 to 0.006 and stopped 0.72 OFV above the
+  optimum. ferx now probes every free variance below 1/1000 of its initial value
+  and, when raising it lowers the objective, resumes the fit with it re-inflated to
+  its initial value. The C-QTc fit then reaches NONMEM's optimum (OFV 3326.8565,
+  ω²_slope 652) with an `optimizer_health` warning; a resumed run that ends no lower
+  or collapses again leaves the fit `converged = false` (#3005).
+- `{model}-fit.yaml` is valid YAML again for models with a theta level block and the
+  covariance step on: names such as `TEFF[TIME=0.5]` are now quoted inside flow lists
+  (`covariance_matrix.parameters`, `eta_names`, `profiled_blocks`, network
+  `inputs`/`outputs`), where `[` and `]` are structural, so R's `yaml` and PyYAML can read
+  the file (#3006).
+- **A fit whose event times move with the parameters no longer runs out of memory** (#3011):
+  with a modeled infusion duration (`RATE=-2`) carrying an ETA, every change in a subject's
+  event structure left another compiled-plan template cached for the rest of the fit, which
+  could exhaust memory before the first evaluation. A subject whose structure keeps changing now
+  keeps no templates, and each subject's template list is capped. Results are unchanged.
+- **A `[covariate_model]` block is now estimated exactly like the same relations written by
+  hand** (#3014). The block's own text was read as a use of the θ it declares, so its relation
+  θ looked shared outside their covariate groups. SAEM and IMP/IMPMAP then took the M-step that
+  keeps the data term, where the hand-written model of the same relations took the joint
+  M-step. A short seeded SAEM fit of the two spellings now agrees bit for bit; before, it
+  differed by 2.2 OFV units after six iterations. FOCE/FOCEI/Laplace estimates were not
+  affected.
+- **A covariate θ read by a named endpoint block is no longer treated as exclusive to its
+  covariate group** (#3014). The check scanned only unnamed blocks, so a θ read by a named
+  block (`[event_model death]`, `[binary_model …]`, …) as well as by a covariate mu-reference
+  looked read by the group alone. That is the condition under which SAEM and IMP/IMPMAP take
+  the joint M-step that leaves the θ's data term out. Named blocks now count as readers exactly
+  like their unnamed spelling. Models without such a shared θ are unaffected.
+- **An η read directly by another block is no longer treated as exclusive to its
+  mu-reference** (#3014). The η side of the exclusivity check walked only
+  `[individual_parameters]`, so a group whose η a hazard (`scale = TVS * exp(0.5 * ETA_CL)` in
+  `[event_model]`), an initial condition or an error model also read was still sent to SAEM's
+  and IMP/IMPMAP's joint M-step. That step re-centres the η and so moves the other block's
+  prediction while it treats the data term as constant. Such a group now takes the M-step that
+  keeps the data term, and an additive mu-reference (`V = TVV + ETA_V`) on such an η is
+  dropped. SAEM/IMP estimates of these models change. Where an additive mu-reference is
+  dropped, FOCE/FOCEI/Laplace lose it too: they warm-start each subject's inner η search
+  from it, so their estimates can move slightly. A `[mixture]` per-class `omega(k)` override
+  and a `[derived]` column name an η without reading it, and do not count.
+- **Runs under consecutive seeds no longer share random streams** (#3021): per-subject,
+  per-chain and per-start RNG streams (IMP and IMPMAP including mixture models, the
+  IMPMAP `mceta` random starts and the ISCALE pilot search, SAEM, SAEM conditional
+  distribution, Bayes chains, NPDE, multi-start) were seeded `seed + i`, so seed `s` subject `i` and seed
+  `s + 1` subject `i - 1` drew identically and a 5-seed IMP comparison shared 499 of 500
+  subject streams. They are now a 64-bit hash of `(seed, coordinates)`. Results at a fixed
+  seed are still reproducible but differ from earlier versions.
+- **Closed-form compartment states follow the predictions for an `SS=1` dose whose lag is
+  longer than `II`** (#3028). The states behind `[derived]` columns and the state outputs
+  wrapped the pre-arrival phase and merged the arrival into the steady state, where the
+  predictions (and NONMEM) clamp the phase and add the arriving dose on its own (#1121).
+  At a lag of 15 with `II = 12`, `[derived] CC = central` read up to 25× off `IPRED` before
+  the arrival. It now equals it. A readout of the oral depot reads the corrected depot,
+  with its exact gradient.
+- **Closed-form fits with a modeled infusion no longer leave subjects stuck at η = 0** (#3033):
+  when an EBE search tried a point far enough out that the modeled duration (`D = TVD·exp(η)`)
+  overflowed to infinity, the compiled plan recorded there treated the dose as no infusion and
+  went on serving every later point that way, so the subject's objective was wrong everywhere
+  and its search could not move. On the 60-subject `RATE=-2` NONMEM anchor this hit 41
+  subjects; the objective now matches NONMEM's.
+- **An ODE inner solve whose mode ties another point keeps the mode's predictions**
+  (#3042). When the mode scored bit-equal to a point one ulp from it, walked before or after
+  it, the solve could keep the other point, hand back no predictions and walk the mode again
+  later. Estimates are unchanged.
+- **An ODE fit no longer loses every analytic gradient to a rejected trial step** (#3065):
+  when an adaptive step's trial stage overshot into a region where the right-hand side
+  has no real value — a Hill term `(C/IC50)^GAMMA` with a fitted or fixed `GAMMA` at a
+  stage where `C` dipped below zero — the step was correctly rejected, but its `NaN`
+  stages still entered the derivative pass, so every subject's gradient came back `NaN`
+  and the fit fell back to per-subject reconverged finite differences on every
+  evaluation. On a stiff PK→neutropenia transit model (165 subjects) a FOCEI fit stalled
+  after its fourth evaluation; it now converges.
+- `[error_model]` refusals name what the user wrote: a `weight =` that reads `IPRED` (or
+  another out-of-scope name) is reported as a `weight =` expression, not as the
+  residual-magnitude expression it desugars into, and a `[structural_model]` name read
+  in a magnitude or weight is reported as a prediction-side name instead of an
+  undeclared covariate with advice to declare it in `[covariates]` (#3121).
+- **Laplace fit results report the stage optimizer and its gradient route** (#3123). An automatic L-BFGS stage is labeled as such, and BOBYQA reports an outer gradient of N/A.
+- SDE models (`[diffusion]`): the Extended Kalman Filter's measurement variance is now each
+  row's scored residual variance, so a custom magnitude (`proportional(SIGMA * THETA)`),
+  `weight =`, a `power(...)` exponent, `block_sigma` correlations and `iiv_on_ruv` reach the
+  filter's covariance. Before, the filter used the bare `sigma` variance for every row, so
+  every observation after a subject's first carried the wrong process-noise variance and the
+  objective was wrong for these models (3.6 OFV on the warfarin example with a doubled
+  magnitude). `block_sigma` with `[diffusion]` now takes finite-difference gradients until
+  #3127, so `optimizer = auto` picks BOBYQA for it unless it has more than 64 free
+  parameters (#3126).
+- **A `[data_selection]` rule that excludes one record no longer drops a whole binary, time-to-event
+  or count subject** (#3148). Such a subject has no Gaussian observations or doses, so the reader took
+  it for empty and discarded it with its surviving records: on `examples/binary_logistic.ferx`,
+  `ignore = FLAG == 1` on one record scored 59 subjects and an OFV 4.16 lower. A subject with doses
+  and endpoint rows whose concentrations are all excluded is no longer warned that it "contributes
+  nothing", and one whose doses are all excluded is now also warned when only endpoint rows remain.
+- **Per-subject OFV contributions now sum to the OFV under Laplace and AGQ** (#3149):
+  under `method = laplace` (any `n_agq`), `focei` with `n_agq > 1` and an `agq_eval_only`
+  readout, each subject's `ofv_contribution` (sdtab `EBE_OFV`, `ebes.csv`) was the
+  post-hoc FOCEI score, which does not sum to the quadrature OFV. It is now the subject's
+  own quadrature term. Other objectives (`bayes`, mixtures, SAEM and IMP readouts) still report
+  the post-hoc FOCE/FOCEI score, which need not sum to their OFV.
+- **L-BFGS and SLSQP no longer leave a turnover model's start on a collapsed point** (#3153): the cap
+  on the opening step divided the first gradient but not the objective, so NLopt's first line search
+  and first secant pair compared a raw objective with a slope `c` times smaller. On a one-state
+  turnover model with no random effects, L-BFGS then restarted on the raw gradient and stepped onto
+  its `1e-10` parameter guard, ending 1887 OFV above the optimum while reporting `Converged: YES`
+  (SLSQP, capped on every evaluation, ended 8000 above). NLopt now minimises `f / c` with gradient
+  `∇f / c` for the first leg, so the first step is unchanged and everything after it is consistent;
+  later legs use the unscaled objective. Every default L-BFGS fit whose first gradient is capped now
+  takes a slightly different path, neutral overall on 26 bundled models from two draws of 1,500 wide
+  random starts (118 -> 123 misses, 124 -> 120 misses; iterations fell about 2%). SLSQP changed more:
+  of 500 fits from random starts, misses fell 52 -> 42 and iterations about 46% (Linux).
+  `examples/warfarin_dcm.ferx` now declares `init`: with its bare output head a fit ended in very
+  different basins depending only on the optimizer's path (#2549), and the path changed here. With
+  `init`, 42 starts near it end below −1194 under either path.
+- **The `ode_method = auto` escalation note no longer offers `ode_method = rk45` as an equal choice**
+  (#3154). The segments it reports are the ones the stiffness probe judged stiff, so pinning the
+  explicit stepper integrates exactly those explicitly. On a quasi-steady-state model where every
+  segment escalated, following the old advice moved the OFV from −579.41 to 370882. The note now
+  says to name a stiff method (`rodas5p` or `rodas4`) to skip the probe, that it then runs every
+  segment, and what `rk45` can cost.
+- The documentation no longer says the `[covariate_model]` default inits and bounds are PsN's verbatim; it lists where they differ from PsN 5.7.2. (#3182)
+- The bootstrap documentation no longer claims feature parity with `PsN::bootstrap`; it describes the method as modelled on it and lists where it differs, and gives the confidence-interval sample-size condition correctly. (#3182)
+
+### Security
+- **The dependency tree no longer contains the unmaintained `unsafe-libyaml`**
+  (#2411, #2424): the test-only YAML parser moved from the deprecated
+  `serde_yaml` to `serde-saphyr`, clearing RUSTSEC-2024-0449 from `cargo audit`
+  on `Cargo.lock`. The shipped library and `ferx` binary never linked it.
+
+### Performance
+- **One exact gradient engine for every likelihood: the adjoint** (#486). FOCE, FOCEI,
+  Laplace and AGQ (either anchor), with or without IOV, now take their outer gradient
+  from a single reverse-mode identity: `Ψ = F − wᵀ∇_η l`, `w = H⁻¹∇_η F`, differentiated
+  at the EBE. It includes the EBE response exactly, and its cost no longer grows with the
+  number of θ or individual parameters. One recorder records every engine the forward
+  sensitivity provider served (closed-form, event walks, user ODEs including Rosenbrock,
+  compartment-free models, IOV and nested variability levels, mixtures, covariate NNs), with no
+  limit on θ; a subject's random effects (stacked `[η, κ]` under IOV) are capped at 24. The inner EBE loop, the AGQ anchors and the IOV linearization read their
+  η-Jacobians and Hessians from the same recorder, tape-free.
+  Measured fit wall time including the covariance step (release, interleaved A/B against
+  the previous release on 2 pinned cores, best of 7; same OFV to every printed digit):
+  `warfarin_ode_lagtime` 15.6 s → 6.4 s, `warfarin_ltbs` 0.75 s → 0.24 s, `warfarin_bloq`
+  0.06 s → 0.04 s, `warfarin` 0.12 s → 0.09 s; `one_cpt_iv`, `mm_oral` and `emax_pkpd`
+  within 4%. Small closed-form 2-/3-compartment fits remain slower (`two_cpt_oral_cov`
+  0.26 s → 0.33 s, `three_cpt_iv` 0.19 s → 0.23 s), narrowed from 1.5–1.7× by computing
+  their macro rates once per subject rather than per dose and observation.
+- **Faster covariate-NN fits** (#486). A `[covariate_nn]` network's output no longer gets
+  re-evaluated at every inner EBE step: it depends only on the weights and the subject's
+  covariates, so it is computed once per solve and kept off the derivative types. The
+  analytic R-matrix differentiates through the network's few outputs instead of every
+  weight. On the 141-weight `warfarin_dcm` example, a FOCEI fit runs about 3.5× faster
+  than before #486 and a Laplace fit about 3.8× faster. The covariance step's R matrix
+  goes from about 15 s to 0.3 s.
+- **Faster stiff `[odes]` fits** (#486). A Rosenbrock step's finite-difference Jacobian is
+  filled in one batched evaluation of the right-hand side instead of one evaluation per
+  state, with bit-identical results. An inner EBE search on an ODE objective also stops
+  backtracking once the step it would take is below the objective's resolution. On a
+  14-state PBPK model the cold EBE pass is 1.5× faster overall.
+- **Faster analytic covariance step** (#486). The exact R-matrix is now assembled by
+  reverse over forward: one taped first-order pass along eight tangent directions and one
+  reverse sweep per direction give eight Hessian columns, where the forward second-order
+  assembly spent a pass on every pair of four-direction blocks, and the mode response comes
+  from a single pass. Results agree with the previous assembly to ~1e-14. Measured
+  covariance step: 0.08 → 0.05–0.06 s on `two_cpt_oral_cov`, 0.07 → 0.05 s on `three_cpt_iv`,
+  0.31 → 0.08 s on the `[covariate_nn]` model `warfarin_dcm`.
+- **Nested variability levels fit on analytic gradients** (#1082): a model with more
+  than one `level` now takes the exact inner and outer gradients one-level IOV uses, on
+  compartment-free, closed-form and `[odes]` models, and `optimizer = auto` picks its
+  gradient-based choice. On the NONMEM-anchored three-level MBMA example a FOCEI fit from
+  an off-optimum start drops from 15.2 s to 1.2 s and now reaches NONMEM's optimum
+  (OFV 107.04357), where the finite-difference route stopped 0.06 higher. A closed-form
+  transit or inverse-Gaussian absorption model with nested levels stays on finite
+  differences and says so.
+- **Nested-level fits take the exact analytic covariance step** (#486). A model with
+  nested variability levels (#1082) differenced the reconverged OFV for its R-matrix; it now
+  takes the adjoint's exact one, which the finite-difference stencil agrees with to 1.5e-4.
+- **`simulate_with_uncertainty()` checks the model and data once per run, not once
+  per draw** (#1288): the simulate preconditions that read no parameter value
+  (dose routing, modeled `RATE`, closed-form absorption support and dosing,
+  time-varying covariates on a hazard) ran again for every uncertainty draw, about
+  3% of each draw's cost on a 1000-subject transit model. They now run once, at the
+  first draw that is simulated; the flip-flop check, which depends on the drawn
+  θ, still runs per draw. `simulate_with_options()` no longer runs them twice.
+- **Leaner ODE right-hand-side calls** (#1523): each evaluation of a `[odes]` block
+  no longer re-zeroes its scratch buffer when every value the program reads is
+  provably written first, and no longer computes `T`/`TAFD`/`TAD`/`MACHEPS` for a
+  model that never reads them. Results are bit-identical; ODE fits measured
+  2–3.5 % faster end to end (clofarabine, cyclophosphamide, busulfan).
+- **Closed-form transit and inverse-Gaussian models keep IOV and time-varying-covariate
+  subjects analytic** (#1560). `pk one_cpt_transit` / `two_cpt_transit` / `one_cpt_ig` /
+  `two_cpt_ig` subjects with IOV or a time-varying covariate used to run on the model's ODE
+  twin. They now run on an exact event-driven walk: the delivered amount is carried across
+  each record where the disposition changes, and each dose absorbs on its own record's
+  kernel. Predictions, EBE gradients and FOCE/FOCEI gradients are closed-form, with no ODE
+  solve. Per subject the walk is 3–4× faster than the twin at default ODE tolerances
+  (transit; IG 1.1–2.3×) and 12–30× faster at `ode_reltol = 1e-12`. It matches an
+  independent quadrature to 1e-14 and the twin to its tolerance. A subject still goes to
+  the twin if an interval's elimination reaches the absorption rate of any dose that has
+  arrived by then, even one long since absorbed (the flip-flop regime); if it has an SS
+  dose, an infusion or a `TIME`-dependent parameter; or if the walk could not serve its
+  gradient analytically (an IOV subject with 24 or more stacked random effects). Two side effects, for **non-IOV** TV-covariate subjects of
+  these models:
+  - `[derived]` expressions that read `compartments[i]` now evaluate to `NaN`, as
+    `W_DERIVED_CMT_TV_ANALYTICAL` already said. That is the rule for every analytical
+    TV-covariate subject. Until now these subjects silently received the ODE twin's state
+    vector under the closed form's compartment names, matched by position — `depot` read the
+    central amount;
+  - the covariance step takes the FD-of-OFV route, as for every other closed-form
+    TV-covariate model, instead of the twin's analytic one.
+
+  IOV subjects keep the analytic covariance step.
+- **Faster covariance step, and one per fit** (#1564). The exact R-matrix records its
+  second-order passes four directions at a time instead of eight, which costs less because a
+  pass's reverse sweep grows with the square of its width: the analytic covariance step
+  (and every other exact-Hessian use) runs 1.2–1.4× faster on #1564's benchmark kit. An
+  NLopt fit that retries or restarts (the #751 held-cap retry, a #1277 / #2093 restart) now
+  runs its covariance step once, on the attempt it reports, instead of once per attempt.
+- **ODE models with more than 12 individual parameters now use exact analytic gradients**
+  (#1661). Until now the whole fit ran on finite differences. Data-copied PK parameters,
+  constants and `F` scalings all count, so sequential PK/PD models crossed 12 on a small
+  `θ + η`. A reported 19-parameter PK/PD model evaluated about 4× faster, and its EBEs no
+  longer stopped short on a third of the subjects. Validated against NONMEM 7.5.1 on a
+  14-parameter myelosuppression model (`nonmem_anchor/wide_ode_myelo`). Since #486 the number
+  of individual parameters is not a limit at all.
+- **Labelling ETAs and kappas is linear in the number of intermediates** (#1674). The walk that
+  decides each random effect's scale followed every path through the intermediates, so a diamond
+  of them (`B = A + 1`, `C = A + 2`, `D = B + C`, ...) doubled its work per level: the parse took
+  11.7 s at depth 18. It now visits each assignment once, and the same parse takes 1.7 s.
+- **Mu-reference detection and the level-block funnel check are linear in the number of
+  intermediates** (#1684, #1676). Both followed every path through a diamond of intermediates
+  (`B = A + 1`, `C = A + 2`, `D = B + C`, ...): mu-reference detection copied every earlier
+  intermediate into each later line, and the level-block check re-walked each shared
+  intermediate once per path. On a 20-level diamond (debug build) a model with a level block
+  took 38.8 s to parse and now takes 1.1 s; one without took 5.1 s and now takes 1.1 s. A
+  diamond that ends up inside a recorded covariate group is the exception: the group stores its
+  typical value as the full tree, which is still exponential in the depth (#1699). Detected
+  mu-references, covariate groups and level-block results are unchanged.
+- **The closed-form log-normal η-chain check no longer rejects a parameter whose
+  η-free first definition is overwritten** (#1691). `CL = TVCL` followed by
+  `CL = TVCL * exp(ETA_CL)` is now recognised as a direct log-normal parameter. This
+  only corrects model metadata: since the adjoint gradient (#2093), no estimation path
+  reads this check, so fits, gradients and run times are unchanged.
+- **Parsing a deep diamond of `[individual_parameters]` intermediates is no longer
+  exponential** (#1699): the parser's symbolic ∂(individual parameter)/∂(θ, η)
+  partials, and the typical value it records for a covariate mu-reference
+  group (SAEM / IMP / IMPMAP / Bayes), now read an upstream intermediate by
+  reference instead of copying it into every line that uses it. A block where
+  each level reads the previous one twice (`B = X + 1`, `C = X + 2`,
+  `X' = B + C`) parses in time linear in its depth, where depth 30 used to run
+  out of memory.
+- **SIR on a `[mixture]` model warm-starts each draw's inner solves** (#1769). Every draw
+  used to solve all K × N per-class inner problems from η = 0; it now starts each class
+  from that class's η̂ at the estimates, which cuts the cost of one draw's objective about
+  tenfold (5.3 ms → 0.50 ms on a K = 2, N = 30 fit). The draw at the estimates is still
+  scored cold, so it still equals the fit's OFV exactly.
+- **Binding `theta NAME[COL, ...]` levels is linear in the records** (#1799). The binder
+  looked each record's level up by scanning the level table; it now hashes on the same key
+  the level-table check uses, so binding 200 studies × 10 times (2000 levels) drops from
+  1.6 ms to 0.4 ms. The indices written are unchanged.
+- **`covariance_method = s` skips the finite-difference `R` matrix entirely** (#1803):
+  `2n²` re-converged population objectives at `n` free parameters (8 at `n = 2`,
+  20,402 at `n = 101`), which the step used to evaluate and then throw away.
+- **FOCEI `n_agq > 1` covariance keeps more subjects on the analytic R-matrix** (#1844):
+  a subject is no longer sent to the per-subject finite-difference salvage
+  (`W_COV_ANALYTIC_SALVAGE`) just because one tail quadrature node has an indefinite
+  exact Hessian, which only the mode needs to be positive-definite. On
+  `two_cpt_oral_cov` at `n_agq = 3` that was 14 of 30 subjects; it is now none.
+  Standard errors move only within the finite-difference reference's own noise.
+- **The finite-difference covariance step no longer runs its setup on one thread** (#1935).
+  The step-size probe now evaluates its points in parallel. For non-mixture models, the base
+  reconvergence at the estimate also re-solves subjects in parallel, and so does the subset
+  base point on the per-subject salvage route. Mixture models keep their existing base point.
+  The probe's points are also no longer evaluated twice: they are the stencil's own diagonal
+  points, so the stencil now takes them from the probe. Without step halving, the step costs
+  one base objective plus `2·n_free²` perturbed ones, instead of `2·n_free + 2·n_free²`. On
+  `examples/three_cpt_iv_ode.ferx` with `analytic_cov_hessian = false` at 8 threads, the time
+  outside the stencil fell from 2.0–2.4 s to 0.4–0.5 s. The covariance matrix is unchanged:
+  that run's full-precision output matched the pre-change build bit for bit at 1 and 4
+  threads. With `verbose = true` the probe now prints `step probe k/N` progress lines, so the
+  wait before the first `Hessian k/N` line no longer looks like a hang.
+- **Exact analytic outer gradient for residuals correlated across rows** (#1960). A
+  FOCEI or FOCE subject whose residual covariance couples two observation rows — a
+  `block_sigma` pairing total and unbound assays at one time (or one `L2` group), or a
+  `correlation cs|ar1|car1(RHO) by COL` block — used to take a finite-difference outer
+  gradient that re-solved its random effects twice per estimated parameter at every
+  evaluation. It now takes the exact analytic gradient of the same dense-`R` objective,
+  `ρ` included, with no inner re-solve. Estimates and OFV are unchanged. On the
+  31-subject fluconazole total/unbound model, where every subject is paired, a FOCEI fit
+  takes 1.9 s instead of 23.9 s and a FOCE fit 4.5 s instead of 36.2 s (Linux arm64, one
+  thread), and the "used reconverged finite-difference outer gradients" warning no
+  longer appears. Such a residual combined with IOV, `iiv_on_ruv`, FREM, M3, a mixture,
+  an SDE, a non-Gaussian endpoint, or dosing the analytic sensitivities decline keeps
+  the reconverged finite-difference gradient for those subjects; combined with a custom
+  residual magnitude (`weight =`, `power(...)`) it still takes the finite-difference
+  gradient throughout, as before.
+- **A refused `theta NAME[COL]` block no longer takes time cubic in the subjects** (#1962):
+  when a level block absorbs a random effect, the binder's check for a contrast that
+  would rescue it coded each sum-to-zero level against its group's last level, one
+  population-wide column per level. It now works on the levels themselves and keeps
+  apart the one direction per group that the contrast removes. Refusals and their
+  messages are unchanged. On a 5-η two-compartment model with one study per subject,
+  the refusal at 1000 subjects drops from 19 s to 0.3 s.
+- **Faster analytic gradients for ODE models** (#1996): the expression interpreter
+  now updates second-order dual numbers in place instead of copying them, and
+  applies constants, covariates, `TIME` and variables directly. Results are
+  unchanged; an ODE + IOV FOCEI fit (busulfan, 1518 subjects) runs about 20%
+  faster.
+- **Faster ODE right-hand sides** (#2000): subexpressions of `[odes]` that read
+  only individual parameters (such as `Q/V1` or `CL/V`) are now computed once per
+  parameter set instead of at every integration stage. Results are unchanged; on
+  a busulfan ODE + IOV FOCEI fit this cuts a further ~5% of CPU time on top of
+  #1996.
+- `[binary_model]` endpoints now use an exact analytic inner (EBE) gradient instead of
+  finite differences: the logit predictor is compiled to a dual-evaluable program and
+  the Bernoulli score `(p − y)·∂lp/∂η` is added to the inner gradient, on endpoint-only
+  and joint PK + binary models alike. A subject that also carries a time-to-event or
+  count record keeps finite differences for its whole objective. The "N of M subjects
+  use finite-difference inner gradients" warning now counts the route each subject
+  actually takes, so it no longer flags endpoint-only binary/CTMM subjects that run
+  analytic, and now does flag joint-model subjects whose time-to-event term runs FD (#2024).
+- **IOV and nested-level fits rebuild less per evaluation** (#2037): a subject's
+  occasion layout is now built once per EBE search and passed to every objective,
+  prediction and sensitivity walk of it, instead of being rebuilt on each call. Results
+  are bit-identical; single-threaded full fits measured 15% faster on the three-level
+  nested-levels NONMEM anchor model and 13% faster on `warfarin_iov`.
+- **An ODE IOV subject with a dose that carries no occasion label now runs its EBE search
+  on the analytic inner gradient** (#2065). Such a dose is evaluated under κ = 0, as the
+  prediction always evaluated it; the ODE sensitivity walk used to decline it, so every
+  inner step of that subject ran on finite differences. Reachable only from a `Subject`
+  built in memory with fewer `dose_occasions` than doses — the CSV reader labels every
+  dose — so fits of data read from a file are bit-identical.
+- **An estimating fit no longer solves its initial estimate's EBEs cold twice** (#2076):
+  the optimizer's first evaluation now starts from the EBEs the flat-theta pre-flight
+  already found at the same point, instead of re-running the guarded inner multi-start
+  there. Applies when the pre-flight freezes no parameter, every subject converged in it,
+  and no `global_search` moves the start. The first evaluation's objective is unchanged;
+  the trajectory after it can differ at the level of optimizer noise.
+- **A subject whose first record is `EVID=3` or `EVID=4` no longer pays for a reset it
+  cannot have** (#2081). Such a reset re-seeds the state the solve starts from, so it is a
+  no-op, but it sent the subject's inner multi-start down the scan-every-coordinate arm. On
+  `examples/warfarin.ferx` with every first dose recoded `EVID=4`, the FOCE fit took 1.32×
+  as long as on the shipped data (1.36× on Linux x86_64); it now takes 1.02× (1.05×), with
+  the same estimates, standard errors and objective. NONMEM datasets often write every first
+  dose as `EVID=4`. A subject whose individual objective has more than one mode now
+  multi-starts as the same data written with `EVID=1` does, so its EBE, and with it the fit,
+  can differ from before (#2013: the scan arm can find a deeper mode).
+- **A `kappa` model with a residual `correlation` line takes the exact analytic gradient**
+  (#2101). One-level and nested-level IOV fits with `correlation cs|ar1|car1(RHO) by …`
+  used central differences of the OFV for the outer gradient, the EBE search and the
+  covariance step. The adjoint now differentiates the dense-`R` IOV marginal directly, on
+  FOCE and FOCEI, and the covariance step takes the exact R-matrix.
+- **A profiled θ level block solves its levels on the exact analytic gradient** (#2109):
+  wherever the outer gradient is analytic, the profile solve's Newton step now reads each
+  subject's level gradient from the adjoint, one recording per subject per step, instead
+  of `2k` EBE re-solves of central differences. Estimates and OFV are unchanged. On the
+  100-study × 8-visit placebo fixture the profiled fit with its covariance step takes
+  3.2 s instead of 6.2 s, and 7.3 s instead of 12.3 s under a global `sum_to_zero`
+  (Linux aarch64). Under `gradient = fd` the solve stays on finite differences; a subject
+  the adjoint cannot serve falls back to them and is reported in a warning.
+- **A profiled fit's covariance step is exact and no longer re-profiles a stencil** (#2109):
+  wherever the outer gradient is analytic (and `analytic_cov_hessian` is on), each subject's
+  Hessian over the structural parameters and its own levels comes from one adjoint block,
+  and the profile objective's Hessian is their Schur complement `A − BD⁻¹Bᵀ` instead of a
+  finite-difference stencil of `~2·nf²` population profile solves. The level blocks `D` and
+  `B` are exact too. On the 100-study × 8-visit placebo fixture the covariance step takes
+  0.09 s instead of 2.25 s, and 0.16 s instead of 3.56 s under a global `sum_to_zero`
+  (Linux aarch64). Profiled standard errors move by the stencil's truncation error (up to
+  ≈0.5% at the default `fd_hessian_step`) and now match the unprofiled fit's exact ones to
+  ~1e-8. Under `gradient = fd` or `analytic_cov_hessian = false` the step is unchanged;
+  a subject the adjoint cannot serve takes re-solved finite differences for its own blocks
+  only, the profile Hessian stays their Schur complement, and a warning says so.
+- **A profiled level block under a global `sum_to_zero` no longer costs the whole
+  block per subject** (#2135): the dependent level is solved as a bordered
+  constraint, so each subject is differenced over its own levels only. On the
+  100-study × 8-visit placebo fixture one profile evaluation drops from 85 s to
+  1.5 s and the fit, covariance step included, finishes in under two minutes
+  where it previously did not finish in 90.
+- ODE models solved exactly by the matrix exponential (linear `[odes]`, `ode_method = auto` or `linear`) skip multiplications by structural zeros in their exponential, propagation and LU kernels: up to 17% faster fits (transit_2cpt). Results are unchanged; the outer gradient can differ in its last bits, so a fit may take a different number of steps to the same optimum (#2210).
+- **IOV FOCE/FOCEI fits warm-start each outer evaluation's inner solves at the previous
+  whole mode** (#2261): the FOCE/FOCEI outer optimizers (NLopt, the built-in BFGS,
+  Gauss–Newton) now hand each subject its previous κ̂ together with η̂, instead of
+  restarting every occasion's κ at 0 on every outer evaluation after the first.
+- **SAEM, VI, SIR, the quadrature evaluation stage, profiled fits and the covariance step
+  warm-start an IOV subject's inner solves at its κ̂ too** (#2261): the final EBE solves of
+  SAEM and VI, the SIR draws (in the fit, the non-PD fallback and `run_sir`), the
+  `agq_eval_only` stage, the profile solve and its covariance, the covariance step's
+  reconverged points and the reconverged finite-difference gradients now start each
+  occasion's κ at the previous mode instead of 0.
+- The inner EBE solver now converges from a start next to the mode instead of falling back to
+  Nelder–Mead, on exact (non-ODE) objectives. A curvature pair from a short step updates the
+  BFGS metric, and a step whose gain is below the objective's rounding is verified by the
+  gradient. On `examples/warfarin` the inner objective evaluations fall from 143,927 to 18,424.
+  With IOV warm starts at the previous mode (η̂, κ̂), as #2261 makes them, `nested_levels_3`
+  falls from 100,960 to 16,879. (#2270)
+- **The near-zero identity-θ pre-flight no longer re-solves the inner loop per θ** (#2291).
+  The #2159 check, which decides whether an identity-packed θ started near zero is divided
+  by its own size, evaluated two re-solved objectives per candidate θ. When every subject
+  has the exact R-matrix, it now reads the same decision from the adjoint gradient and the
+  R-matrix's diagonal along the candidates, with no inner solve. On a 1,317-θ covariate
+  network the pre-flight took 68 s of an 87 s fit. Models outside that scope, mixtures
+  included, keep the probes.
+- **Faster exact gradients for covariate neural networks** (#2293). When a
+  `[covariate_nn]`'s weights reach the likelihood only through its outputs and its
+  inputs are constant within a subject, the adjoint gradient now records the
+  network's outputs instead of the whole network. It then pulls their sensitivities
+  back through the network in one ordinary backward pass, reusing the forward pass
+  that produced them. This applies under FOCE, FOCEI, Laplace and AGQ. The gradient
+  is the same to rounding. On `warfarin_dcm` one population gradient took 8.7 ms →
+  3.6 ms at 1,323 θ and 3.7 ms → 2.3 ms at 411 θ; models without a network are
+  unaffected.
+- **Faster exact gradients for models with many θ** (#2294). The adjoint gradient,
+  the covariance step's exact R-matrix and the AGQ scores now unpack the parameters
+  once per population instead of once per subject. Each per-subject unpack rebuilt
+  every θ's name, bounds, Ω and Σ, which on a 1,317-θ covariate network was about a
+  third of the gradient. Results are unchanged, and models with few θ are
+  unaffected.
+- **Bayes's final EBE pass on an IOV model starts each occasion at its posterior-mean κ**
+  (#2377), not at 0; before, only η was warm-started from the posterior mean. The pass
+  converges to the same modes either way (the returned κ̂ agree to ~1e-9).
+- **Laplace is 1.3–1.5× faster on models with several random effects** (#2422): the exact
+  inner Hessian that Laplace's objective and analytic gradient are built on is now assembled
+  by the chain rule through each observation's prediction, instead of by carrying full
+  second-order derivatives through every arithmetic step. Estimates are unchanged (bit-identical
+  on the NONMEM `LAPLACIAN` warfarin anchor); FOCEI is unaffected.
+- **A reactive window that diverges before the first dose is checked for a dose-clock
+  dependence at half the cost** (#2120). The check now reads only the window's start state:
+  its end state is non-finite whenever the check runs, so it was never evidence. No verdict
+  or message changes.
+- **FOCEI fits on models with many parameters are faster** (#2434): the outer gradient no
+  longer re-reads the full parameter set once per subject at every step. A FOCEI fit of a
+  147-parameter covariate-network model is 8% faster (0.91 s → 0.84 s, median); results are identical.
+- **The `ferx` command-line tool is faster** (#2435): it now uses the mimalloc memory
+  allocator instead of the system one. A single-threaded fit uses 10–22% less CPU on
+  most models, a multi-threaded fit or search runs up to 16% faster, and the rest are
+  unchanged within run-to-run noise. Estimates are identical. The process holds about
+  25 MB more resident memory, a fixed amount that does not grow over a long search. The
+  `ferx-core` library and the R package keep their own allocator.
+- **ODE fits are 1.1–1.4× faster, with identical results** (#2454). The ODE right-hand
+  side is compiled once to register code instead of being interpreted on every call, and
+  reads its states and parameters directly. A Rosenbrock (stiff) step on a stretch that
+  does not depend on time saves one right-hand-side evaluation, and small linear solves
+  are unrolled. Every estimate and objective value is bit-for-bit what it was. Measured on
+  one core: a 40-subject TMDD fit 365 s → 261 s, a fast-absorption Michaelis–Menten fit
+  494 s → 351 s, `mm_oral` 1.66 s → 1.21 s, `transit_savic` 1.64 s → 1.26 s; closed-form
+  models are unchanged.
+- **ODE fits are another 1.15–1.8× faster, with identical results** (#2456). The ODE
+  right-hand side is compiled to machine code (Cranelift) the first time a fit evaluates it,
+  for the solves, the stiff solvers' Jacobian columns and the inner gradient (`FERX_NO_RHS_JIT=1`
+  keeps the interpreter); the exact linear path computes its matrix exponentials without
+  per-product allocations and shares the work between sampling gaps a power of two apart,
+  and between segments of one thread with the same generator. Every estimate and objective value is
+  bit-for-bit what it was. Measured on one core: a 40-subject TMDD fit 285 s → 172 s, a
+  fast-absorption Michaelis–Menten fit 350 s → 197 s, `two_cpt_oral_ode` with `rk45`
+  30.9 s → 17.1 s, `mm_oral` 1.44 s → 1.00 s; closed-form models are unchanged.
+- **Exact derivatives of ODE models run on compiled code end to end** (#2468): the
+  integrators call the native right-hand side directly, the adjoint gradient's tape
+  records each right-hand-side call as one block with a compiled reverse pass, static
+  subjects solve their outer gradient and the covariance step's exact Hessian (the
+  analytic standard errors) in their few individual parameters rather than over every
+  random effect (one such solve per derivative pass), and SAEM and
+  VI score θ exactly in one solve instead of one per θ. Whole fits are 1.06–1.34× faster
+  on the example models and 1.3–1.8× on larger ones (an 8-state, 80-subject PK/PD fit:
+  337 s → 205 s); predictions, inner gradients and inner Hessians are unchanged bit for
+  bit.
+- **Leaner exact-derivative tapes** (#2481). The covariance step's R-matrix records each
+  tangent product as one fused tape node instead of three (values bit-identical, 1.17×
+  faster). The AGQ outer gradient no longer seeds its quadrature-node recordings in the
+  sweep that only reads the η-adjoint, and a reverse sweep whose node carries only a value
+  adjoint propagates it on the value lane alone: an ODE AGQ fit (`laplace`, `n_agq = 3`,
+  500 subjects) runs 1.90× faster, closed-form AGQ 1.03–1.10×. The outer gradient's tape
+  buffers are released on every worker when a fit ends, so a long-lived process (an R
+  session) no longer holds each thread's largest recording.
+- **Exact derivatives replace the remaining finite differences** (#2482): time-to-event, binary
+  and CTMM endpoints now have exact gradients under Laplace/AGQ (both anchors), in the
+  covariance step, in the Gauss–Newton/S-matrix scores and in the SAEM/IMP M-step, IOV
+  included; so do drug-driven CTMM generators, hazards reading `TIME`, the Gaussian rows of
+  steady-state subjects on joint PK-TTE models, mixtures with IOV or a block Ω (gradient and
+  covariance), and the final gradient of derivative-free fits. With a gradient optimizer,
+  time-to-event fits run 7–14× faster and binary, CTMM and joint PK-TTE fits 1.5–2× faster;
+  Gauss–Newton fits with an endpoint up to 2.9×. Only SDE models, `gradient = fd` and
+  out-of-scope subjects still use finite differences. Models without random effects (a binary
+  or CTMM model with no `omega`) no longer run an inner search per subject per evaluation.
+- **Tight-tolerance inner solves no longer stall at the mode** (#2497): at a tight
+  `inner_tol`, which is what the #2462 verification leg uses, an inner BFGS that has reached
+  its mode now stops after five steps that leave the objective unchanged and move the iterate
+  and the gradient by less than rounding-level thresholds, instead of repeating them to
+  `inner_maxiter`. When the Newton certificate shows that point is at its mode, the solve
+  skips the Nelder–Mead restart. This applies to IOV and non-IOV subjects alike, but not to
+  FREM. On the bundled examples the restart returns the same NLL and EBEs, bit for bit.
+  Measured on macOS arm64, with the same OFV to the six reported decimals: a
+  one-compartment IIV+IOV FOCEI fit drops from 15.4 s to 1.6 s, and a 3-compartment IV
+  FOCEI fit from 2.5 s to 0.85 s.
+- An unprofiled FOCE / FOCEI L-BFGS or SLSQP fit takes one verification leg, not two, when
+  that leg lowered the objective by no more than the 1e-3 noise floor. The second leg had
+  gained nothing in any measured case: at most 8.1e-9 on the A2 anchor, where results are
+  unchanged at all 80 starts. On the rifapentine benchmark it ran about 150 evaluations
+  and ended higher. When more than one leg runs, the fit now keeps the lowest leg's point,
+  with its optimizer gradient and EBE state, instead of the last one's (#2507).
+- **ODE models with IOV fit in ~4× fewer outer evaluations again under FOCE/FOCEI**
+  (#2508): since #2261 each evaluation's inner solves started at the previous one's κ̂,
+  which on an `[odes]` model made the objective depend on the optimizer's path and let a
+  far line-search point be rejected outright. On a 299-subject busulfan ODE + IOV fit the
+  outer L-BFGS took 234 evaluations (90 s); it now takes 63 (34 s) and ends at a lower
+  gradient. The outer loop restarts κ at 0 on ODE + IOV models (closed-form models keep
+  the κ̂ warm start), and an inner start rejected only because of its carried κ̂ is retried
+  from κ = 0 before the trial is rejected. The same fit's OFV, 0.06 above earlier releases
+  at the default `ode_reltol = 1e-4`, is integration error rather than a worse optimum:
+  the estimates agree to 4–6 significant figures, and at `ode_reltol = 1e-8` the fit
+  reaches 38033.661, which the earlier 38033.448 undershot by more than today's 38033.509
+  does.
+- Closed-form (analytic) model fits on data with time-varying covariates are faster: `$PK` is
+  now evaluated once per distinct set of record inputs (covariate values and occasion) and not
+  once per record. Analytic FOCE/FOCEI fits on a 100-subject, two-covariate benchmark run
+  about a third faster, and every result is bit-identical. ODE model fits, and models whose
+  individual parameters read `TIME`, get no speed-up (#2542).
+- **FOCE and FOCEI fits take up to 60% fewer outer iterations** (#2549): each evaluation now
+  starts its inner solves at the modes predicted for its own point, the first-order expansion
+  η̂ + (dη̂/dx)·Δx (Almquist Eq. 48), with the exact mode response formed from the outer
+  gradient's own recording. Measured against the previous release on the same machine:
+  1.2–4.0× fewer instructions per fit on BSV models (`mm` 4.0×, `ctmm_pd_2state` 3.6×,
+  `pktte_joint` 2.5×, `pk1` 2.3×, `pk2_big` 1.5×), at the same optimum.
+- **IOV fits and every cold inner solve are cheaper** (#2549): a warm IOV inner solve is seeded
+  with the stacked Gauss–Newton metric (`warfarin_iov` 5.9× fewer instructions per fit, its
+  solves no longer falling to Nelder–Mead); a cold solve's two metrics share one Sobol screen
+  (bit-identical, 1.13–1.24× on BSV fits); a TTE subject's endpoint term is recorded once for
+  the gradient and its mode response; and the per-evaluation buffers are reused instead of
+  reallocated.
+- **Laplace fits take predicted EBE warm starts** (#2549): the inner solves of
+  `method = laplace` now start at the modes predicted for the new point,
+  `η̂ + (dη̂/dx)·Δx`, with the exact mode response formed on the quadrature's own gradient tape.
+  On a hard fit it decides the result: Laplace on a 26-parameter, five-random-effect model
+  reaches OFV −3485.11 in 59 G instructions where it stopped at −3458.81 after 90 G. Laplace
+  and AGQ alike now form the exact inner Hessian once per subject and evaluation: the
+  objective's exact anchor and the next warm inner solve's seed both take it from the gradient
+  pass.
+- **Cheaper quadrature gradient sweeps** (#2549): the mode response's rows are swept over the
+  scalar tape together and read in place rather than copied per row, the second-order sweep
+  stops accumulating at the tangents when the second-order adjoints are zero, and the
+  dot-product and Taylor-polynomial rules no longer allocate per call.
+- Closed-form (analytic) FOCE/FOCEI fits on data with time-varying covariates are faster
+  again: the index of which records share a `$PK` evaluation is now built once per subject's
+  EBE search, not at every evaluation inside it. On a 100-subject, two-covariate benchmark
+  that is 10–15% less fit time, and every result is bit-identical. Fits without
+  time-varying covariates, and models whose individual parameters read `TIME`, do not
+  change (#2558).
+- **Faster covariance step and earlier plateau stop on models with held parameters**
+  (#2597): the analytic R-matrix used to differentiate along every packed
+  coordinate. It now goes along the free ones only, skipping `FIX` parameters and
+  the structural-zero Ω entries that sit beside a `block_omega`, which the
+  covariance step never read. Standard errors are unchanged, bit for bit. On a
+  6-η model with one 2 × 2 block, 34 coordinates come down to 18, and the
+  covariance step runs about 1.8× faster. The FOCE/FOCEI stagnation guard's window
+  is now sized in free coordinates too, so the same fit stops after 19 flat
+  evaluations instead of 35.
+- **The mid-leg basin probe no longer cuts every leg of a large fit short** (#2600).
+  The probe used to end the optimizer leg for a restart whenever a cold re-solve
+  beat the best objective by more than 0.05. On a large population a few subjects
+  almost always sit in a lower cold mode, so a 5,937-subject FOCEI fit had all five
+  legs cut at evaluation 32 and ended `converged: false` with |g|∞ = 16. Now a
+  probe restarts only when at least 1 % of the subjects switched mode. Below that,
+  the leg continues from their cold modes and keeps its L-BFGS memory. The
+  end-of-leg check and its `W_EBE_START_DEPENDENT` warning are unchanged.
+- **An inline `if` in `[odes]` no longer drops the model to the bytecode interpreter**
+  (#2680). Inline conditionals — and `min`, `max` and `clamp`, which are written as one — are
+  now compiled to register code and native code like the rest of the right-hand side, with
+  bit-identical predictions, inner gradients and inner Hessians. `warfarin_ode_time` fits
+  3.5× faster and an 8-state Friberg neutropenia model with an `if (rb < CIRC0)` feedback
+  evaluates 4.2× faster. Statement-level `if (…) { … }` blocks still use the interpreter.
+- **IMP and IMPMAP reuse each subject's event schedule** (#2687): the estimation
+  E-step and M-steps rebuilt it for every draw on subjects with time-varying
+  covariates. Results are unchanged.
+- A subject whose empirical Bayes estimate is exactly zero (no observations, or an η the model
+  never reads, such as a population-only dummy `omega ETA_DUMMY ~ 1.0 FIX`) no longer reruns
+  the cold inner multi-start at every outer evaluation, under any outer optimizer and in
+  mixture class solves. A profiled fit's start solve and a subject solved on the
+  inter-occasion-variability path still rerun it (#2899, #2900). Estimates and objective are unchanged. On `examples/mm_iv.ferx` made
+  population-only, the multi-starts per fit drop from 920 to 60 (default optimizer), 3440 to
+  100 (`slsqp`), 6060 to 40 (`trust_region`) and 6040 to 40 (`method = gn`), and the fit runs
+  2.4–6.6× faster on Linux x86_64 (#2688).
+- **`imp_auto` / `impmap_auto` no longer ramp the whole population for a subject more
+  draws cannot fix** (#2690): a subject whose ESS stays below 2 across a rise in the
+  sample count, or whose sampler failed, is left out of the decision to raise K and
+  named in the under-sampling warning. The warning's collapsed-proposal count now
+  also covers subjects whose weight sits on one draw, not only failed ones. Fits that
+  used `auto` can land on different numbers at the same seed.
+- **Cheaper exact outer gradients for FOCE/FOCEI and Laplace/AGQ** (#2706, #2704). When every
+  theta a model reads reaches it only through mu-referenced individual parameters
+  (`CL = TVCL * (WT/70)^TH_WT * exp(ETA_CL)`, each `ETA` used nowhere else), the FOCE/FOCEI
+  gradient reads those thetas' derivatives off the random effects' instead of recording the
+  solve for them: up to 25% fewer instructions per gradient on IOV models, 1–6% per fit on
+  closed-form models. Laplace/AGQ gradients drop one second-order backward pass when the
+  mode response is formed: 3–7% fewer instructions per fit. Estimates are unchanged to
+  round-off.
+- **A trial the EBE convergence guard is certain to reject stops solving subjects**
+  (#2709): once more than `max_unconverged_frac` of the subjects are unconverged, or one
+  is rejected at its inner start, the rest are not solved, since the rejection penalty
+  does not depend on them. The OFV, estimates and `converged` flag are bit-identical. On
+  nlmixr2data's `Infusion_2CPTMM` the fit goes from 241.8 s to 114.2 s (Linux x86_64, one
+  thread). The first evaluation and a run with no feasible evaluation still solve every
+  subject. On a stopped evaluation, `max_unconverged_subjects`, `total_ebe_fallbacks` and
+  `total_ebe_nm_polished` count the subjects that were solved, and
+  `ebe_convergence_warnings` counts the evaluation even where the full pass would have been
+  counted as a non-finite objective.
+- Exact linear ODE models (compartment models written in `[odes]`) propagate each segment through its eigen-decomposition instead of a Padé matrix exponential: 1.6–3.4× fewer instructions per fit (pk2_ode −71%), same estimates. Five-random-effect covariance steps no longer pad to an 8-wide Hessian (−18% covariance step), and a two-core machine now uses two workers by default (#2747).
+- **Closed-form event walks no longer rescan the whole dose list per interval** (#2754):
+  the analytic event-driven walk and its gradient twin index a subject's doses once
+  (sorted `SS=1` records, infusing doses, infusion breaks, arrivals) instead of
+  scanning every dose per interval, arrival and observation, so a walk is no longer
+  `O(n_doses²)`. Long dose histories with an estimated lag time, IOV or time-varying
+  covariates evaluate several times faster (measured ~4× at 200 doses per subject);
+  predictions and objective values are unchanged.
+- Linear ODE models in which most states are idle in any one stretch of time fit much faster.
+  A typical case is urine collected over intervals, with one accumulator per interval switched
+  on by a time-varying index. The exact linear solver used to take every state through its
+  matrix exponential, so its cost grew with the cube of the state count. It now leaves out the
+  states that neither change nor feed another state, and the gradient recording reports those
+  zeros as it does elsewhere. On an 18-state example (24 subjects, eight collection intervals)
+  a full fit with the covariance step takes 30 s instead of 181 s, with identical estimates,
+  standard errors and diagnostics. Elsewhere the gradient can move slightly, because it now
+  uses the same form of the exact solution as the objective function. On `emax_pkpd` that is
+  7.9e-13 relative, which takes the optimizer to the same optimum by a different path (#2760).
+- **Fits no longer pay for doses after a subject's last observation** (#2778). Dosing
+  records that run past the last scored record of any endpoint are left out of the likelihood
+  automatically, while the dataset, `[derived]` outputs, `predict()` and `simulate()` keep
+  them. On long-treatment datasets, where most doses can be of this kind, an ODE fit runs
+  an order of magnitude faster with the same objective. Models with a lag time keep every
+  dose, since the search can take a lag negative. Fits on time-varying-covariate and
+  IOV routes can differ from earlier releases around the ninth significant digit, and a
+  subject whose covariate varied only on those rows moves within ODE solver tolerance.
+- **Smaller binary and faster fits** (#2786): the shipped release binary is 27.0 MB (was
+  78.8 MB), and fits take about half the instructions (geometric mean -46% over 22 benchmark
+  fits, from -3% on SAEM to -82% on one-compartment ODE AGQ; Michaelis-Menten ODE -36%,
+  two-compartment ODE -62%, within-subject IOV -37%). Fit results are unchanged at printed
+  digits.
+- **Less one-time start-up work in a process** (#2786): the first Sobol draw of a process
+  (a FOCE/FOCEI random-effect screen, or an importance-sampling draw) built the direction
+  numbers of all 1000 dimensions although a model with up to 100 random effects reads the
+  first 100, which are the same numbers; it now builds the 100-row table. The
+  `[error_model]` parser no longer compiles its `correlation`, `iiv_on_ruv`, `log(DV)` and
+  `CMT=` regexes for a model with none of those lines. Both are one-time costs, so the
+  saving lands on a process's first fit: about 16M instructions (3% of a warfarin CLI run,
+  7% of a one-compartment IV run), with the same objective and estimates.
+- **Faster cold EBE solves under a strongly correlated `block_omega`** (#2788): the
+  `inner_restarts` axis seeds now move the correlated random effects by their
+  conditional mean, so each seed sits the intended 2–3 prior SDs out instead of far
+  across the prior's ridge. On a melphalan 2-compartment ODE model with
+  ρ(η_CL, η_V) ≈ 0.999, FOCEI went from 191 s to 13 s at the same OFV. Diagonal-Ω
+  models are unchanged. An ODE segment that starts from a non-finite state now
+  returns `NaN` without stepping.
+- **`sqrt` in `[odes]` now compiles to native code** (#2844): a right-hand side that calls
+  `sqrt(...)` (e.g. the quasi-steady-state TMDD free-drug root) no longer falls back to the
+  bytecode interpreter or reports `W_ODE_RHS_INTERPRETED`. Predictions are bit-identical to
+  the interpreter; a synthetic QSS-TMDD fit ran about 3× faster. Where the argument of an
+  `[odes]` `sqrt` is zero or negative, its derivative is now `0` instead of `NaN` on the
+  gradient paths.
+- **A profiled fit no longer re-scans a subject whose mode is exactly zero at every start
+  solve** (#2899). The profiled-levels start solve now treats the modes a previous solve
+  returned as warm starts, as the unprofiled drivers have since #2691. On the F1 profile
+  fixture with one subject that has no observations, a fit's inner multi-starts drop from
+  47 to 14, with the same estimates.
+- **An IOV subject whose random effects stay exactly zero is no longer re-scanned at every
+  evaluation** (#2900). Its inner multi-start now treats a mode an earlier pass returned as a
+  warm start, as the non-IOV solve has done since #2691. In a 10-subject `warfarin_iov` fit
+  where one subject's η and κ do not reach its predictions, that subject's multi-starts drop
+  from 134 to 0, with the same estimates.
+- **A mixture subject outside the analytic outer gradient no longer sends the whole
+  gradient to finite differences** (#2906): on a `[mixture]` model fitted with an NLopt
+  gradient optimizer, the in-scope (subject × class) terms keep their exact analytic
+  gradient and only the declined subject's terms are differenced, re-solving that one
+  subject's class modes. The decline is now reported by the "could not be given the exact
+  analytic outer gradient" warning, as it is for a single population.
+- **Fewer instructions per inner solve, ODE evaluation, covariance step and SAEM
+  iteration** (#2931): the dense BFGS inner solve updates its inverse Hessian in place for up
+  to five random effects, the exact derivative entries no longer rebuild and lift Omega's
+  inverse on every call (and reuse it per stacked width), the ODE value path makes fewer
+  copies and allocations, the covariance step's exact Hessian carries one tangent per pass,
+  each thread keeps a small table of the plans it looked up last so repeated plan lookups
+  skip the registry, and SAEM's covariate-group typical values read a per-subject covariate
+  snapshot. The gains are in instructions (`perf stat`, benchmark fits, `--threads 1`); fit
+  results, `sdtab` and covariance output are bit-identical.
+- **The exact covariance step is 1.5–4.5× cheaper, and ODE and many-design fits are faster**
+  (#2980): the R-matrix is assembled from per-observation scalars and a small recorded reduce
+  instead of differentiating the whole likelihood per direction, its plan inputs run through
+  a precomputed basis, and the compiled kernels run each subject's primal once and only the
+  tangents per direction. Measured in instructions on one thread against the previous release,
+  across FOCE, FOCEI, Laplace, FOCEI-AGQ and Laplace-AGQ on closed-form and ODE models: the
+  covariance step takes 0.22–0.66× (0.31–0.43× on AGQ; 0.43× per subject at 3000 subjects on a
+  two-compartment ODE model). Fits: a linear-ODE transit model 0.22× the cycles, a 932-design
+  model 0.71×, two-compartment ODE fits 0.83–0.86×. The smallest single-dose closed-form fits
+  pay 3–4% more. Estimates, objective values and standard errors are unchanged (to rounding).
+- **FOCE fits with many observations per subject are fast again past the Woodbury gate**
+  (#2988). Where a row's residual variance is tiny next to its η-sensitivity
+  (`1 + tr S > 1e6`), the outer gradient factored the subject's full observation-sized `R̃`,
+  which the compiled per-subject plans write out as `O(n³)` instructions. It now rotates each row into the
+  factor of `I + S` instead (`O(n)` in the observations, no cancellation). On an IOV
+  model with 100 and 200 one-hour infusions per subject, a fit takes 4.9 s and 12.7 s
+  instead of 52 s and 481 s (8.0 s and 31 s before #2939; Linux x86_64, `--threads 1`),
+  with the same OFV.
+- **The numerical θ/σ M-step of SAEM predicts once per solve** (#3001): the M-step's η/κ are
+  fixed within a solve and predictions never depend on σ, so every evaluation at an unchanged
+  θ — all of them in a σ-only M-step — now reuses one prediction pass per subject instead of
+  predicting again. A Newton solve that stalls drops a memo that follows θ before BOBYQA takes over (a memo
+  holding a pinned θ is kept: the continuation still hits it), and a subject's buffer grows
+  with the samples scored, never with the sample count. IMP and IMPMAP do the same under
+  `mstep_optimizer = newton | lbfgs` only: their
+  `imp_samples` (1000 by default, up to 10 000 under auto-sampling) per subject would keep
+  `subjects × samples × n_obs` numbers, several times the estimator's own state, and a
+  default fit does not grow by that. Outputs are bit-identical (fit file and sdtab
+  byte-for-byte, 90 fits); whole SAEM fits take 1.3–2.0× fewer instructions on the benchmarks
+  with a numerical M-step (1.33× `pk1`, 1.96× `pk1_ode`, 1.31× `pk1_sparse`, 1.42× `pk2_big`,
+  1.37× `wiov`).
+- **`mstep_optimizer = newton` fused pass reads the information's Jacobian off one forward
+  pass** (#3001): the per-observation `∂f/∂θ` rows the expected information is built from came
+  from one reverse sweep per observation (about 50× the cost of a value pass on a small ODE
+  model, and most of a Newton M-step); they now come from one forward pass carrying one tangent
+  per free θ whenever there are no more free θ than observations, with the score the weights'
+  contraction of those rows and no kept forward or second sweep. Exact to rounding (same
+  discrete trajectory as the reverse sweeps); BOBYQA fits are bit-identical. The same rows serve
+  `mstep_solver = score_sa`, which reads the information too: its fits (4 models with numerical θ
+  × 5 seeds) are identical to every printed digit to the reverse sweeps' and cost 15–40 % fewer
+  instructions. SAEM `newton` fits
+  of a 1-state ODE model run in 27 % of the instructions, a Michaelis–Menten ODE model 45 %,
+  four-θ closed-form models 77 %.
+- **Modified-release models take their exact derivatives from the closed form, not the ODE twin**
+  (#3001): a static `[odes]` model absorbed through `first_order` / `transit` / `igd` /
+  `zero_order` forcings (parallel, mixed or per-route-lagged, 1- or 2-compartment) is
+  *predicted* in closed form, but the compiled plan behind every exact derivative (the
+  Newton M-step, the FOCE/FOCEI/Laplace/AGQ outer and inner gradients, the inner Hessian and
+  the covariance step) recorded the integration of its ODE twin, an adaptive solver loop
+  with tangents about 10 times the cost of a value pass. The plan now records the one generic
+  closed-form kernel the value path runs, so its values are the value path's bits and it holds
+  no solver loop. FOCEI fits of the parallel, per-route-lag, mixed and zero-order examples run
+  in 27 %, 13 %, 22 % and 33 % of the instructions, and an SAEM `newton` fit of a
+  two-route model in 70 %. The incomplete-gamma partials the `igd` closed form needs are
+  closed form too (`x`-derivatives) or from the series' own recurrences (`a`-derivatives).
+  FOCE-family objectives on these models move by up to about 1e-2 OFV (2e-2 at one point
+  measured, 8.7e-3 at a fit's end): `∂f/∂η` in the objective is now the exact derivative of the
+  closed-form prediction, no longer carrying the ODE twin's integration error at `ode_reltol`.
+  At a tight `ode_reltol = 1e-12` the old code gives the same OFV and iterates as the new
+  one at the default (per-route-lag: -882.350329, 60 iterations, identical final gradient), so
+  the new fits are the converged ones and no longer depend on `ode_reltol`. The NONMEM anchors
+  (`TOL=9`) are unchanged to 2e-6. A fit may now report `optimizer_stop: Failure` where it
+  reported `XtolReached` / `FtolReached`: that is the EBE-noise-limited line search of the
+  converged fit (with `inner_tol = 1e-9` it stops on `FtolReached`), which the old
+  integration error had been ending early.
+- **Faster fits when infusion end times move with the parameters** (#3010): with a modeled
+  infusion duration (`RATE=-2`) carrying an ETA, the EBE search recorded a whole new compiled
+  plan for every trial point whose infusion end had crossed an observation, only to read one
+  objective value from it. Those points are now computed by the ordinary predictor, which gives
+  the same values; the 156-subject case that motivated this goes from 479 s to 183 s, with the
+  same estimates.
+- **Less memory for fits that compile many plans** (#3010): each compiled kernel now keeps only
+  the instructions it runs, dropping bookkeeping that is needed only while the kernel is being
+  built. On the 156-subject modeled-infusion case that motivated this, peak memory goes from
+  3.1 GB to 2.4 GB, with identical results and the same run time.
+- **Much faster, leaner fits when infusion end times move with the parameters** (#3010): on a
+  linear `[odes]` model, an infusion whose duration or rate is modeled (`RATE=-2`/`-1`, or an
+  `F`-scaled rate-defined one) no longer forces a new compiled plan each time its end moves
+  past an observation; one plan now serves both sides. The 156-subject modeled-infusion case
+  that motivated this fits in 39 s instead of 142 s, at 1.4 GB peak memory instead of 3.1 GB,
+  with the same estimates.
+- **Closed-form models no longer recompile a subject when a modeled infusion end crosses an
+  observation** (#3033): the analytic PK models (`pk one_cpt_iv`, `two_cpt_*`, `three_cpt_*`)
+  now get the treatment #3010 gave linear `[odes]` models. An infusion whose duration or rate
+  is modeled (`RATE=-2`/`-1`, or an `F`-scaled rate-defined one) is served by one compiled
+  plan on both sides of an observation, instead of a new plan each time an EBE search moves its
+  end past one. Estimates are unchanged.
+- **A correlated residual no longer exhausts memory in the analytic gradient** (#3060):
+  under `correlation <kind>(RHO) by COL` or a `block_sigma` pair across observations,
+  FOCEI's exact gradient factored each subject's residual covariance as one dense
+  `n × n` matrix, recording work cubic in the subject's observations into its compiled
+  kernel. A subject with 84 paired observations took gigabytes and seconds of compile,
+  and a 67-subject fit was killed past 8 GB before its first evaluation. The covariance
+  is now factored block by block — the groups the correlation actually couples — with
+  identical results: that fit now converges in under a minute on 4 threads.
+- **Less memory for ODE fits on the analytic gradient path** (#3076): `fit()`
+  no longer re-runs a second-order sensitivity solve per subject after the fit
+  just to read the `auto_stiff_rejected_jets` solver counter. That solve went
+  through the same compiled plans as the fit's gradients, whose ODE loops cannot
+  take the jet decision, so the counter always read 0. It is still reported, and
+  is still 0 on a fit. Compiled kernels also drop their intermediate code once
+  they reach their final compilation tier. Results are bit-identical.
+- **Post-fit phases no longer stack their memory on top of estimation** (#3077): the compiled
+  derivative plans a fit records are now released at each phase boundary — after estimation,
+  around the covariance step and around the ODE tolerance settle check — together with the pool
+  workers' cached buffers. On a 9-state stiff ODE PK/PD model (150 subjects, 11 random effects)
+  the peak memory footprint of a full fit fell from 4.6 GB to 4.1 GB, with bit-identical
+  estimates, objective and tables; later phases pay a few seconds to re-record their plans.
+- **Exact-gradient ODE fits keep far smaller step logs** (#3078): the reverse pass
+  of a compiled ODE plan no longer needs every right-hand-side, stage, Jacobian and
+  accept body's inputs logged for every step. The log now keeps a checkpoint — the
+  lanes a step reads that it did not compute itself — and the reverse runs each step
+  forward again from it, giving bit-identical derivatives. On small stiff fixtures the
+  log is 8–11× smaller (Rosenbrock) and 4–6× (explicit steppers); results are
+  unchanged to the last bit.
+- **ODE fits hold one copy of each loop call's slot tables** (#3079). The index tables an ODE
+  segment's compiled kernels read through depend only on the segment's shape, but every subject's
+  plan kept its own copy at every layout: on a 150-subject, 9-state stiff model they peaked at
+  658 MB against 0.34 MB distinct. They are now shared, with results unchanged bit for bit.
+- **IOV EBE search scores value and gradient in one pass** (#3088). On a closed-form IOV
+  model the inner search now reads the objective's value from the same pass that takes its
+  stacked `[η, κ]` gradient, as the non-IOV search already did: the gradient pass's value
+  enters the objective memo, and the line search's full-step trial runs one pass for both,
+  instead of walking the subject again. The value is bit-equal to the native IOV objective
+  under both the FOCE (frozen) and FOCEI (conditional) residual variance; nested levels,
+  dense residual correlations, censored, FREM, SDE and non-Gaussian records keep the native
+  objective. Whole-fit instruction counts (callgrind, one thread; same OFV and θ to every
+  printed digit): `warfarin_iov` FOCE −2.1%, FOCEI −4.6%; `warfarin_iov_ode_bloq` −2.0%
+  (from the objective memo alone).
+- **IOV EBE search allocates less per gradient** (#3088, #3090). The IOV inner gradient
+  reuses one buffer of per-observation `∂f/∂(η, κ)` rows for the whole EBE search, as the
+  non-IOV inner loop already did, and computes the block-diagonal `Ω⁻¹` prior without
+  copying vectors or submatrices on each call. Whole-fit instruction counts (callgrind,
+  one thread; same OFV and θ to every printed digit): `warfarin_iov` −3.3%,
+  `warfarin_iov_ode_bloq` −1.5%.
+- **FOCEI fits that visit hopeless outer trials on an adaptively integrated ODE model no longer
+  pay for the finite-difference step of #2868 there** (#3145). Where a solve behind the
+  finite-difference inner (EBE) gradient runs out of steps, the gradient uses the `1e-7` step
+  again. On an 8-state `ode_method = auto` model whose inner gradient is otherwise exact, the
+  longer step let more searches of such a trial converge, so the EBE guard took longer to
+  reject it and the fit took about 60% more time for identical results.
+- **Per-subject passes balance better across few threads** (#3216). Subjects are now split
+  into fixed-size chunks (about 16 per thread) that idle threads can always steal, instead of
+  rayon's adaptive split, which could leave one thread working through a long run of subjects
+  alone. FOCEI on a 1,518-subject ODE+IOV model on 2 threads went from 277 s to 210 s
+  (1.43× to 1.88× over one thread); results are unchanged.
+
 ## [0.4.0] - 2026-09-25
 
 **Upgrading from 0.3.1.** Most of this release is fixes, but a few changes can stop an
@@ -7457,7 +13289,8 @@ and `git log v0.1.0..v0.1.5` for details.
 Initial tagged release. See the
 [GitHub release](https://github.com/FeRx-NLME/ferx-core/releases/tag/v0.1.0).
 
-[Unreleased]: https://github.com/FeRx-NLME/ferx-core/compare/v0.4.0...HEAD
+[Unreleased]: https://github.com/FeRx-NLME/ferx-core/compare/v0.5.0...HEAD
+[0.5.0]: https://github.com/FeRx-NLME/ferx-core/compare/v0.4.0...v0.5.0
 [0.4.0]: https://github.com/FeRx-NLME/ferx-core/compare/v0.3.1...v0.4.0
 [0.3.1]: https://github.com/FeRx-NLME/ferx-core/compare/v0.3.0...v0.3.1
 [0.3.0]: https://github.com/FeRx-NLME/ferx-core/compare/v0.2.0...v0.3.0

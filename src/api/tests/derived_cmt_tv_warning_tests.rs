@@ -225,6 +225,30 @@ fn analytical_msg(cause: &str) -> String {
     )
 }
 
+fn transit_model(cl: &str) -> CompiledModel {
+    parse_model_string(&format!(
+        r#"
+[parameters]
+  theta TVCL(2.0, 0.01, 50.0)
+  theta TVV(20.0, 0.1, 500.0)
+  omega ETA_CL ~ 0.09
+  sigma PROP ~ 0.01
+[individual_parameters]
+  {cl}
+  V  = TVV
+  NTR = 3.0
+  MTT = 1.0
+[structural_model]
+  pk one_cpt_transit(cl=CL, v=V, n=NTR, mtt=MTT)
+[error_model]
+  DV ~ proportional(PROP)
+[derived]
+  c0 = compartments[0]
+"#
+    ))
+    .expect("the transit test model must parse")
+}
+
 /// The ODE cells with exact states warn about nothing: a reset alone, and an `[odes]`
 /// RHS that reads time, route to the event-driven pass but under one snapshot.
 #[test]
@@ -283,6 +307,26 @@ fn analytical_cells() {
     let (_, states) =
         crate::pk::compute_predictions_with_states(&time, &s, &time.default_params.theta, &[0.0]);
     assert!(states.is_empty(), "TIME-reading analytical states must be empty");
+}
+
+/// A closed-form transit model whose `CL` reads `TIME` is served by its ODE twin, which has no
+/// states in the closed form's layout (#1580): the subject gets `_TWIN_ANALYTICAL` and not
+/// also `_TV_ODE`, which would say the same states are approximate. Without the `continue`
+/// after the twin is flagged, both fire.
+#[test]
+fn twin_served_time_subject_gets_only_the_twin_warning() {
+    let m = transit_model(CL_TIME);
+    assert!(m.ode_spec.is_none() && m.effective_for(&subject(NONE)).ode_spec.is_some());
+    assert_eq!(
+        warnings_for(&m, &[NONE]),
+        vec![
+            "W_DERIVED_CMT_TWIN_ANALYTICAL: closed-form transit/IG model with subjects its ODE \
+             equivalent serves (for example a steady-state or infusion dose, a TIME-reading \
+             parameter, or the flip-flop regime) — compartment states are not available for \
+             those subjects; [derived] expressions that reference compartments[i] evaluate to \
+             NaN for them."
+        ]
+    );
 }
 
 /// An IOV subject is skipped — its states are empty under `W_DERIVED_CMT_IOV_UNSUPPORTED`.

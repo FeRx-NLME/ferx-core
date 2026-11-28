@@ -58,8 +58,9 @@
 
 use super::simulate::simulate_with_options_impl;
 use super::vpc_tte::{
-    build_strata, check_band_options, checked_record, duplicate_id, no_record, refuse, resolve_cmt,
-    stratum_grid, stratum_value, Entry, VpcCensoring, VpcGrid, VpcStratify,
+    build_strata, check_band_options, checked_record, duplicate_id, empty_stratum_warning,
+    no_record, refuse, resolve_cmt, stratum_grid, stratum_value, Entry, VpcCensoring, VpcGrid,
+    VpcStratify,
 };
 use super::{SimulateOptions, SimulationResult};
 use crate::diagnostics::EngineError;
@@ -130,7 +131,7 @@ pub struct RtteOrderBand {
     pub n_subjects: usize,
     pub observed: KmCurve,
     pub grid: Vec<f64>,
-    /// The observed curve on the grid (`None` past its last time unless it reached 0).
+    /// The observed curve on the grid (`None` past its last time, also where it reached 0).
     pub obs_on_grid: Vec<Option<f64>>,
     pub lo: Vec<Option<f64>>,
     pub med: Vec<Option<f64>>,
@@ -182,7 +183,8 @@ pub struct RtteVpc {
     pub strata: Vec<RtteVpcStratum>,
     /// The warning of this check about the data's follow-up on `[0, H]`
     /// (`W_VPC_RTTE_ENDS_ON_EVENT`), then the simulator's (a degenerate recurrent
-    /// hazard, …).
+    /// hazard, …), then `W_VPC_EMPTY_STRATUM` per stratum with no MCF band at any grid
+    /// time.
     pub warnings: Vec<String>,
 }
 
@@ -470,6 +472,17 @@ pub fn vpc_rtte(
             rep_mcf.iter().map(|c| c.time.as_slice()),
         );
         let band = vpc_band_mcf(&rep_mcf, &grid, probs).expect(PROBS_OK);
+        // The MCF band only: every absolute and gap curve ends at or before its
+        // replicate's follow-up end, so they are empty whenever the MCF band is.
+        warnings.extend(empty_stratum_warning(
+            WHO,
+            &label,
+            &grid,
+            &band.n_used,
+            probs,
+            rep_mcf.iter().map(|c| c.time.as_slice()),
+            None,
+        ));
         let mcf = RtteMcfBand {
             obs_on_grid: grid.iter().map(|&t| obs_mcf.at(t)).collect(),
             observed: obs_mcf,

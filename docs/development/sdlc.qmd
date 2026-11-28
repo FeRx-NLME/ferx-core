@@ -269,6 +269,7 @@ after each major feature) and not yet on GitHub — a known gap to formalize.
 | `changelog.yml` | PR, incl. label changes | `Changelog fragment` — a PR touching user-facing source must add a `changelog.d/` fragment or carry the `no-changelog` label |
 | `slow-tests.yml` | nightly 06:00 UTC, Sundays 07:00 UTC (`full-nn`), manual, push to `main` touching the suite's inputs | Tier-3 fits to convergence on `--profile ci-test`: `Slow regression tests (core k/4)` (the whole workspace suite split over four runners by `tools/ci-test-shard.py`, #2182), `Slow regression tests (core)` (the one verdict over the four shards), `Slow regression tests (nn)` (the lib unit tests and `tools/slow-nn-tests.txt` with `nn` on), `Slow regression tests (nn test set)`; on Sundays `full-nn k/4` instead — see [Slow tests, sharded](#slow-tests-sharded) |
 | `golden-fits.yml` | nightly 04:30 UTC, manual | `Golden fit set (Linux)`: the reference models of `tools/golden-fits/models.tsv` fitted at the last release and at head, diffed into the job summary; report-only until 2026-12-07, then fails outside the measured band — see [Golden fit set](golden-fits.qmd) |
+| `peak-memory.yml` | nightly 05:00 UTC, manual | `Peak memory (Linux)`: the shipped (`--release`, mimalloc) `ferx` binary's peak RSS on the synthetic 9-state stiff ODE probe `tools/peak-memory/stiff_pkpd.ferx`, for one evaluation and a short fit with the covariance step; fails on growth beyond 25 % over `tools/peak-memory/baseline.json` — see [Peak-memory probe](peak-memory.qmd) |
 | `mutants.yml` | nightly 01:30 UTC, manual | cargo-mutants over the previous UTC day's merges to `main`: `Plan mutants`, `Mutants (k/N)` (N sized from the selection), `Mutants summary` (survivors as `file:line` + mutation in the job summary; an untested tail goes to a follow-up pass on the same commit); report-only — see [Nightly mutants](#nightly-mutants) |
 | `docs.yml` | push to `main` touching `docs/**` | `quarto render` → deploy to `gh-pages` |
 | `release.yml` | tag `v*` or manual | GitHub release with generated notes |
@@ -598,10 +599,12 @@ cache warm. `rust-toolchain.toml` still pins nightly as the default, and `Check`
 ### 8.7 The public-API gate
 
 The repo is a cargo workspace: the root package is the `ferx-core` **library**,
-with `crates/ferx-tools` (multi-fit tooling — bootstrap, covariate search,
-cross-validation) and `crates/ferx-cli` (the `ferx` binary) stacked on top. The
+with `crates/ferx-tools` (multi-fit tooling — bootstrap, GAM screening),
+`crates/ferx-search` (model-space search) and `crates/ferx-cli` (the `ferx`
+binary) stacked on top. The
 boundary rule is *`ferx-core` = one model, one dataset, one fit; `ferx-tools` =
-many fits*. Statistical kernels stay in core; orchestration of repeated fits does
+many fits of a given model; `ferx-search` = many fits over a space of models*, and
+the dependency runs `ferx-search` → `ferx-tools` → `ferx-core` only. Statistical kernels stay in core; orchestration of repeated fits does
 not.
 
 Members can only reach `ferx-core` through its `pub` API, so the way that
@@ -618,7 +621,7 @@ tools/update-public-api.sh --check  # what CI runs
 
 `#[doc(hidden)]` is banned outright (`tests/public_api_boundary.rs`): `cargo
 public-api` omits such items, so the attribute is a working bypass of this gate,
-not a style question. And anything `ferx-tools` needs must also be reachable from
+not a style question. And anything a member needs must also be reachable from
 ferx-r, which consumes `ferx-core` as an ordinary external crate — an API that
 only makes sense "because we're in the same workspace" is the wrong API.
 
@@ -668,7 +671,7 @@ Trunk-based, so a release is a **tag on `main`**:
 
 1. Confirm `main` is green (CI), ferx-core ↔ ferx-r are in sync, docs are
    current, and the relevant `Cargo.toml` / `DESCRIPTION` versions are bumped.
-   *(Current: ferx-core `0.4.0`, ferx-r `0.4.0`.)*
+   *(Current: ferx-core `0.5.0`, ferx-r `0.4.0`.)*
    Assemble the changelog in the same release PR:
    `tools/changelog.sh assemble X.Y.Z` writes the `changelog.d/` fragments
    into `CHANGELOG.md` under `## [X.Y.Z] - <date>`, updates the compare links
@@ -694,7 +697,9 @@ Trunk-based, so a release is a **tag on `main`**:
    cargo publish --workspace --exclude docs-lint --dry-run   # then without --dry-run
    ```
 
-   Cargo publishes `ferx-core` → `ferx-tools` → `ferx-cli` in dependency order.
+   Cargo publishes `ferx-core` → `ferx-tools` → `ferx-search` → `ferx-cli` in
+   dependency order. `ferx-search` is LGPL-3.0-or-later, the others MIT (#3183);
+   `tools/preflight.sh licenses` checks that each tarball carries its texts.
    A published version can be yanked but never replaced, so check the dry-run's
    file list (`cargo package -p <crate> --list`) first.
 
@@ -719,8 +724,8 @@ form. User-facing breaking changes also carry **migration notes** (PR template).
 
 **Distribution.** Releases are **GitHub releases** built by `release.yml` on
 each `vX.Y.Z` tag. Since `0.4.0`, `ferx-core`, `ferx-tools` and `ferx-cli` are
-also published to **crates.io** (step 5 above); `docs-lint` is `publish =
-false`. ferx-r is installed from source / GitHub (`R CMD INSTALL`, e.g.
+also published to **crates.io** (step 5 above), joined by `ferx-search` from
+0.5.0; `docs-lint` and `patterns-lint` are `publish = false`. ferx-r is installed from source / GitHub (`R CMD INSTALL`, e.g.
 `remotes::install_github`). If we later publish to a CRAN-style channel, add
 that step here.
 

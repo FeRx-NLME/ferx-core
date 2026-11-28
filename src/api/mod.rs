@@ -9,11 +9,13 @@ use rand::RngExt;
 use std::path::Path;
 
 // ── validation subsystem (extracted verbatim; see src/api/validation.rs) ──
-mod validation;
+pub(crate) mod validation;
 // `check_covariates` / `check_kappa_weights` / `check_residual_magnitude` are the
 // *parts* of `check_simulation_data` (#1083). Production now calls the bundle, so
 // the parts are re-exported for the unit tests that pin each one's message
 // individually — hence the allow, which would otherwise fire on a non-test build.
+#[allow(unused_imports)]
+pub(crate) use crate::occasions::apply_iov_occasion_rule;
 #[cfg(feature = "markov")]
 pub(crate) use validation::check_ctmm_time_dependent_pk_diags;
 pub(crate) use validation::{
@@ -24,15 +26,14 @@ pub(crate) use validation::{
 };
 #[allow(unused_imports)]
 pub(crate) use validation::{
-    apply_iov_occasion_rule, check_absorption_closed_form_support,
-    check_absorption_closed_form_support_diags, check_absorption_dosing,
-    check_absorption_flip_flop_no_twin, check_absorption_flip_flop_no_twin_diags,
-    check_analytic_readout_support, check_covariate_levels, check_covariate_model_bound,
-    check_covariates, check_dose_compartments, check_endpoint_routing, check_kappa_weights,
-    check_level_index_columns, check_modeled_dose_rates, check_ode_method_linear,
-    check_packed_start_in_box, check_residual_magnitude, check_simulation_data,
-    check_unbound_theta_levels, check_variance_init_rails, unbound_level_refusal, LevelDataEntry,
-    UnboundLevelsEntry,
+    check_absorption_closed_form_support, check_absorption_closed_form_support_diags,
+    check_absorption_dosing, check_absorption_flip_flop_no_twin,
+    check_absorption_flip_flop_no_twin_diags, check_analytic_readout_support,
+    check_covariate_levels, check_covariate_model_bound, check_covariates, check_dose_compartments,
+    check_endpoint_routing, check_kappa_weights, check_level_index_columns,
+    check_modeled_dose_rates, check_ode_method_linear, check_packed_start_in_box,
+    check_residual_magnitude, check_simulation_data, check_unbound_theta_levels,
+    check_variance_init_rails, unbound_level_refusal, LevelDataEntry, UnboundLevelsEntry,
 };
 pub use validation::{
     check_experimental_features, check_model_data, check_model_data_rule,
@@ -52,18 +53,19 @@ pub(crate) use validation::check_survival_time_dependent_pk;
 
 // ── production submodules (peeled from this file) ──
 mod adaptive;
+mod adaptive_contrast;
+mod adaptive_decomposition;
 mod adaptive_inputs;
-mod covariate_stats;
-mod entry_refusals;
+mod adaptive_summary;
 mod fit;
-mod levels;
 mod output_columns;
-mod pool;
 pub(crate) mod postfit;
 mod predict;
 mod run;
 mod scoring_horizon;
 mod simulate;
+#[cfg(feature = "survival")]
+mod vpc_cif;
 #[cfg(feature = "survival")]
 mod vpc_kmmc;
 #[cfg(feature = "survival")]
@@ -71,45 +73,43 @@ mod vpc_rtte;
 #[cfg(feature = "survival")]
 mod vpc_tte;
 
+pub use crate::covariate_stats::{assert_covariate_model_bound, bind_covariate_stats};
+pub(crate) use crate::entry_refusals::{adaptive_spec, adaptive_unsupported_diag};
 pub use adaptive::{
     simulate_adaptive, simulate_adaptive_from_spec, simulate_adaptive_from_spec_with_inputs,
-    simulate_adaptive_with_inputs, AdaptiveSimulateOptions, AdaptiveSimulationResult,
-    DrawnParameters,
+    simulate_adaptive_with_inputs, AdaptiveRunManifest, AdaptiveSimulateOptions,
+    AdaptiveSimulationResult, DrawnParameters,
+};
+pub use adaptive_contrast::{
+    decompose_contrast, summarize_contrast, AdaptiveArmLabels, AdaptiveContrast,
+};
+pub use adaptive_decomposition::{
+    decompose_adaptive, AdaptiveComponentStatus, AdaptiveDecomposition, AdaptiveDecompositionSkip,
+    AdaptiveVarianceComponent, AdaptiveVarianceLayer, AdaptiveVarianceScope,
 };
 pub use adaptive_inputs::{AdaptiveInputs, SuppliedEtas, UncertaintySpec, UnmatchedSubjects};
-pub(crate) use covariate_stats::check_stats_on;
-pub use covariate_stats::{assert_covariate_model_bound, bind_covariate_stats};
-#[cfg(feature = "survival")]
-pub(crate) use entry_refusals::npde_tte_input;
-pub(crate) use entry_refusals::{
-    adaptive_spec, adaptive_unsupported_diag, fit_input_changed, fit_input_missing,
-    fit_input_model, level_mixed_with_iov_rule, logit_theta_out_of_range, param_shape,
-    sir_nothing_to_sample, sir_options, theta_length,
+pub use adaptive_summary::{
+    summarize_adaptive, AdaptiveBandStatus, AdaptivePopulationSummary, AdaptivePredictionInterval,
+    AdaptiveQuantiles, AdaptiveSummaryBand, AdaptiveSummaryMetric, AdaptiveSummaryOptions,
+    AdaptiveSummaryRow, AdaptiveSummaryStatistic,
 };
 pub use fit::{fit, fit_from_files};
-pub(crate) use validation::check_level_labels;
+// The fit-scoped pools live at the crate root (#3041); `api` keeps their public paths.
+pub(crate) use crate::pool::install_on_fit_pool;
+pub use crate::pool::{
+    configure_global_thread_pool, install_on_engine_pool, PoolPlan, FIT_RAYON_STACK_SIZE,
+};
+
 // Deprecated in favour of `bind_from_fit` (#1619); kept for callers pinned to it.
 #[allow(deprecated)]
-pub use levels::bind_theta_levels_from_fit;
-pub(crate) use levels::{
-    active_levels, bind_from_fit_on, rsr_one_subject_levels_warning, write_fitted_level_columns,
-};
-pub use levels::{
+pub use crate::levels::bind_theta_levels_from_fit;
+pub use crate::levels::{
     bind_from_fit, bind_theta_levels, layout_from_fit, level_map as theta_level_map,
     theta_level_values, ThetaLevelValue,
 };
+pub(crate) use crate::levels::{bind_from_fit_on, rsr_one_subject_levels_warning};
 pub use output_columns::tafd_tad_for_subject;
 pub(crate) use output_columns::{compute_extra_output_columns, trapezoid};
-pub use pool::{
-    configure_global_thread_pool, install_on_engine_pool, PoolPlan, FIT_RAYON_STACK_SIZE,
-};
-pub(crate) use pool::{
-    install_on_fit_pool, parallelize_cheap_subject_pass, with_fit_scope, with_fit_scope_ode,
-};
-// Reached only from tests (the fit paths call these from inside `pool` itself), but `pool` is
-// private to `api`, so a test elsewhere in the crate needs the re-export.
-#[cfg(test)]
-pub(crate) use pool::{default_fit_pool, fit_scope_pool};
 // The fit path reaches these through `kappa_shrinkages` (#1911); the shrinkage tests
 // call them directly.
 pub(crate) use postfit::{
@@ -125,8 +125,7 @@ pub(crate) use postfit::{
     profiled_bound_report, rebuild_warnings_structured, refresh_held_at_bound_report,
     refresh_profiled_bound_report, report_resolved_levels, resolve_covariance_status,
     resolve_sir_fallback, runaway_guard_warning_for, sir_unavailable_warning, solver_stats_scope,
-    stalled_at_init_warning, step_held, sweep_sensitivity_solver_stats, with_solver_stats,
-    ContributionSource, SolverStatsPhase,
+    stalled_at_init_warning, step_held, with_solver_stats, ContributionSource, SolverStatsPhase,
 };
 #[cfg(test)]
 pub(crate) use postfit::{
@@ -153,6 +152,8 @@ pub use run::{
 pub(crate) use simulate::check_theta_length;
 #[cfg(feature = "survival")]
 pub(crate) use simulate::simulate_with_options_tallied;
+#[cfg(feature = "survival")]
+pub use vpc_cif::{vpc_cif, CifCauseBand, CifVpc, CifVpcBand, CifVpcStratum, VpcCifOptions};
 #[cfg(feature = "survival")]
 pub use vpc_kmmc::{vpc_kmmc, KmmcVpc, KmmcVpcStratum, VpcKmmcOptions};
 #[cfg(feature = "survival")]
@@ -190,23 +191,23 @@ pub use simulate::{
 // ── test-support re-exports (reached via `super::` from the relocated
 //    #[cfg(test)] test siblings; production code uses these items in place) ──
 #[cfg(test)]
+pub(crate) use crate::pool::{
+    cap_default_threads, default_thread_count, effective_default_threads, fit_thread_warnings_with,
+    reconfiguration_result, resolve_default_threads, resolve_fit_threads, thread_warnings,
+    ThreadSource,
+};
+#[cfg(test)]
 pub(crate) use adaptive::{
     pk_bits_eq, reject_selected_error_for_adaptive, reject_unsupported_adaptive,
     verify_adaptive_snapshots,
 };
-pub(crate) use fit::fitted_population;
 #[cfg(test)]
 pub(crate) use fit::{
     dw_autocorrelation_warning, multistart_prefers, per_start_options, per_start_seed,
     perturb_init, saem_active_covariate_group_etas, saem_active_mixture_switched_etas,
     saem_non_mu_referenced_individual_params_warning, select_start, DwAdvice, SubjectLine,
 };
-#[cfg(test)]
-pub(crate) use pool::{
-    cap_default_threads, default_thread_count, effective_default_threads, fit_thread_warnings_with,
-    reconfiguration_result, resolve_default_threads, resolve_fit_threads, thread_warnings,
-    ThreadSource,
-};
+pub(crate) use fit::{fitted_population, stage_optimizer_request};
 #[cfg(test)]
 pub(crate) use postfit::{
     diagnostic_details, high_correlation_pairs, packed_guard_side, should_run_sir_fallback,
@@ -260,12 +261,7 @@ pub(crate) fn model_preds(
 
 // ── Step 7: [output] validation and TAFD/TAD helpers ────────────────────────
 
-/// Mandatory sdtab column names that are always written — declaring them in
-/// [output] is allowed but produces a W_OUTPUT_DUPLICATE warning.
-const OUTPUT_MANDATORY: &[&str] = &[
-    "ID", "TIME", "DV", "CENS", "OCC", "CMT", "PRED", "IPRED", "CWRES", "IWRES", "NPDE", "NPD",
-    "EPRED", "PWRES", "EWRES", "EBE_OFV", "N_OBS", "TAFD", "TAD",
-];
+use crate::model_checks::OUTPUT_MANDATORY;
 
 // ── Step 8: post-fit extra column computation ────────────────────────────────
 
@@ -569,6 +565,17 @@ mod tests_derived_iov_kappa;
 #[cfg(test)]
 #[path = "tests/adaptive_sim_tests.rs"]
 mod adaptive_sim_tests;
+
+// ── Tests: the population summary, bands and prediction interval (#946 PR2) ──
+#[cfg(test)]
+#[path = "tests/adaptive_contrast_tests.rs"]
+mod adaptive_contrast_tests;
+#[cfg(test)]
+#[path = "tests/adaptive_decomposition_tests.rs"]
+mod adaptive_decomposition_tests;
+#[cfg(test)]
+#[path = "tests/adaptive_summary_tests.rs"]
+mod adaptive_summary_tests;
 
 // ── Tests: under IOV every decision is a record (#2895) ──
 #[cfg(test)]

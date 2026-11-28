@@ -338,9 +338,9 @@ A bare sigma name keeps the legacy behaviour exactly ($m_k \equiv 1$).
   whose magnitude it scales.
 - The magnitude may depend only on `TIME`, declared covariates, thetas, and the
   scaled sigma (and on η-free names assigned in `[individual_parameters]`, see
-  [below](#magnitude-indiv-names)). It may **not** depend on a random effect (η), on an individual
-  parameter, or on the prediction (`IPRED`/`PRED`/`DV`) — the multiplier must be
-  independent of the inner empirical-Bayes loop. `TAD` — the data-derived time
+  [below](#magnitude-indiv-names)), and on the individual prediction `IPRED`
+  ([below](#magnitude-ipred)). It may **not** depend on a random effect (η), on an
+  η-dependent individual parameter, on `PRED` or on `DV`. `TAD` — the data-derived time
   after dose, steady-state aware, no lag time (#1182) — is available beside
   `TIME`; `TAFD` is not. `TAD` groups a dose and an observation at the same
   `TIME` as Pharmpy's `add_time_after_dose` does: the observation belongs to
@@ -386,6 +386,74 @@ A bare sigma name keeps the legacy behaviour exactly ($m_k \equiv 1$).
   finite-difference fallback — correct, just slower. A magnitude built only from
   covariates and `TIME` — including every `weight =` model — has no direct-θ
   channel at all, and keeps the fast closed forms everywhere.
+
+### Reading the prediction (`IPRED`) {#magnitude-ipred}
+
+> **Maturity: experimental** ([#3121](https://github.com/FeRx-NLME/ferx-core/issues/3121)).
+
+A magnitude may read `IPRED`, so the residual SD can be any function of the prediction,
+not only the built-in loadings (`proportional`, `combined`, [`power`](#power)). This is
+the usual residual for arm-level summary data in model-based meta-analysis, where the SD
+of an arm mean models the within-arm SD as a function of the response and divides it
+by √N. The NONMEM `$ERROR`
+
+```nonmem
+W = THETA(8)*EXP(THETA(9)*IPRED)/SQRT(NIND)
+Y = IPRED + W*EPS(1)          ; $SIGMA 1 FIX
+```
+
+is, in ferx:
+
+```
+[parameters]
+  theta A(1.0, 0.01, 100.0)
+  theta B(0.1, -5.0, 5.0)
+  sigma EPS ~ 1.0 (variance) FIX
+
+[error_model]
+  DV ~ additive(EPS * A * exp(B * IPRED) / sqrt(NIND))
+```
+
+The magnitude `h(IPRED, TIME, covariates, θ)` multiplies its sigma's loading, so the
+variance contribution is `(loading · h · σ)²`.
+
+- **Scale.** `IPRED` is the natural-scale prediction, as NONMEM's `IPR`. Under
+  log-transform-both-sides (`log(DV) ~ …`), where the residual is scored on the log
+  prediction, `IPRED` reads its exponential (floored as the LTBS log is).
+- **Operators.** Around `IPRED` an expression may use `+ - * / ^`, `exp`, `log`, `sqrt`,
+  `abs` and `inv_logit`; anything else (`floor`, an inline `if`, `min`, `max`, …) is
+  refused by name. The parts that do not read `IPRED` are unrestricted.
+- **Where it is refused.** `weight =` stays a property of the datum, so it cannot read
+  `IPRED`: write the factor into the magnitude, `additive(SIGMA * h(IPRED))`, which is
+  the same model. A `power(...)` exponent cannot read it either. A name assigned on the
+  prediction side (`[structural_model]`, `[scaling]`, an `[odes]` state) is refused with
+  its own message: only the prediction itself is readable, as `IPRED`. A dataset column
+  named `IPRED` declared in `[covariates]` is refused too, since the magnitude would read
+  the prediction while the rest of the model reads the column: rename the column to read
+  it, or drop it from `[covariates]` to read the prediction.
+- **Estimation.** Under FOCEI and in the EBE search the variance moves with η through
+  `IPRED`. Plain FOCE holds it at the population prediction, as it does for
+  `proportional`. The inner and outer gradients, and the covariance R-matrix, are
+  analytic under FOCE, FOCEI, Laplace and AGQ. The Gauss-Newton closed forms assume a
+  magnitude constant in the prediction, so those subjects take GN's finite-difference
+  fallback.
+- **Initial check.** `E_RUV_MAGNITUDE_NONPOSITIVE` evaluates the magnitude at the η = 0
+  prediction of the initial estimates, and names that `IPRED` (natural scale).
+
+#### Comparison with NONMEM {#magnitude-ipred-nonmem-anchor}
+
+NONMEM 7.6.0, natural-scale naproxen arm means (`nonmem_anchor/ipred_magnitude*.ctl`,
+`tests/ipred_magnitude_nonmem_anchor.rs`), SD `A·exp(B·IPRED)/sqrt(NIND)`:
+
+| quantity | NONMEM | \|ferx − NONMEM\| |
+|---|---:|---:|
+| FOCEI OFV, initial estimates | −143.048727 | 3.5e-8 |
+| FOCE (no `INTER`) OFV, initial estimates, `EMAX` log-normal | −71.564006 | 3.3e-8 |
+| FOCEI OFV at NONMEM's optimum | −171.185236 | 5.6e-8 |
+| no random effects, OFV at NONMEM's optimum | −36.321932 | 2.1e-14 |
+| POSTHOC η̂ / IPRED / IWRES / CWRES | — | 3.0e-7 / 2.2e-7 / 1.1e-6 / 1.9e-8 |
+| fitted OFV | −171.185236 | 3.7e-9 (ferx lower) |
+| fitted `A`, `B` | 4.47106, −0.170729 | ≤ 3e-5 relative on every θ |
 
 ### Names assigned in `[individual_parameters]` {#magnitude-indiv-names}
 

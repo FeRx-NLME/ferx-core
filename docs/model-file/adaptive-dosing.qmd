@@ -61,7 +61,7 @@ with the run, never with a fitted model's parameters.
 | `decision_covariates` | | `locf` (default) or `nocb`: the covariate row each decision carries as a record, for the interval that ends at it. See [Every decision is a record](#decision-records). |
 | `intervals` | | Dosing-interval ladder `[d1, d2, …]`, strictly increasing and positive. Rules step it with `lengthen` / `shorten`. Requires `start_interval`. See [Changing the dosing interval](#changing-the-dosing-interval). |
 | `start_interval` | | The dosing interval in force from the first decision; one of `intervals`, and required with it. |
-| `target_window` | | Therapeutic band `[low, high]` for the monitored signal, used **only** to report the `pct_time_in_window` outcome metric — it does **not** influence dosing (the `when` rules do). `high` may be `inf` for a one-sided "at or above `low`" target. Omit it to leave `pct_time_in_window` unreported, rather than guessing a band from the rule thresholds. |
+| `target_window` | | Therapeutic band `[low, high]` for the monitored signal, used **only** to report the `pct_readings_in_window` outcome metric (the fraction of decision readings whose *latent* signal is in the band, see [Outcome metrics read the latent signal](#outcome-metrics-read-the-latent-signal)) — it does **not** influence dosing (the `when` rules do). `high` may be `inf` for a one-sided "at or above `low`" target. Omit it to leave `pct_readings_in_window` unreported, rather than guessing a band from the rule thresholds. |
 | `auc_target` | | Exposure band `[low, high]` for the **area under the monitored signal** over each inter-decision window (e.g. vancomycin AUC₂₄ when decisions are daily), used **only** to report the `auc_target_attainment` outcome metric — like `target_window` it does **not** influence dosing. `low` must be `≥ 0`; `high` may be `inf`. Declaring it makes the reactive driver integrate the signal over each window as it simulates — any pre-scheduled base regimen (#702) together with the realized controller doses, on the run's own trajectory; omit it to skip that integral and leave `auc_target_attainment` unreported. |
 | `with_assay_error` | signal¹ | Titrate on the **noised measurement** of a model output (named by `assay_cmt`) instead of a latent expression (default `false`). The signal's value comes from that output's `[scaling]` readout and its σ from that output's `[error_model]`, so the two are always on the same scale — there is no re-typed `observe` expression to mis-scale. Mutually exclusive with `observe`. |
 | `assay_cmt` | | The 1-based compartment of the model output measured under `with_assay_error` — its `[scaling]` readout is the signal value and its `[error_model]` σ the noise. **Required** with `with_assay_error`. |
@@ -694,7 +694,7 @@ At a grid point that is not due, the controller is not called and no dose is
 given, but the monitors are still read. The decision log records the point with
 the outcome `NotDue`, distinct from `Hold`, and with what the monitors read, so
 the signal summaries (`signal_min` / `signal_max` / `signal_mean`,
-`pct_time_in_window`) still cover every grid point. The metrics count these
+`pct_readings_in_window`) still cover every grid point. The metrics count these
 points as `n_not_due`, never as holds. Every decision-log row also carries the
 interval in force after it. `auc_target` windows stay the review-grid windows:
 with a q24 grid each window is a daily AUC, whatever the dosing interval.
@@ -825,8 +825,8 @@ The result bundles four tidy, long-form artifacts — each tagged by
   record rather than inferred from gaps in the ledger.
 - `metrics` — one per-subject `AdaptiveSubjectMetrics` row per realized run:
   cumulative dose, dose-increase / -decrease / hold / discontinuation counts,
-  time-to-discontinuation, the observed-signal summary (min / max / mean),
-  `pct_time_in_window` when the block declares a `target_window`, and
+  time-to-discontinuation, the signal summary (min / max / mean),
+  `pct_readings_in_window` when the block declares a `target_window`, and
   `auc_target_attainment` when it declares an `auc_target`. The point fields are
   derived from `ledger` + `decisions` alone, so they are auditable against those
   rows (no re-integration). Increases / decreases are counted by realized dose
@@ -847,9 +847,33 @@ The result bundles four tidy, long-form artifacts — each tagged by
   decisions, so if a run discontinues (a `Stop`) the later, dose-free scheduled
   windows are not counted — discontinuation is already its own metric, and folding
   it in here too would double-count it; this keeps `auc_target_attainment` on the
-  same realized basis as `pct_time_in_window`. Population summaries **with
-  uncertainty bands** across the draws of a run with
-  [parameter uncertainty](#parameter-uncertainty) are a follow-up (#946).
+  same realized basis as `pct_readings_in_window`. To summarise these rows over the
+  population, with bands across parameter draws, see
+  [Population summary and bands](#population-summary-and-bands).
+
+### Outcome metrics read the latent signal
+
+Each monitor reading is recorded twice in `observed_signals`: `value`, what the
+controller saw, and `latent`, the noise-free readout it was taken from. Under `Ipred`
+the two are the same number. Under `Dv`, `value` carries the assay draw (and the clamp
+at 0 where the readout cannot be negative), and `latent` does not.
+
+The outcome metrics `signal_min`, `signal_max`, `signal_mean` and `pct_readings_in_window`
+are scored on `latent`, like `auc_target_attainment` (#946). Whether the patient was in
+the window is an outcome, and measurement error is not part of it. A `Dv` monitor's
+noise still reaches the metrics, but only through the doses it changed. `value` stays
+in the ledger, so every decision can still be audited against the reading that drove
+it.
+
+`pct_readings_in_window` is the fraction of **decision readings** whose latent value lies
+in `target_window`. It counts readings, not elapsed time: on an uneven decision grid
+each reading weighs the same, whatever the interval around it. Despite the `pct_`
+prefix it is a fraction in `[0, 1]`, like `auc_target_attainment`.
+
+Before #946 these four metrics were scored on `value`. For `Dv` monitors that counted
+the assay noise twice, once through the doses and once through the score. The window
+metric was also called `pct_time_in_window` until #946 renamed it, because it never
+measured time.
 
 ## Parameter uncertainty
 
@@ -885,7 +909,7 @@ held-at-bound parameters stay at their estimates.
 |---|---|
 | Parameter draws | A stream of their own, rooted at the run seed. Asking for more draws leaves the earlier ones, and every row simulated under them, unchanged. |
 | η | The one η stream continues from draw to draw, so each draw simulates new virtual patients. Draw 1 uses the standard normals the same seed gives without uncertainty, scaled by draw 1's Ω. |
-| κ, `Dv` assay | Keyed by subject, draw and sim. Draw 1 keeps the keys of a run without uncertainty. |
+| κ, `Dv` assay | Keyed by subject, draw, sim and assay replicate (`rep`, see [Assay replicates](#assay-replicates)). Draw 1, rep 1 keeps the keys of a run without uncertainty. |
 | Mixture class | Keyed by subject, draw and sim (never an assay replicate), under the draw's mixing probabilities. |
 
 So a draw at the point estimate reproduces the run without uncertainty, row for row.
@@ -896,7 +920,7 @@ The draw loop is the outermost. Each draw's κ, assay, σ and class follow that 
 parameters. A failure in any draw stops the run, as a failure in any replicate does
 today: dropping a draw would bias the uncertainty distribution. Messages then name the
 draw as well as the replicate, `subject '7' (draw 3, sim 2): …`. Without uncertainty they
-keep `(sim 2)`.
+keep `(sim 2)`. With assay replicates they add the rep, `(sim 2, rep 3)`.
 
 ### Dose knowledge under a drawn θ
 
@@ -921,6 +945,283 @@ validated by the degenerate oracle (draws at the point estimate reproduce the ru
 without uncertainty, bit for bit) and by a cross-check against
 `simulate_with_uncertainty` on the same draws under a fixed regimen (IPRED equal to
 the bit).
+
+### Population summary and bands
+
+`summarize_adaptive(&result, &AdaptiveSummaryOptions::default())` turns a run's
+`metrics` and `decisions` rows into three tables
+([#946](https://github.com/FeRx-NLME/ferx-core/issues/946)). It only borrows the
+result, so it cannot change it, and the same run can be summarised again with other
+options.
+
+| Table | One entry per | What it holds |
+|---|---|---|
+| `rows` | metric, statistic, draw | The statistic over that draw's runs, `n_runs`, `n_missing` and its Monte Carlo SE `mc_se` |
+| `bands` | metric, statistic | Quantiles of the per-draw statistic **across draws** |
+| `prediction_intervals` | metric | Quantiles of the individual value **pooled over every run** |
+
+The metrics are the `AdaptiveSubjectMetrics` fields, with `discontinued` as 1 or 0, and
+the latent signal of every monitored analyte at each `decision_idx`.
+`time_to_discontinuation` is left out: it is censored, and `discontinued` covers it.
+Every metric gets a `Mean` and a `Median`. `AdaptiveSummaryOptions::thresholds` adds a
+`FractionAtLeast(a)` row, e.g. `(PctReadingsInWindow, 0.8)` for the fraction of
+patients with at least 80 % of their decision readings in the window; there is none by
+default. The mean of `Discontinued` is the fraction discontinued.
+
+Each metric, statistic and band status has a stable `label()`, the spelling ferx-r
+writes: the metric's `metrics` column (`CUM_DOSE`, `PCT_READINGS_IN_WINDOW`, …, and
+`SIGNAL` for a signal, whose analyte and decision are its fields), and lower-case tokens
+such as `fraction_at_least` and `not_drawn`. `AdaptiveSummaryMetric::from_label` reads a
+scalar metric back from its label, and `AdaptiveSummaryMetric::SCALARS` lists them. The
+variance decomposition's scope, layer and status have a `label()` too.
+
+#### How runs are pooled
+
+- A draw's statistic is over all its runs, `n_sim × n_reps × subjects`, each run weighted
+  the same: assay replicates only lengthen the run count. Supplied-η subjects (`with_etas`, without uncertainty) count like any other.
+- A run that carries no value for a metric, such as `pct_readings_in_window` without a
+  `target_window` or the signal at a decision after a `Stop`, is skipped and counted in
+  `n_missing`, never imputed. A metric no run carries has `value = None`.
+- Every statistic, `FractionAtLeast` included, is over the runs that carry the value
+  (`n_runs − n_missing`). For the signal at a decision after some runs stopped, it is a
+  statistic of the runs still going at that decision.
+- A non-finite value makes every statistic, band and interval it enters `NaN`.
+
+#### Monte Carlo standard error of a row
+
+Each row's `mc_se` says how far the statistic could move with another seed at the same
+`n_sim` ([#3215](https://github.com/FeRx-NLME/ferx-core/issues/3215)). It is a
+delete-one jackknife over the draw's sims. A sim is the independent replicate: each
+subject's η and mixture class are drawn once per sim and shared by its `n_reps`
+replicates, so treating each run as independent would understate the error.
+
+- `Mean` and `FractionAtLeast` rows get one. A `Median` row has `mc_se = None`: the
+  delete-one jackknife is not consistent for a quantile.
+- With `S` sims carrying the metric, read it with a t on `S − 1` degrees of freedom. At
+  `n_sim = 5`, ±1.96 SE covers 88 %, as t₄ predicts.
+- It is `None` with fewer than two such sims, which includes a row whose `value` is
+  `None`. Otherwise it is `NaN` when the value is.
+- It is the error of that draw's statistic. Parameter uncertainty is the band's.
+
+Over 300 seeds on the contrast's analytic fixture below, the SE was 0.96 to 1.07 of the
+empirical SD of `Mean` and `FractionAtLeast` rows from `n_sim = 5` to 200, and 0.99 to
+1.02 of the analytic Monte Carlo SD of the mean. A jackknife over runs instead of sims
+gave 0.67 to 0.81 at `n_reps = 2`. For the median the jackknife's own spread did not
+shrink as `n_sim` grew.
+
+#### Band versus prediction interval
+
+The **band** answers "how sure are we of the population outcome": the quantiles across
+draws of, say, the fraction attaining target. It reflects parameter uncertainty only. The
+**prediction interval** answers "where does one patient fall": it pools every run, so it
+holds between-patient and within-patient variability as well, and it is wider. The two
+are separate types and never share a table.
+
+Quantiles are type 7 (R's default), as in the VPC bands, at
+`AdaptiveSummaryOptions::probs` (default 0.05 / 0.5 / 0.95). A quantile at `p` is only
+reported once there are `⌈1 / min(p, 1 − p)⌉ − 1` values (19 for 5 % and 95 %, 1 for
+the median); below that it is `None`. A run with a single draw, which includes every
+run without uncertainty, has no band: its status is `NotDrawn`, not a zero-width band.
+Its rows and prediction intervals are still there. Per-trial quantities such as the
+probability of success are computed from `metrics` grouped by `(draw, sim)`.
+
+The band is checked against a conditional oracle. With Ω fixed at 0 and a fixed regimen,
+every run of a draw is the same patient, so each draw's statistic is a closed form of
+that draw's θ. The band equals the type-7 quantiles of those closed forms to 1e-13.
+
+### Variance decomposition
+
+`decompose_adaptive(&result)` splits the variance of each outcome metric into the layers
+of randomness it comes from ([#946](https://github.com/FeRx-NLME/ferx-core/issues/946)).
+For a metric `Y` of subject `i`:
+
+```
+Var(Y | i) = Var_Θ E[Y|Θ]  +  E_Θ Var_η E[Y|Θ,η]  +  E_{Θ,η} Var_W(Y|Θ,η)
+             parameter        BSV                    within
+```
+
+Θ is the parameter draw, η the between-subject random effects (and the mixture class),
+and W the within-subject randomness: IOV κ and the `Dv` assay noise. Interactions go to
+the inner layer, so a Θ × η interaction counts as BSV. The metrics are the ones
+[`summarize_adaptive`](#population-summary-and-bands) reads, with the same rule for
+missing values.
+
+`components` holds one row per metric, scope and layer. The scope is a subject or the
+`Population`. A population row averages that layer over the subjects. `BetweenRow`, the
+variance of the subject means (covariates and design), exists only at population scope.
+`Total` is `Var(Y | i)` for a subject, the sum of its layers. For the population it is the
+pooled variance, `mean_i Var(Y | i) + Var_i E[Y | i]`, which is the sum of the population
+lines unless some subject's η was supplied (see below). Each estimate carries a Monte
+Carlo standard error (`mc_se`).
+
+#### Assay replicates
+
+The within layer can only be told apart from BSV if the same patient is run more than
+once. `AdaptiveSimulateOptions::n_reps = R` does that. Each subject's η and mixture class
+are drawn once per `(draw, sim)`. κ and the assay noise are then redrawn `R` times, and
+the controller runs again on each. This costs `R` times the runs. `ledger`, `decisions`
+and `metrics` carry each row's `rep`. `trajectories` holds rep 1 only, since its row type
+has no `rep` field. `R = 1`, the default, gives exactly the run without replicates, and
+rep 1 of any run is that run.
+
+The metrics are scored on the latent signal ([Outcome metrics read the latent
+signal](#outcome-metrics-read-the-latent-signal)). So with a fixed regimen and no IOV the
+within layer is exactly 0: assay noise reaches an outcome only through the doses a
+controller reading a `Dv` monitor chooses.
+
+#### What each layer needs
+
+| Design | Outcome |
+|---|---|
+| `n_reps = 1` | Refused (`E_ADAPTIVE_OPTIONS`): within is confounded with BSV |
+| `n_sim = 1` | Refused: BSV is confounded with the parameter layer |
+| Uncertainty with `n_draws = 1` | Refused: one draw cannot estimate the parameter layer |
+| No uncertainty | `Parameter` is `NotDrawn`, not 0 |
+| Supplied η (`with_etas`) | That subject's `Bsv` is `Supplied`, and its `Total` has no BSV. The population BSV averages the drawn subjects; within and `BetweenRow` average all of them. So the population `Total`, the pooled variance, is then less than the sum of the population lines. |
+| A metric missing in a run | Skipped for that subject and counted in `skipped`, never imputed |
+
+#### Estimator and standard error
+
+The estimator is the balanced nested ANOVA over `D` draws × `S` sims × `R` reps:
+`(MS_D − MS_S)/(SR)`, `(MS_S − MS_E)/R` and `MS_E`. It is unbiased. A small layer can come
+out **negative**, and it is reported as it is, never cut to 0. Cutting it would bias the
+estimate upwards.
+
+`mc_se` is a delete-one jackknife over draws, or over sims when there is one draw. On the
+analytic fixture below and on two 0/1 metrics, over 300 seeds, its mean was 0.90 to 1.08
+of the empirical SD in all 30 cells (four designs, three layers). The normal-theory
+formula, `Var(MS) = 2 MS²/df`, gave 0.51 to 1.67: the metrics are skewed or discrete, so
+it is not used. `mc_se` is `None` when a delete-one replicate cannot form the layer
+(`Parameter` with two draws, `Bsv` with two sims and no uncertainty), and for the
+`Total` that includes it.
+
+The parameter layer's error is about `2/√D`: draws, not sims, buy its precision.
+
+#### How it is checked
+
+There is no NONMEM run: NONMEM has no feedback dosing. On a one-compartment model with
+log-normal θ, BSV and IOV on clearance and a fixed regimen, each layer is compared with
+its quadrature at the run's own draws: parameter, BSV and within come out within 0.6 SD of
+the Monte Carlo error. IOV reaches the readings through
+[the record convention](#window-kappa), so that quadrature integrates three κ, not two.
+Two cases need no tolerance. With no IOV and an `Ipred` monitor, within is exactly 0.
+With Ω = 0 as well, BSV is exactly 0. Each is paired with a live case.
+
+### Controller effect: a contrast against a reference regimen
+
+The controller is a deterministic map from the random inputs to doses, so it has no
+variance layer of its own. Its effect is a **contrast**
+([#946](https://github.com/FeRx-NLME/ferx-core/issues/946)). You run the same model and
+population twice, with the same seed: once under the controller (the adaptive arm) and
+once under a reference regimen. Then you report each outcome summary for both arms and
+for their difference, adaptive − reference.
+
+- `decompose_contrast(&adaptive, &reference, &labels)` returns the
+  [variance decomposition](#variance-decomposition) of both arms and of the difference,
+  per metric, scope and layer. It needs what `decompose_adaptive` needs (`n_reps ≥ 2`,
+  `n_sim ≥ 2`).
+- `summarize_contrast(&adaptive, &reference, &labels, &opts)` returns the
+  [population summary](#population-summary-and-bands) of both arms and of the per-run
+  differences: the mean effect per draw with its paired Monte Carlo SE (`mc_se`), its
+  band across draws, and the prediction interval of one patient's effect. It works on any design, including `n_reps = 1`.
+
+Both return an `AdaptiveContrast { labels, adaptive, reference, difference }`. Each arm's
+summary is exactly what that arm alone gives. `AdaptiveArmLabels` names both arms, and
+neither label may be empty: the reference is never implicit.
+
+#### Worked example: how much variability does the controller remove?
+
+```rust
+let opts = AdaptiveSimulateOptions { seed: Some(2026), n_reps: 2, ..Default::default() };
+let tdm = simulate_adaptive_from_spec(&model, &pop, &params, 200, &spec, &opts)?;
+let fixed = simulate_adaptive_from_spec(&model, &pop, &params, 200, &spec.fixed_reference(), &opts)?;
+let labels = AdaptiveArmLabels::new("TDM rule", "start dose every due point");
+
+let v = decompose_contrast(&tdm, &fixed, &labels)?;          // variance, per layer
+let m = summarize_contrast(&tdm, &fixed, &labels, &Default::default())?;  // mean effect
+```
+
+In `v.difference` a negative `Bsv` row at population scope is between-patient variance
+the controller removed; divide it by the reference arm's `Bsv` for the fraction. A
+positive `Within` row is variance it added by acting on noisy readings. `m.difference`'s
+`Mean` rows are the mean effect on each metric (on `PctReadingsInWindow`, the change in
+the fraction of readings in the window).
+
+A threshold in the summary options applies to each summary's own values. So on
+`m.difference` a `FractionAtLeast(a)` row is the fraction of runs whose **effect** is at
+least `a`, P(A − R ≥ a). The change in attainment, P(A ≥ a) − P(R ≥ a), is the `adaptive`
+row minus the `reference` row.
+
+On the analytic fixture below (a proportional controller acting on a `Dv` reading against
+the fixed dose it starts from), the controller removed about 26 % of the BSV and of the
+parameter layer, and added a within layer the fixed regimen does not have (exactly 0
+there). That pattern is typical: with `Ipred` monitors the controller compensates for
+patients, so BSV shrinks; with a `Dv` monitor, noise moves doses, so the within layer
+grows. The parameter layer is what the controller cannot see.
+
+#### Common random numbers
+
+The two runs share their random numbers when they have the same seed, parameters and
+decision grid. That holds whatever the controllers do. η is drawn once per
+`(draw, sim, subject)`, in population order, before the controller runs. κ and the assay
+noise are keyed by the decision's grid index, so a `Stop`, a hold, an interval change or
+an extra dose shifts no other draw. The run records these inputs in
+`AdaptiveSimulationResult::manifest` (`seed`, `point_parameters`, `decision_times`).
+Both functions refuse (`E_ADAPTIVE_OPTIONS`) a pair that does not share them, and name the
+first difference:
+
+| Difference | Why it breaks the pairing |
+|---|---|
+| A label is empty | The reference must be named |
+| An arm has no seed | Its random numbers came from entropy |
+| Different seeds | Every stream differs |
+| Different parameters, draw count, or a draw's values | Other η scales, other draws |
+| Different decision grid | κ occasions and assay draws are keyed by grid index |
+| Different `n_sim` or `n_reps` | The runs cannot be matched one to one |
+| Different subject count or order | η is drawn in population order |
+| A supplied η in one arm only | One arm's η is not drawn |
+
+The model, the covariates, the base regimen in the data and the supplied η values
+(`with_etas`) are not recorded, so they cannot be checked. Pass the same ones to both
+runs.
+
+#### The reference regimen
+
+On the spec entry, `AdaptiveDosingSpec::fixed_reference()` returns the block with its
+rules removed. With no rule to fire, the controller gives its start dose at every due
+point. The schedule, monitor, route and metric bands are unchanged, so the grid matches by
+construction. "The start dose" is what the adaptive arm itself starts from:
+
+| `start_dose` | The reference gives |
+|---|---|
+| A number | That number |
+| A covariate expression ([dose expressions](#dose-expressions)) | Each subject's own value |
+| A θ-only expression, under parameter uncertainty | Its value at θ̂, the prescriber's knowledge, as in the adaptive arm |
+| With `dose_knowledge = oracle` | Its value at the draw's θ |
+| With `round_to` | The start dose placed on the dose grid |
+
+A rule-free spec is allowed only in Rust. A `.ferx` block still needs a rule; a fixed
+regimen there belongs in the data's dose records. The reference is not a fair one for a
+controller with a loading dose. On the programmatic entry, pass any fixed controller as
+the reference, with the same options.
+
+#### Standard error and how it is checked
+
+The arms share their outer units (draws, or sims with one draw), so the difference's
+`mc_se` is a **paired** jackknife: the same unit is left out of both arms at once.
+Combining the arms' own SEs as `√(se_A² + se_R²)` ignores their correlation. Over 300
+seeds on the analytic fixture, the paired SE was 0.95 to 1.07 of the empirical SD of the
+difference, and the unpaired one 4.2 to 4.9. The summary difference's `mc_se` is paired
+the same way, by sim: 0.99 to 1.09 of the empirical SD of the mean effect without
+parameter uncertainty, against 8.7 to 9.9 unpaired.
+
+No NONMEM run exists for feedback dosing. Two cases need no tolerance: a controller
+contrasted with itself gives bit-identical runs and every difference exactly 0, and a
+fixed controller on the programmatic entry equals `fixed_reference()` on the spec entry
+bit for bit. The difference is then compared with quadrature at the run's own draws, on a
+one-compartment model with log-normal θ and a controller `100 − 0.5 × reading`, whose
+layers have closed forms. Each layer agrees within the test's tolerance of 4 SD of its
+Monte Carlo error (2.3 SD at the test's seed).
 
 ## Verification (on by default)
 
@@ -1392,8 +1693,7 @@ cannot see a failure in the solver itself.
 - **One monitored signal per block** — the declarative block titrates on a single
   `observe`; multiple named per-analyte monitors (already supported by the
   programmatic engine) are a declarative-surface follow-up.
-- **Roadmap** — population outcome summaries with uncertainty bands, the imperative
-  `[dose_control]` block, and PK + PD + safety model composition.
+- **Roadmap** — the imperative `[dose_control]` block, and PK + PD + safety model composition.
 
 [`ControllerCtx`]: https://docs.rs/ferx-core
 [`DoseAction`]: https://docs.rs/ferx-core

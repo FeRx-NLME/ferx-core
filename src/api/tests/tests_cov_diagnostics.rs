@@ -173,6 +173,18 @@ fn gn_zero_eta_warning_dropped_when_a_later_stage_re_optimises() {
     let w = crate::estimation::gauss_newton::GN_ZERO_ETA_NONCONVERGENCE_WARNING;
     assert!(!keep_gn_zero_eta_warning(w, false));
     assert!(keep_gn_zero_eta_warning(w, true));
+    // #2438's BHHH rank warning says the same about the GN stage, so it follows the rule.
+    let rank = crate::estimation::gauss_newton::gn_rank_deficient_warning(
+        false,
+        true,
+        false,
+        6,
+        7,
+        crate::types::EstimationMethod::FoceGn,
+    )
+    .unwrap();
+    assert!(!keep_gn_zero_eta_warning(&rank, false));
+    assert!(keep_gn_zero_eta_warning(&rank, true));
 }
 
 #[test]
@@ -184,6 +196,11 @@ fn gn_zero_eta_filter_passes_every_other_warning_through() {
         "Gauss-Newton: max iterations reached without convergence",
         "Gauss-Newton: trust radius collapsed without convergence",
         "Covariance step failed — SEs not available",
+        "Gauss-Newton (BHHH) approximation may be inaccurate with M3 censoring; consider \
+         method=foce_i for heavy censoring fractions (>20%).",
+        // Shares the rank warning's whole head, colon included: only its fixed middle tells
+        // the two apart (#2438 review row 5).
+        "Gauss-Newton (BHHH): some later diagnostic.",
     ] {
         assert!(keep_gn_zero_eta_warning(w, false), "wrongly dropped: {w}");
         assert!(keep_gn_zero_eta_warning(w, true), "wrongly dropped: {w}");

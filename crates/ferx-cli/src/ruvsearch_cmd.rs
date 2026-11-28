@@ -1,16 +1,16 @@
 //! `ferx ruvsearch` — residual-error model search (#1182).
 //!
 //! Thin by construction (#1114 A5): parse flags, load the `.ferxsearch`
-//! file, call [`ferx_tools::ruvsearch::run_ruvsearch`], print the step
+//! file, call [`ferx_search::ruvsearch::run_ruvsearch`], print the step
 //! table, pick an exit code. Every decision about candidates, tests and
-//! selection lives in `ferx-tools`.
+//! selection lives in `ferx-search`.
 
 use std::path::PathBuf;
 
-use ferx_tools::ruvsearch::{
+use ferx_search::ruvsearch::{
     default_dir, render_summary, run_ruvsearch, RuvsearchEvent, RuvsearchOptions, RuvsearchRun,
 };
-use ferx_tools::search::SearchConfig;
+use ferx_search::search::SearchConfig;
 
 use crate::covsearch_cmd::{flag, parse_threads, scan_args, value};
 
@@ -177,8 +177,8 @@ fn run_ruvsearch_command(args: &[String]) -> Result<i32, String> {
     }
     eprintln!(
         "Step table written to {}; final model to {}",
-        ferx_tools::ruvsearch::steps_path(&dir).display(),
-        ferx_tools::ruvsearch::final_model_path(&dir).display()
+        ferx_search::ruvsearch::steps_path(&dir).display(),
+        ferx_search::ruvsearch::final_model_path(&dir).display()
     );
     Ok(if result.cancelled { 130 } else { 0 })
 }

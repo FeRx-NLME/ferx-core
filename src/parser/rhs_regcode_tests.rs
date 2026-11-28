@@ -1195,6 +1195,52 @@ fn sqrt_at_its_guard_is_the_interpreter_bit_for_bit_on_every_route() {
     }
 }
 
+/// An `[odes]` `sqrt` recorded through `apply_unary` (the interpreter, over the recording type)
+/// at a positive argument and run at zero or below holds the plan's checks, with the VM's flat
+/// `+0` and zero jets to second order (#3002). With the guarded branches in `Op::Sqrt` instead,
+/// each was a guard and the plan declined the segment.
+#[test]
+fn a_recorded_ode_sqrt_holds_at_a_non_positive_argument() {
+    use super::kernel_jit::{begin, end, Tr};
+    use crate::sens::num::vm::Layout;
+    let prog = program("  d/dt(x1) = sqrt(x1)\n  d/dt(x2) = 0\n  d/dt(x3) = 0");
+    begin();
+    let c = |v| <Tr as PkNum>::from_f64(v);
+    let mut vars = bind(
+        &prog,
+        &[Tr::eta(0, 0.25), c(0.0), c(0.0)],
+        &vec![c(0.0); crate::types::MAX_PK_PARAMS + 2],
+        &[c(1.75); 4],
+    );
+    let mut du = vec![c(0.0); 3];
+    let _time = ModelTimeGuard::enter(1.75);
+    eval_statements_g::<Tr>(
+        &prog.stmts,
+        &[],
+        &[],
+        &[],
+        &mut vars,
+        Some(&mut du),
+        &mut vec![],
+        &[],
+        &[],
+    );
+    let rec = end(Some(vec![du[0].reg()])).expect("records");
+    let lay = Layout { n: 1, m: 1, th: false, wide: false, tan: 0 };
+    let plan = rec.plan(lay, 1, 0).expect("plans");
+    let l = lay.lanes();
+    for (at, want) in
+        [(0.36, [0.6, 1.0 / 1.2, -0.25 / 0.36f64.powf(1.5)]), (0.0, [0.0; 3]), (-0.25, [0.0; 3])]
+    {
+        let mut du = vec![0.0; 2 * l];
+        plan.forward_layout(lay, &[at, 1.0, 0.0], &[], &mut du).expect("runs");
+        assert_eq!(du[l], 1.0, "the plan's checks hold at {at}");
+        for (k, w) in want.iter().enumerate() {
+            assert!((du[k] - w).abs() < 1e-12, "sqrt({at}) lane {k}: {} vs {w}", du[k]);
+        }
+    }
+}
+
 /// `sqrt`'s jets on the compiled routes against central finite differences of the `f64`
 /// RHS: the register code (`Dual2`), at points
 /// where every `sqrt` argument is positive, plus the reverse pass against forward tangents.

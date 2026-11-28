@@ -346,18 +346,18 @@ fn an_sde_model_keeps_the_requested_gradient_and_stays_silent() {
     );
 }
 
-/// **Finding 2 — a mixture fit was told its optimizer moved when it had not.**
+/// **Finding 2 — a mixture fit and the optimizer-follows-gradient warning.**
 ///
-/// `optimize_population` special-cases mixtures: `optimizer = auto` is BOBYQA for a
-/// mixture *whatever* the gradient situation, because the label-switching
-/// multimodality is what the choice is about. The first cut asked `resolve_auto`,
-/// which knows nothing of that arm, so an analytic-scope mixture with `gradient = fd`
-/// was told it had swapped `nlopt_lbfgs` for `bobyqa` — a swap that never happened.
+/// Since #3025 a mixture's `auto` follows the gradient exactly as a single population's
+/// does (L-BFGS on the exact mixture gradient, BOBYQA when `gradient = fd` removes it),
+/// so the coupling is real for a mixture and the warning must fire for it too. Before
+/// #3025 `auto` was BOBYQA whatever the gradient, and the warning was (rightly) silent.
+/// Both sides go through `resolve_outer_optimizer`, the rule the outer loop runs.
 ///
-/// The straddle is asserted: the same model *without* the mixture does warn, so this
-/// test cannot pass by the fixture having drifted out of analytic scope.
+/// The straddle is asserted: the same model without the mixture warns, so this test
+/// cannot pass by the fixture having drifted out of analytic scope.
 #[test]
-fn a_mixture_fit_is_silent_because_auto_is_bobyqa_either_way() {
+fn a_mixture_fit_warns_like_its_single_population_twin() {
     let mut model = analytical_model(GradientMethod::Fd);
     let opts = FitOptions {
         method: EstimationMethod::FoceI,
@@ -373,7 +373,7 @@ fn a_mixture_fit_is_silent_because_auto_is_bobyqa_either_way() {
         "the non-mixture twin must warn, or this test proves nothing about mixtures"
     );
 
-    // …and with it, both arms run BOBYQA, so there is nothing to report.
+    // …and with it, the mixture's `auto` follows the gradient the same way.
     model.default_params.mixture = Some(crate::types::MixtureParams {
         omega: vec![model.default_params.omega.clone()],
         sigma: vec![model.default_params.sigma.clone()],
@@ -390,12 +390,24 @@ fn a_mixture_fit_is_silent_because_auto_is_bobyqa_either_way() {
             true,
         )
         .0,
-        Optimizer::Bobyqa,
-        "a mixture resolves `auto` to BOBYQA even with an analytic gradient available"
+        Optimizer::NloptLbfgs,
+        "a mixture resolves `auto` to L-BFGS when the analytic gradient is available"
     );
-    assert!(
-        !check_model_options(&model, &opts).iter().any(|d| d.code == CODE),
-        "a mixture's `auto` is BOBYQA with or without the gradient override"
+    assert_eq!(
+        crate::estimation::outer_optimizer::resolve_outer_optimizer(
+            Optimizer::Auto,
+            &model,
+            true,
+            false,
+        )
+        .0,
+        Optimizer::Bobyqa,
+        "…and to BOBYQA when `gradient = fd` removes it"
+    );
+    assert_eq!(
+        check_model_options(&model, &opts).iter().filter(|d| d.code == CODE).count(),
+        1,
+        "a mixture's `auto` moves with the gradient override, so the coupling is reported"
     );
 }
 

@@ -4,7 +4,7 @@
 //! entry points stamped from the options. `fit` takes `&CompiledModel` (not `Clone`), so it
 //! could not stamp, and a direct `fit()` with `FitOptions { gradient_method: Fd, .. }` on a
 //! parsed model ran on the analytic `Dual2` gradient — bit-identical to the run without the
-//! setting, with no warning. Now `fit` arms the call's flag (`api::pool::FitScope`) and every
+//! setting, with no warning. Now `fit` arms the call's flag (`pool::FitScope`) and every
 //! reader asks `GradientMethod::forced_fd`, a union with the model's own flag.
 //!
 //! Every case reads **which engine ran** — the `gradient_method_inner` / `_outer` labels,

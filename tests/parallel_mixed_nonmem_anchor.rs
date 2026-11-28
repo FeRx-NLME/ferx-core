@@ -64,7 +64,7 @@ const PARALLEL_AT_NONMEM_OPTIMUM: &str = r"
 
 /// 1-cpt mixed zero+first-order model at **NONMEM's final values**
 /// (`nonmem_anchor/results/mixed_zero_first.ext`, MINIMIZATION SUCCESSFUL —
-/// covariance step flagged, see the run's `.lst`). `FZO1 = 1 - FZO` is the declared
+/// covariance step flagged, see the run's `.nm.json`). `FZO1 = 1 - FZO` is the declared
 /// complement. The proportional `sigma` is the SD `√0.0252075 = 0.158769`.
 const MIXED_AT_NONMEM_OPTIMUM: &str = r"
 [parameters]

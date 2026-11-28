@@ -1,0 +1,90 @@
+{
+ "nonmem_version": "7.6.0",
+ "data_file": "param_time_reset.csv",
+ "data_records": 840,
+ "observations": 660,
+ "individuals": 30,
+ "nmtran_warnings": [2],
+ "markers": [
+  "MINIMIZATION SUCCESSFUL"
+ ],
+ "steps": [
+  {
+   "method": "First Order Conditional Estimation with Interaction",
+   "objv": -2227.063,
+   "objv_without_constant": -2227.062609570158,
+   "objv_with_constant": -1014.0637457399903,
+   "function_evaluations": 130,
+   "significant_digits": 3.6,
+   "etabar": [
+    [-0.00020544, -0.00023192]
+   ],
+   "etabar_se": [
+    [0.047567, 0.034751]
+   ],
+   "p_val": [
+    [0.99655, 0.99468]
+   ],
+   "etashrinksd": [
+    [0.47773, 1.7862]
+   ],
+   "etashrinkvr": [
+    [0.95318, 3.5405]
+   ],
+   "ebvshrinksd": [
+    [0.46669, 1.7632]
+   ],
+   "ebvshrinkvr": [
+    [0.9312, 3.4954]
+   ],
+   "relativeinf": [
+    [99.045, 96.481]
+   ],
+   "epsshrinksd": [
+    [3.3414, 3.3414]
+   ],
+   "epsshrinkvr": [
+    [6.5712, 6.5712]
+   ],
+   "final": {
+    "theta": [2.07, 20.7, 1.98],
+    "omega": {
+     "ETA1": [0.0685],
+     "ETA2": [0.0, 0.0376]
+    },
+    "sigma": {
+     "EPS1": [0.0108],
+     "EPS2": [0.0, 0.0001]
+    }
+   },
+   "markers": [
+    "MINIMIZATION SUCCESSFUL"
+   ]
+  }
+ ],
+ "control_stream_as_run": [
+  "$PROBLEM #1969 parameter time: $PK step on TIME at a dose-tied trough (reset)",
+  "$INPUT ID TIME DV AMT EVID CMT MDV",
+  "$DATA param_time_reset.csv IGNORE=@",
+  "$SUBROUTINE ADVAN1 TRANS2",
+  "$PK",
+  "  IND = 1",
+  "  IF (TIME.GE.24) IND = THETA(3)",
+  "  CL = THETA(1)*IND*EXP(ETA(1))",
+  "  V  = THETA(2)*EXP(ETA(2))",
+  "  S1 = V",
+  "$ERROR",
+  "  IPRED = F",
+  "  Y = IPRED*(1 + EPS(1)) + EPS(2)",
+  "$THETA",
+  "  (0.01, 2.0, 100)   ; TVCL",
+  "  (1.0, 20.0, 500)   ; TVV",
+  "  (0.1, 2.0, 10)     ; IND",
+  "$OMEGA 0.09",
+  "$OMEGA 0.04",
+  "$SIGMA 0.01",
+  "$SIGMA 0.0001 FIX",
+  "$ESTIMATION METHOD=1 INTER MAXEVAL=9999 PRINT=5 NOABORT FORMAT=s1PE23.16",
+  "$TABLE ID TIME EVID IND CL IPRED ETA1 ETA2 NOPRINT ONEHEADER NOAPPEND FORMAT=s1PE23.16 FILE=param_time_reset.tab"
+ ]
+}

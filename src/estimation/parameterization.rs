@@ -280,7 +280,7 @@ pub(crate) const SIGMA_PACK_UPPER: f64 = 5.0;
 /// `E_OMEGA_INIT_AT_RAIL` (#1229) both *compares against* it and quotes
 /// `exp(2·lower)` back at the user as the largest variance that lands on it —
 /// a number that was a hand-typed decimal literal until #1242; and
-/// `ferx-tools`' search seeder carried a **seventh** copy of that same decimal,
+/// `ferx-search`'s search seeder carried a **seventh** copy of that same decimal,
 /// in a crate that cannot see this constant, until the same change gave it
 /// [`omega_variance_at_or_below_rail`] to ask instead.
 ///
@@ -376,11 +376,11 @@ pub(crate) fn rail_variance_at(rail: f64) -> f64 {
 ///
 /// # Why this is public API
 ///
-/// `ferx-tools` seeds a search child's Ω and must not hand the engine a start
+/// `ferx-search` seeds a search child's Ω and must not hand the engine a start
 /// the engine will refuse. Before #1408's review it asked that question with its
 /// own copy of the answer — `const RAIL_VARIANCE: f64 = 6.144_212_353_328_21e-6`
 /// in `search/seed.rs`, a *seventh* spelling of this rail, in a crate that
-/// cannot see a `pub(crate)` constant. Moving the rail left every `ferx-tools`
+/// cannot see a `pub(crate)` constant. Moving the rail left every `ferx-search`
 /// test green (verified: at `OMEGA_CHOL_PACKED_LOWER = -4.0` the rail variance
 /// is 3.35e-4, 55x the seeder's own threshold, and 602 tests still passed) while
 /// every seeded candidate would have been refused by `fit()`.
@@ -2197,6 +2197,16 @@ pub(crate) fn chol_lt_idx(i: usize, j: usize, n: usize) -> usize {
     col_offset + (i - j)
 }
 
+/// A θ's standard error on its own scale from its packed-scale variance `var`: the
+/// packed SE (`0.0` for a non-positive variance, as every `se_*` vector reports it)
+/// times the packing Jacobian. The one rule behind `se_theta` and a free level's
+/// standard error in `theta_level_values` (#1890), so the two are equal by
+/// construction rather than by a second formula.
+pub(crate) fn theta_se_from_packed(var: f64, theta: f64, theta_lower: f64) -> f64 {
+    let se_packed = if var > 0.0 { var.sqrt() } else { 0.0 };
+    theta_packing_jacobian(theta, theta_lower) * se_packed
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -3347,7 +3357,7 @@ mod tests {
     /// equality has to count as "at or below".
     ///
     /// It also gives the predicate a test in its **own** crate. It is public API
-    /// whose only consumer is `ferx-tools`, and a `ferx-core` item covered only
+    /// whose only consumer is `ferx-search`, and a `ferx-core` item covered only
     /// by another crate's suite is one the core coverage run never executes
     /// (which is how it first landed with 88% patch coverage).
     ///
@@ -3371,7 +3381,7 @@ mod tests {
         assert!(!omega_variance_at_or_below_rail(f64::from_bits(rail.to_bits() + 1)));
         assert!(!omega_variance_at_or_below_rail(0.09));
 
-        // The consumer's contract, without depending on `ferx-tools`: its
+        // The consumer's contract, without depending on `ferx-search`: its
         // seeding threshold (`MIN_CHOLESKY_VARIANCE = 8e-6`) must be startable.
         // `seed_tests::min_cholesky_variance_still_clears_the_engine_rail`
         // asserts the same thing from the other side, against the real constant.
