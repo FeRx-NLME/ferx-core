@@ -189,6 +189,8 @@ fn check_horizon_value(population: &Population, horizon: TteHorizon) -> Result<(
 /// stream by `simulate_rtte_stream` (analytic hazards only). Several preconditions are
 /// *user-fixable* and would otherwise corrupt the stream silently, so they are rejected
 /// here (a clean `Err` from every `simulate*` entry point):
+/// - an **ODE-accumulated hazard** is refused: it fits under `clock = forward` (#3152), but the
+///   stream draws analytic hazards only;
 /// - a **finite, positive horizon** is required — the recurrent stream is generated up
 ///   to that administrative window; there is no implicit one;
 /// - **left truncation** (`entry_time > 0`) *is* supported (#740): the stream is drawn on
@@ -262,6 +264,25 @@ pub(crate) fn validate_tte_simulatable(
         matches!(e, EndpointLikelihood::Tte { recurrence: TteRecurrence::Repeated { .. }, .. })
     });
     if has_rtte {
+        // #3152 fits a clock-forward RTTE cause with an ODE-accumulated hazard; the stream
+        // generator draws analytic hazards only.
+        if let Some(cmt) = model.endpoints.iter().find_map(|(c, e)| {
+            matches!(
+                e,
+                EndpointLikelihood::Tte {
+                    recurrence: TteRecurrence::Repeated { .. },
+                    hazard: crate::types::HazardSpec::OdeAccumulated { .. },
+                    ..
+                }
+            )
+            .then_some(*c)
+        }) {
+            return Err(tte_not_simulatable(format!(
+                "CMT={cmt}: simulating repeated events (`type = rtte`) with an ODE-accumulated \
+                 `hazard = ...` is not supported yet (#3224); fitting it is (#3152). Use an analytic \
+                 `family` hazard to simulate repeated events."
+            )));
+        }
         // A finite, positive administrative horizon bounds the recurrent stream.
         match horizon {
             Some(h) if h.is_finite() && h > 0.0 => {}

@@ -8974,15 +8974,20 @@ fn parse_event_model_block(
     // endpoint only records that accumulator's state index. Mutually exclusive with
     // the analytic closed-form `family` keys.
     if hazard_present {
-        // RTTE with a drug-driven ODE hazard (joint PK-RTTE) needs the repeated-event
-        // root-finder loop AND, for clock-reset, the selective CHZ reset — a later
-        // slice. Reject rather than silently fitting a single-event likelihood.
-        if matches!(recurrence, crate::types::TteRecurrence::Repeated { .. }) {
+        // Clock-reset RTTE with a drug-driven ODE hazard needs a fresh ODE solve from
+        // each renewal state over gap time, integrating `h(τ, state_reset(τ))` per gap —
+        // a later slice (#3224). Clock-forward is fully supported: the cumulative hazard
+        // is integrated once over the absolute risk window and gap contributions are
+        // `H(tₖ) − H(tₖ₋₁)` (#3152).
+        if matches!(
+            recurrence,
+            crate::types::TteRecurrence::Repeated { clock: crate::types::RtteClock::Reset }
+        ) {
             return Err(format!(
-                "[event_model]: CMT={cmt} combines `type = rtte` with an ODE-accumulated \
-                 `hazard = ...` (drug-driven joint PK-RTTE), which is not yet supported. Use an \
-                 analytic `family` hazard for repeated events, or `type = tte` for a single-event \
-                 drug-driven hazard."
+                "[event_model]: CMT={cmt} combines `type = rtte, clock = reset` with an \
+                 ODE-accumulated `hazard = ...` (drug-driven joint PK-RTTE, clock-reset). Use \
+                 `clock = forward` (Andersen–Gill) for an ODE-driven hazard, or an analytic \
+                 `family` hazard for clock-reset RTTE (#3224)."
             ));
         }
         if family_opt.is_some()

@@ -606,6 +606,54 @@ fn rtte_records_out_of_order_are_coded() {
     assert!(check.iter().any(|d| d.code == "E_RTTE_RECORDS"), "{check:?}");
 }
 
+/// #3152: on an ODE-accumulated clock-forward RTTE endpoint, an EVID=3/4 reset inside the
+/// risk window zeroes `H` and scored the subject at the silent 1e20 sentinel. It is
+/// `E_RTTE_RECORDS`; a reset at TIME 0 or after the last record is not. A hand-built
+/// `clock = reset` model, which the parser refuses, is refused here too.
+#[cfg(feature = "survival")]
+#[test]
+fn an_ode_rtte_reset_inside_the_risk_window_is_coded() {
+    use crate::types::{EndpointLikelihood, EventType, ObsRecord, RtteClock, TteRecurrence};
+    let src = crate::test_models::ODE_9.replace("  cmt    = 2\n", "  cmt    = 2\n  type = rtte\n");
+    let mut model = parse_model_string(&src).expect("parse");
+    let rec = |time, event_type| ObsRecord::Event { time, event_type, entry_time: 0.0, cmt: 2 };
+    let pop = |reset_times: Vec<f64>| {
+        population_of(vec![Subject {
+            id: "1".to_string(),
+            doses: [0.0, 12.0, 24.0]
+                .map(|t| crate::types::DoseEvent::new(t, 100.0, 1, 0.0, false, 0.0))
+                .to_vec(),
+            obs_records: vec![
+                rec(8.0, EventType::Exact),
+                rec(20.0, EventType::Exact),
+                rec(30.0, EventType::RightCensored),
+            ],
+            reset_times,
+            ..Default::default()
+        }])
+    };
+    let coded = |model: &CompiledModel, pop: &Population| {
+        crate::api::check_model_data(model, pop).into_iter().find(|d| d.code == "E_RTTE_RECORDS")
+    };
+    let want = "Subject '1': RTTE endpoint CMT=2 has an ODE-accumulated `hazard = ...` and an \
+                EVID=3/4 reset at TIME=14, inside its risk window. The reset zeroes the \
+                cumulative hazard, so the gaps across it cannot be scored. Drop the reset, or \
+                end the subject's records before it.";
+    let err = fit_refusal(&model, &pop(vec![14.0]), &model.default_params, &FitOptions::default());
+    assert_coded(&err, "reset", "E_RTTE_RECORDS", Some("event_model"), want);
+    assert_eq!(coded(&model, &pop(vec![14.0])).expect("check").message, want);
+    for t in [0.0, 31.0] {
+        assert!(coded(&model, &pop(vec![t])).is_none(), "a reset at {t} is outside the window");
+    }
+    for ep in model.endpoints.values_mut() {
+        if let EndpointLikelihood::Tte { recurrence, .. } = ep {
+            *recurrence = TteRecurrence::Repeated { clock: RtteClock::Reset };
+        }
+    }
+    let d = coded(&model, &pop(Vec::new())).expect("a hand-built clock = reset is refused");
+    assert!(d.message.contains("`clock = reset`"), "{}", d.message);
+}
+
 /// With two repeated-event endpoints both out of time order, `E_RTTE_RECORDS` names the
 /// **lower** CMT, and not the higher one, on every compile (#2531): the check returns
 /// the first bad endpoint it walks, so the walk order is the message.

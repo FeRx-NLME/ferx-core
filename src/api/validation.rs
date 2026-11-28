@@ -2860,6 +2860,8 @@ pub(crate) fn check_absorption_closed_form_support(
 ///     negative gap folded to `1e20` (reset).
 ///   * **`entry_time > TIME`**: a negative first gap (reset) or `H(entry) > H(TIME)` (forward).
 ///     The datareader skips such rows on load; a hand-built caller bypasses that.
+///   * **an ODE-accumulated hazard with an EVID=3/4 reset in the risk window**: the reset
+///     zeroes `H`, so a gap goes negative; with `clock = reset` the pairing itself (#3152).
 ///
 /// For **`clock = reset`** only:
 ///
@@ -2883,9 +2885,27 @@ fn check_rtte_records(model: &CompiledModel, population: &Population) -> Option<
     // final record, gaps must be strictly positive); track them so those checks stay
     // scoped to reset and don't reject clock-forward data that telescopes fine.
     let mut reset_cmts: std::collections::HashSet<usize> = std::collections::HashSet::new();
+    // ODE-accumulated hazards: an EVID=3/4 reset zeroes the cumulative-hazard state (#3152).
+    let mut ode_cmts: std::collections::HashSet<usize> = std::collections::HashSet::new();
     for (cmt, ep) in &model.endpoints {
-        if let EndpointLikelihood::Tte { recurrence: TteRecurrence::Repeated { clock }, .. } = ep {
+        if let EndpointLikelihood::Tte {
+            recurrence: TteRecurrence::Repeated { clock },
+            hazard,
+            ..
+        } = ep
+        {
             rtte_cmts.push(*cmt);
+            let ode = matches!(hazard, crate::types::HazardSpec::OdeAccumulated { .. });
+            // The parser refuses this pairing; a hand-built model reaches it here (#3152).
+            if ode && matches!(clock, RtteClock::Reset) {
+                return Some(format!(
+                    "RTTE endpoint CMT={cmt}: `clock = reset` with an ODE-accumulated \
+                     `hazard = ...` is not supported (#3224). Use `clock = forward`."
+                ));
+            }
+            if ode {
+                ode_cmts.insert(*cmt);
+            }
             if matches!(clock, RtteClock::Reset) {
                 reset_cmts.insert(*cmt);
             }
@@ -2934,6 +2954,23 @@ fn check_rtte_records(model: &CompiledModel, population: &Population) -> Option<
                         "Subject '{}': RTTE endpoint CMT={cmt} has entry_time={entry_time} after \
                          TIME={time}. The left-truncation entry must not exceed the record's \
                          event/censoring time.",
+                        subject.id
+                    ));
+                }
+                // An ODE hazard's gaps are `H(tₖ) − H(tₖ₋₁)` on one solve from the first record's
+                // entry; an EVID=3/4 reset in that window zeroes `H`, so a gap would fold to the
+                // silent 1e20 sentinel. A reset at a window end counts (which side of it `H` is
+                // read on is not defined); one at TIME 0 cannot move `H` (#3152).
+                let lo = if prev == f64::NEG_INFINITY { *entry_time } else { prev };
+                let in_window = |&&t: &&f64| t > 0.0 && t >= lo && t <= *time;
+                if let Some(t) =
+                    subject.reset_times.iter().find(in_window).filter(|_| ode_cmts.contains(&cmt))
+                {
+                    return Some(format!(
+                        "Subject '{}': RTTE endpoint CMT={cmt} has an ODE-accumulated `hazard = \
+                         ...` and an EVID=3/4 reset at TIME={t}, inside its risk window. The \
+                         reset zeroes the cumulative hazard, so the gaps across it cannot be \
+                         scored. Drop the reset, or end the subject's records before it.",
                         subject.id
                     ));
                 }
