@@ -207,8 +207,12 @@ cmd_check() {
       errors=$((errors + 1))
       continue
     fi
-    first="$(printf '%s\n' "$body" | head -n 1)"
-    if ! printf '%s' "$first" | grep -Eq '^- [^[:space:]]'; then
+    # No `printf "$body" | <reader that may exit early>` below: once `head` / `grep -q` /
+    # `awk … exit` stops reading, printf's next write takes SIGPIPE, and `pipefail` turns
+    # a match into a miss or `set -e` exits 141 with no message (#2587). Line 1 is read
+    # from the file: `${body%%$'\n'*}` is quadratic in bash 3.2.
+    IFS= read -r first <"$path" || :
+    if ! [[ $first =~ ^-\ [^[:space:]] ]]; then
       echo "changelog.d/$name: line 1 must start a bullet ('- ...'), found: $first" >&2
       errors=$((errors + 1))
       continue
@@ -218,20 +222,20 @@ cmd_check() {
     # bullet. A column-0 line is a second bullet, a heading, or prose outside
     # the list; and ` - x` with ONE space is still a sibling bullet, not a
     # nested one.
-    bad="$(printf '%s\n' "$body" | awk 'NR > 1 && NF && !/^(  |\t)/ { print NR ": " $0; exit }')"
+    bad="$(awk 'NR > 1 && NF && !/^(  |\t)/ { print NR ": " $0; exit }' "$path")"
     if [ -n "$bad" ]; then
       echo "changelog.d/$name: must be a single bullet; line $bad is not indented" \
         "by two spaces (continuation lines need at least two; one entry per file)" >&2
       errors=$((errors + 1))
       continue
     fi
-    if printf '%s' "$body" | grep -q $'\r'; then
+    if [[ $body == *$'\r'* ]]; then
       echo "changelog.d/$name: contains CR line endings; save it with LF" >&2
       errors=$((errors + 1))
       continue
     fi
     # A real number: `#0` / `#00` is a placeholder left in, not a reference.
-    if ! printf '%s' "$body" | grep -Eq '#[1-9][0-9]*'; then
+    if ! [[ $body =~ \#[1-9] ]]; then
       echo "changelog.d/$name: no issue/PR reference — cite it as (#NN)" >&2
       errors=$((errors + 1))
       continue
@@ -245,7 +249,7 @@ cmd_check() {
       echo "CHANGELOG.md: [Unreleased] must stay empty between releases (#1545) — it is"
       echo "assembled from changelog.d/ at release time. Move each entry into its own"
       echo "changelog.d/<N>.<category>.md. Offending lines:"
-      printf '%s\n' "$stray" | head -n 5 | sed 's/^/  /'
+      printf '%s\n' "$stray" | sed -n '1,5s/^/  /p'
     } >&2
     errors=$((errors + 1))
   fi
