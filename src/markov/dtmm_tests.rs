@@ -489,7 +489,8 @@ fn time_varying_covariate_reads_the_current_record() {
     let (v, _) = dtmm_subject_eta_grad(&model, &s, &theta, &eta).unwrap();
     assert_eq!(v.to_bits(), got.to_bits());
 
-    assert!(crate::api::check_survival_tv_covariates(&model, &population_of(s.clone())).is_empty());
+    assert!(crate::model_checks::check_survival_tv_covariates(&model, &population_of(s.clone()))
+        .is_empty());
 
     // misaligned: a snapshot one short of the records
     let mut short = s.clone();
@@ -506,7 +507,8 @@ fn time_varying_covariate_reads_the_current_record() {
     with_tte.endpoint_covariates.push(dose_cov(3.0));
     assert!(with_tte.record_covariate_snapshots().is_none());
     for bad in [short, with_tte] {
-        let refused = crate::api::check_survival_tv_covariates(&model, &population_of(bad));
+        let refused =
+            crate::model_checks::check_survival_tv_covariates(&model, &population_of(bad));
         assert_eq!(refused.len(), 1, "{refused:?}");
         assert_eq!(refused[0].code, "E_ENDPOINT_TV_COVARIATE");
         assert!(refused[0].message.contains("type = dtmm"), "{}", refused[0].message);
@@ -515,7 +517,8 @@ fn time_varying_covariate_reads_the_current_record() {
     // the same covariate held constant needs no snapshot
     let mut constant = subject(&[(0.0, 0), (1.0, 1), (2.0, 0)]);
     constant.covariates = dose_cov(1.0);
-    assert!(crate::api::check_survival_tv_covariates(&model, &population_of(constant)).is_empty());
+    assert!(crate::model_checks::check_survival_tv_covariates(&model, &population_of(constant))
+        .is_empty());
 }
 
 /// The data reader's per-row snapshot is what aligns: read through the real CSV reader, a
@@ -556,7 +559,8 @@ fn reader_snapshots_align_with_state_records() {
     let want = -(p01.ln() + inv_logit(-1.3 + 0.6 * 3.0).ln() + (1.0 - p01).ln());
     let got = dtmm_subject_nll(&run.parsed.model, s, &theta, &eta);
     assert!((got - want).abs() < 1e-14, "got {got}, want {want}");
-    assert!(crate::api::check_survival_tv_covariates(&run.parsed.model, &run.population).is_empty());
+    assert!(crate::model_checks::check_survival_tv_covariates(&run.parsed.model, &run.population)
+        .is_empty());
 }
 
 /// A valid mode on the stochastic boundary — `P01 = A + η²` at `A = 1`, `η = 0`: every

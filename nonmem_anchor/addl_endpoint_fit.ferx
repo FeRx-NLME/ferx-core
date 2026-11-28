@@ -1,0 +1,25 @@
+# ferx twin (analytic) of nonmem_anchor/addl_endpoint.ctl (#2368): addl_tie_fit.ferx with a
+# binary endpoint on CMT 3, whose rows are records of the PK model. Evaluated once
+# (maxiter = 0) by tests/record_clock_nonmem_anchor.rs, which compares PRED.
+[parameters]
+  theta TVCL(0.5, 0.01, 100.0)
+  theta TVV(10.0, 0.1, 1000.0)
+  theta TH0(0.0, -10.0, 10.0)
+  omega ETA_CL ~ 0.01
+  sigma PROP ~ 0.1 (sd)
+[individual_parameters]
+  CL = TVCL * X * exp(ETA_CL)
+  V  = TVV
+[structural_model]
+  pk one_cpt_iv(cl=CL, v=V)
+[covariates]
+  X continuous
+[error_model]
+  DV ~ proportional(PROP)
+[binary_model]
+  cmt   = 3
+  logit = TH0
+[fit_options]
+  method = foce
+  maxiter = 0
+  covariance = false

@@ -171,7 +171,7 @@ fn gn_tr_two_cpt_oral_cov_ofv_matches_slsqp_baseline() {
 /// reconverged central difference of 6.86). The trust region collapsed and GN stopped
 /// 10.6 OFV above FOCEI. It now takes each subject's exact total derivative. The
 /// reference is the NONMEM 7.5.1 LAPLACE M3 fit `bloq_convergence.rs` anchors L-BFGS
-/// to (`tests/nonmem/warfarin_bloq.lst`), at the same tolerances.
+/// to (`tests/nonmem/warfarin_bloq.nm.json`), at the same tolerances.
 #[test]
 #[cfg_attr(not(feature = "slow-tests"), ignore = "slow: opt in with --features slow-tests")]
 fn gn_warfarin_bloq_m3_matches_nonmem() {

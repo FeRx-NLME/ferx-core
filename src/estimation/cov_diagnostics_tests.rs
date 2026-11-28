@@ -1427,7 +1427,7 @@ fn a_positive_definite_r_under_the_floor_is_clipped_and_takes_the_fallback() {
 }
 
 // ---- #2093 review round 2 (finding 7): the decline/remedy sentence cells, rebuilt on the
-// adjoint's clause set. `GradientFd` and `Disabled` carry a one-line remedy; `Mixture`,
+// adjoint's clause set. `GradientFd` and `Disabled` carry a one-line remedy;
 // `NonGaussianEndpoint`, `ModelOutOfScope` and `PerSubjectBail` do not.
 
 #[test]

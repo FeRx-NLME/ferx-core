@@ -154,15 +154,15 @@ impl<'a> AdaptiveInputs<'a> {
             return Ok(None);
         };
         if spec.n_draws == 0 {
-            return Err(super::entry_refusals::adaptive_options(
+            return Err(crate::entry_refusals::adaptive_options(
                 "`UncertaintySpec::n_draws` must be at least 1; omit `with_uncertainty` to \
                  simulate at the point estimate",
             ));
         }
         let template =
             crate::estimation::uncertainty_samples::fitted_params_from_result(fit, model)?;
-        if let Some(what) = first_value_difference(self.params, &template) {
-            return Err(super::entry_refusals::adaptive_options(format!(
+        if let Some(what) = first_value_difference(self.params, &template, ("run", "fit")) {
+            return Err(crate::entry_refusals::adaptive_options(format!(
                 "`with_uncertainty` draws around the fit's point estimate, but the run's \
                  parameters differ from it: {what}. Pass the fit's parameters (for example \
                  `fitted_params_from_result(&fit, &model)`) as the run's `params`"
@@ -176,7 +176,7 @@ impl<'a> AdaptiveInputs<'a> {
                 "Refit with `covariance_fallback = sir` and `sir_keep_samples = true` to draw \
                  from the SIR pool instead (#223)."
             };
-            return Err(super::entry_refusals::fit_input_missing(format!(
+            return Err(crate::entry_refusals::fit_input_missing(format!(
                 "Asymptotic uncertainty requires FitResult.covariance_matrix, and this fit has \
                  none (its covariance step did not run or did not succeed). {remedy}"
             )));
@@ -278,9 +278,11 @@ pub(crate) fn resolve_supplied_etas(
     if etas.names != model.eta_names {
         return Err(refusal(format!(
             "the supplied η are named [{}] but the model's are [{}]; supply every η of \
-             the model, in the model's order",
+             the model, in the model's order{}",
             etas.names.join(", "),
-            model.eta_names.join(", ")
+            model.eta_names.join(", "),
+            crate::types::dropped_zero_eta_note(model)
+                .map_or(String::new(), |n| format!(". Note: {n}"))
         )));
     }
     let resolved: Vec<Option<Vec<f64>>> =
@@ -399,13 +401,14 @@ impl SuppliedEtas {
     }
 }
 
-/// The first parameter whose **value** differs between the run's `params` and the fit's
-/// template (#946), or `None` when every value is bit-equal: θ, Ω, Ω_IOV, σ and the
-/// `block_sigma` ρ. Masks, FIX flags, names and bounds are not compared: ferx-r builds
-/// its `params` through `OmegaMatrix::from_matrix` with the template's flags, and the
-/// draws pin FIX coordinates from the fit either way.
+/// The first parameter whose **value** differs between `run` and `fit` (#946), or `None`
+/// when every value is bit-equal: θ, Ω, Ω_IOV, σ and the `block_sigma` ρ. Masks, FIX
+/// flags, names and bounds are not compared: ferx-r builds its `params` through
+/// `OmegaMatrix::from_matrix` with the template's flags, and the draws pin FIX coordinates
+/// from the fit either way. `(this, other)` name the two sides in the message: the run's
+/// `params` against the fit's template (`("run", "fit")`), or the two arms of a contrast.
 pub(super) fn first_value_difference(
-    run: &ModelParameters, fit: &ModelParameters,
+    run: &ModelParameters, fit: &ModelParameters, (this, other): (&str, &str),
 ) -> Option<String> {
     let bits_eq = |a: f64, b: f64| a.to_bits() == b.to_bits();
     let first_in = |a: &[f64], b: &[f64]| -> Option<Option<usize>> {
@@ -421,8 +424,8 @@ pub(super) fn first_value_difference(
                  a: &[f64],
                  b: &[f64]| {
         match k {
-            None => format!("{kind} has {} value(s), the fit's {}", a.len(), b.len()),
-            Some(k) => format!("{kind} {} is {}, the fit's is {}", name(k), a[k], b[k]),
+            None => format!("{kind} has {} value(s), the {other}'s {}", a.len(), b.len()),
+            Some(k) => format!("{kind} {} is {}, the {other}'s is {}", name(k), a[k], b[k]),
         }
     };
     let by_name = |names: &[String]| {
@@ -435,13 +438,19 @@ pub(super) fn first_value_difference(
     }
     let matrix = |name: &str, a: &nalgebra::DMatrix<f64>, b: &nalgebra::DMatrix<f64>| {
         if a.shape() != b.shape() {
-            return Some(format!("{name} is {:?}, the fit's is {:?}", a.shape(), b.shape()));
+            return Some(format!("{name} is {:?}, the {other}'s is {:?}", a.shape(), b.shape()));
         }
         (0..a.nrows())
             .flat_map(|i| (0..a.ncols()).map(move |j| (i, j)))
             .find(|&(i, j)| !bits_eq(a[(i, j)], b[(i, j)]))
             .map(|(i, j)| {
-                format!("{name}[{}, {}] is {}, the fit's is {}", i + 1, j + 1, a[(i, j)], b[(i, j)])
+                format!(
+                    "{name}[{}, {}] is {}, the {other}'s is {}",
+                    i + 1,
+                    j + 1,
+                    a[(i, j)],
+                    b[(i, j)]
+                )
             })
     };
     if let Some(d) = matrix("Ω", &run.omega.matrix, &fit.omega.matrix) {
@@ -456,7 +465,7 @@ pub(super) fn first_value_difference(
         (None, None) => {}
         (a, _) => {
             return Some(format!(
-                "the run {} an Ω_IOV and the fit {}",
+                "the {this} {} an Ω_IOV and the {other} {}",
                 if a.is_some() { "has" } else { "has no" },
                 if a.is_some() { "has none" } else { "has one" },
             ))
@@ -493,5 +502,5 @@ pub(crate) fn list_ids(ids: &[&str]) -> String {
 }
 
 fn refusal(message: String) -> EngineError {
-    super::entry_refusals::supplied_etas(message)
+    crate::entry_refusals::supplied_etas(message)
 }

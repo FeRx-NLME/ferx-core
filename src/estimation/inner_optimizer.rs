@@ -934,7 +934,7 @@ impl EbeVariance {
     ) -> Self {
         let sheiner_beal =
             !interaction && crate::types::FitOptions::agq_nodes_for(method, n_agq).is_none();
-        if sheiner_beal && model.error_spec.has_f_dependent_variance() {
+        if sheiner_beal && model.has_f_dependent_variance() {
             Self::Population
         } else {
             Self::Conditional
@@ -998,10 +998,10 @@ pub(crate) struct InnerSolvePolicy {
     /// zero — a subject with no observations, a random effect no prediction reads — is taken
     /// for the cold placeholder at every evaluation and re-runs the guarded multi-start each
     /// time, which cannot move it: on `examples/mm_iv.ferx` with one unused η, 920 multi-starts
-    /// in 470 solves, none of which moved an EBE. Unlike `init_is_mode` it does not say the
-    /// starts are modes *at these parameters*, so the IOV solve's start gates — its seed gate
-    /// and, since #2730, its multi-start gate — read only that and still apply: an IOV
-    /// subject's exactly-zero mode is cold there at every evaluation. Set by
+    /// in 470 solves, none of which moved an EBE. The IOV solve's seed and multi-start gates
+    /// read it too, for a start that carries κ̂ as well as η̂ (#2900). Unlike `init_is_mode` it
+    /// does not say the starts are modes *at these parameters*, so the IOV solve's start
+    /// certificates read only that. Set by
     /// [`PrevEtas::Solved`]; `false`, the `Default`, otherwise.
     pub(crate) init_is_warm: bool,
     /// Return a warm start unchanged when [`FallbackCertifier::certifies_in_place`] already
@@ -1031,6 +1031,12 @@ pub(crate) struct InnerSolvePolicy {
     /// quadrature, whose objective is that constant; quadrature, IMP and the rest keep the
     /// solve. `false`, the `Default`, solves.
     pub(crate) skip_refused: bool,
+    /// Restart from a small kick of each informative coordinate of the returned EBE and keep a
+    /// lower mode ([`kink::kick_restarts`], #3159), where a second mode a barrier away is
+    /// otherwise reported as the subject's EBE. `[fit_options] inner_kick`, in every solve: kicked
+    /// in the final pass only, a fit's #833 recovery scores the warm, unkicked EBEs lower on OFV
+    /// and reports them (#3159 review). `false`, the `Default`.
+    pub(crate) kick: bool,
 }
 
 impl InnerSolvePolicy {
@@ -1052,6 +1058,7 @@ impl InnerSolvePolicy {
             keep_certified_start: false,
             unseeded_iov_warm: false,
             skip_refused: skips_refused_subjects(options),
+            kick: options.inner_kick,
         }
     }
 
@@ -1769,6 +1776,12 @@ struct EvalRoute {
 
 #[cfg(test)]
 thread_local! {
+    /// Fused IOV gradient-pass values put into the IOV EBE search's objective memo (#3088).
+    pub(crate) static IOV_MEMO_FUSED_PUTS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+#[cfg(test)]
+thread_local! {
     /// The points [`EvalRoute::at`] decided on this thread, in order (a test asserts the solve
     /// asks once per point, not once per consumer).
     pub(crate) static EVAL_ROUTE_LOG: RefCell<Vec<Vec<u64>>> = const { RefCell::new(Vec::new()) };
@@ -1802,10 +1815,27 @@ impl EvalRoute {
 /// Identical to `effective_for` for every subject the walk cannot take
 /// (`effective_model_for_eval_iov` returns `effective_for` for them), so only a walk-eligible
 /// transit/IG subject changes behaviour.
+#[cfg(test)]
 fn inner_stall_enabled_at_iov(
     model: &CompiledModel, subject: &Subject, theta: &[f64], stacked_eta: &[f64],
 ) -> bool {
-    crate::pk::effective_model_for_eval_iov(model, subject, theta, stacked_eta).ode_spec.is_some()
+    iov_eval_route(model, subject, theta, stacked_eta).0
+}
+
+/// `(ode, fused_native)` at one IOV iterate ([`iov_eval_route`]).
+type IovRoute = (bool, bool);
+
+/// The IOV inner solve's route at one stacked iterate `[η_bsv, κ_g0.., κ_g1..]` (η in true
+/// space): `(ode, fused_native)`. `ode` is [`inner_stall_enabled_at_iov`]'s predicate; `fused_native`
+/// whether the fused gradient pass's value is bit-equal to the native objective there — the
+/// model actually evaluated is closed form and one the plan scores bit-equal
+/// ([`crate::stats::likelihood::plan_value_bit_equal`]), as [`EvalRoute`] without IOV.
+fn iov_eval_route(
+    model: &CompiledModel, subject: &Subject, theta: &[f64], stacked_eta: &[f64],
+) -> IovRoute {
+    let eff = crate::pk::effective_model_for_eval_iov(model, subject, theta, stacked_eta);
+    let ode = eff.ode_spec.is_some();
+    (ode, !ode && crate::stats::likelihood::plan_value_bit_equal(eff))
 }
 
 /// Find Empirical Bayes Estimates (EBEs) for a single subject via BFGS.
@@ -2163,12 +2193,13 @@ pub(crate) fn find_ebe_for_stage_with_prev(
         restarts,
         schedule.as_ref(),
         // The historical seed, as `find_ebe_with_variance` uses; only the convention, the
-        // #2013 screen and the #2095 twin seed come from the stage.
+        // #2013 screen, the #2095 twin seed and the #3159 kicks come from the stage.
         InnerSolvePolicy {
             ebe_variance: EbeVariance::for_options(stage, model),
             screen: stage.inner_screen,
             twin_seed: stage.inner_twin_seed,
             skip_refused: skips_refused_subjects(stage),
+            kick: stage.inner_kick,
             ..InnerSolvePolicy::default()
         }
         .with_prev_etas(prev),
@@ -2462,6 +2493,9 @@ pub(crate) fn recording_handle() -> Option<RecordingHandle> {
     INNER_RECORDING.with(|r| r.borrow().clone())
 }
 
+#[path = "inner_kink.rs"]
+mod kink;
+
 /// Run `f` with this thread writing to `handle`, then restore what it wrote to before — on
 /// every exit path, a panic included, so a recorded fit that panics on a cached pool worker
 /// cannot leave its handle armed there (#2379).
@@ -2599,7 +2633,8 @@ fn find_ebe_impl_from(
     // When the model has kappa declarations AND this subject has occasion labels,
     // optimize over the flat vector [bsv_eta (n_eta), kappa_1 (n_kappa), ..., kappa_K (n_kappa)].
     if model.n_kappa > 0 && !subject.occasions.is_empty() {
-        if policy.skip_refused && crate::stats::likelihood::iov_refuses_frem(model, subject) {
+        let refused = crate::stats::likelihood::iov_refuses_frem(model, subject);
+        if policy.skip_refused && refused {
             return refused_iov_ebe(model, subject);
         }
         let ebe = find_ebe_iov_seeded(
@@ -2613,7 +2648,10 @@ fn find_ebe_impl_from(
             restarts,
             policy.ebe_variance,
             policy.init_is_mode,
+            // A refused subject's zeros are `refused_iov_ebe`'s placeholder, not a solve.
+            policy.init_is_warm && !refused,
             if policy.unseeded_iov_warm { InnerHessianSeed::None } else { policy.seed },
+            policy.kick,
         );
         #[cfg(test)]
         with_recording(|r| {
@@ -2696,8 +2734,8 @@ type ScreenDescent = Option<(Vec<f64>, InnerExit, f64)>;
 /// `init_is_mode` is the caller's certificate that `eta_init` came from a solve, which makes
 /// any `Some` warm, zeros included: a converged mode at these parameters
 /// ([`InnerSolvePolicy::init_is_mode`], #2076) or a mode an earlier inner pass returned
-/// ([`InnerSolvePolicy::init_is_warm`]); the non-IOV solve passes either
-/// ([`InnerSolvePolicy::is_warm`]), the IOV solve the first.
+/// ([`InnerSolvePolicy::init_is_warm`]); the solve's start gates pass either
+/// ([`InnerSolvePolicy::is_warm`]), the IOV solve's start certificates the first.
 fn is_warm_start(eta_init: Option<&[f64]>, init_is_mode: bool) -> bool {
     eta_init.is_some_and(|w| init_is_mode || w.iter().any(|&v| v != 0.0))
 }
@@ -2706,6 +2744,53 @@ fn is_warm_start(eta_init: Option<&[f64]>, init_is_mode: bool) -> bool {
 /// `find_ebe_impl`). Two solves reaching the *same* mode by different paths agree far below
 /// this; the second modes it exists for are separated by O(1).
 const COLD_SEED_TIE_TOL: f64 = 1e-9;
+
+/// The walks an EBE solve keeps for reading the mode's predictions back (#3042): the first point
+/// to reach the lowest value scored, and the latest point tied with it bit for bit. The mode can
+/// tie a point an ulp beside it, walked before it (macOS arm64, `mm_oral` subject 1) or after it
+/// (a line-search trial), so one slot keeps the earlier of a tie and the other the later, and the
+/// mode is found either way. The mode is not always the lowest value: a candidate scoring lower
+/// by under the multistart's `1e-9` is rejected, yet takes the first slot. A tie between three
+/// points, or a mode that is not the lowest, is walked again: only a copy is lost, never a value.
+#[derive(Default)]
+struct KeptWalks([Option<(Vec<u64>, f64, Vec<f64>)>; 2]);
+
+impl KeptWalks {
+    /// The value of a kept walk at exactly `e`.
+    fn held(&self, e: &[f64]) -> Option<f64> {
+        self.0.iter().flatten().find(|(k, ..)| same_bits(k, e)).map(|w| w.1)
+    }
+
+    /// Keep `(e, v, preds)` if `v` is a real value that is a new lowest or ties it.
+    fn offer(&mut self, e: &[f64], v: f64, preds: &[f64]) {
+        let slot = match &self.0[0] {
+            _ if !crate::stats::likelihood::is_usable_subject_nll(v) => return,
+            None => 0,
+            Some(b) if v < b.1 => 0,
+            Some(b) if v == b.1 => 1,
+            Some(_) => return,
+        };
+        let (k, bv, p) = self.0[slot].get_or_insert_with(Default::default);
+        k.clear();
+        k.extend(e.iter().map(|x| x.to_bits()));
+        *bv = v;
+        p.clear();
+        p.extend_from_slice(preds);
+    }
+
+    /// The predictions kept at exactly `mode`, if `n_obs` long.
+    fn take_at(self, mode: &[f64], n_obs: usize) -> Option<Vec<f64>> {
+        self.0
+            .into_iter()
+            .flatten()
+            .find(|(k, _, p)| same_bits(k, mode) && p.len() == n_obs)
+            .map(|w| w.2)
+    }
+}
+
+fn same_bits(k: &[u64], e: &[f64]) -> bool {
+    k.len() == e.len() && k.iter().zip(e).all(|(&b, &x)| b == x.to_bits())
+}
 
 /// One inner solve. `cold_seed = false` is the normal solve: the policy's Hessian seed is
 /// used only on a genuinely warm start. `cold_seed = true` forces the seed onto a cold start,
@@ -2817,7 +2902,7 @@ fn find_ebe_solve(
     // `agrad`'s scratch for its analytic-gradient call, kept separate from `obj`'s above.
     // The `match analytic_eta_nll_gradient_with_schedule(...) { ... }` below has its
     // scrutinee's `&mut …borrow_mut()` temporaries live for the *whole* match — including
-    // the `None` arm, which calls `gradient_fd(&obj, ..)` and so re-enters `obj` while
+    // the `None` arm, which calls `fd` and so re-enters `obj` while
     // those borrows are still outstanding. Sharing one RefCell pair between `obj` and
     // `agrad` would panic there with "already borrowed"; separate cells keep the fallback
     // re-entrant.
@@ -2886,15 +2971,14 @@ fn find_ebe_solve(
         key.extend(e.iter().map(|x| x.to_bits()));
         m.push((key, v));
     };
-    // The best point the walk has scored this solve, with the predictions it left: the 4-slot
+    // The best points the walk has scored this solve, with the predictions they left: the 4-slot
     // memo above decides which value a lookup returns (a fused gradient pass's value can sit
     // beside the walk's), and only on its miss is the walk's own, a pure function of η, read
     // back from here instead of walked again. The solve reads back one point's predictions —
-    // the mode's, which is the lowest value it scored — so one entry is all that is kept
-    // (not a vector per η the search and its finite-difference probes visited), written only
-    // on an improvement and read without a copy. An ODE walk is what a repeat is worth
-    // skipping; a closed form re-walks for less than the lookup costs.
-    let best_walk: RefCell<Option<(Vec<u64>, f64, Vec<f64>)>> = RefCell::new(None);
+    // the mode's, normally the lowest value it scored — so [`KeptWalks`] holds two entries, not
+    // a vector per η the search and its finite-difference probes visited. An ODE walk is what a
+    // repeat is worth skipping; a closed form re-walks for less than the lookup costs.
+    let best_walk: RefCell<KeptWalks> = RefCell::new(KeptWalks::default());
     let track_walks = model.ode_spec.is_some();
     let obj = |e: &[f64]| -> f64 {
         if let Some(v) = memo_get(e) {
@@ -2905,21 +2989,12 @@ fn find_ebe_solve(
             memo_put(e, v);
             return v;
         }
-        let held = best_walk.borrow().as_ref().and_then(|(k, v, _)| {
-            (k.len() == e.len() && k.iter().zip(e).all(|(&b, &x)| b == x.to_bits())).then_some(*v)
-        });
+        let held = best_walk.borrow().held(e);
         let v = if let Some(v) = held {
             v
         } else {
             let v = obj_uncached(e);
-            let mut best = best_walk.borrow_mut();
-            if v.is_finite() && best.as_ref().is_none_or(|b| v < b.1) {
-                let (k, bv, p) = best.get_or_insert_with(Default::default);
-                k.clear();
-                k.extend(e.iter().map(|x| x.to_bits()));
-                *bv = v;
-                p.clone_from(&pred_recycle.borrow());
-            }
+            best_walk.borrow_mut().offer(e, v, &pred_recycle.borrow());
             v
         };
         memo_put(e, v);
@@ -3003,6 +3078,13 @@ fn find_ebe_solve(
     let opted_out = inner_analytic_opted_out(model);
     let profile = inner_profile_enabled();
     let fused_first_gradient = RefCell::new(None::<Vec<f64>>);
+    // Central differences, both FD arms below (#2868).
+    let integrating_step = model_integrating_fd_step(model);
+    let fd = |e: &[f64]| {
+        #[cfg(test)]
+        INNER_AGRAD_ROUTE.with(|c| c.set((c.get().0, c.get().1, c.get().2 + 1)));
+        ebe_gradient_fd(&obj, e, None, n_eta, integrating_step.filter(|_| stall_at(e)))
+    };
     // The gradient a fused pass ([`PrimeFn`]) took at the exact bits of its point.
     let primed: RefCell<Option<(Vec<u64>, Vec<f64>)>> = RefCell::new(None);
     let agrad = |e: &[f64]| -> Vec<f64> {
@@ -3031,11 +3113,7 @@ fn find_ebe_solve(
             g
         };
         if !use_analytic {
-            return exact().unwrap_or_else(|| {
-                #[cfg(test)]
-                INNER_AGRAD_ROUTE.with(|c| c.set((c.get().0, c.get().1, c.get().2 + 1)));
-                gradient_fd(&obj, e, n_eta)
-            });
+            return exact().unwrap_or_else(|| fd(e));
         }
         let t0 = GRADIENT_TIMINGS.start();
         // Invalidated by emptying, so the key buffer survives for the refill below.
@@ -3105,9 +3183,7 @@ fn find_ebe_solve(
                     GRADIENT_TIMINGS.record_analytic(t0);
                     return g;
                 }
-                #[cfg(test)]
-                INNER_AGRAD_ROUTE.with(|c| c.set((c.get().0, c.get().1, c.get().2 + 1)));
-                let g = gradient_fd(&obj, e, n_eta);
+                let g = fd(e);
                 GRADIENT_TIMINGS.record_fd(t0);
                 if profile {
                     PROFILE_INNER_FD_FALLBACK.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -3277,6 +3353,9 @@ fn find_ebe_solve(
             stop_precond,
             &stall_at,
             short_line_search,
+            // Not on every model (#3159 land): on by default it fired 390 times in a smooth
+            // transit fit, and the EBEs it moved broke BOBYQA's convergence.
+            kink::kink_escape_allowed(model, use_analytic, policy.kick),
         )
     };
 
@@ -3427,6 +3506,8 @@ fn find_ebe_solve(
                 #[cfg(test)]
                 TWIN_SEEDS_RUN.with(|n| n.set(n.get() + 1));
                 let mut cand = start;
+                // No kink escape on this probe (#3159 review): it is a short, independent
+                // exploration of the flip-flop twin, not the primary solve.
                 let ok = inner_minimize_with_grad(
                     &obj,
                     &agrad,
@@ -3438,6 +3519,7 @@ fn find_ebe_solve(
                     None,
                     stop_precond,
                     &stall_at,
+                    false,
                     false,
                 );
                 if cand.iter().all(|v| v.is_finite()) {
@@ -3460,7 +3542,7 @@ fn find_ebe_solve(
         // subject sits where `η_ka` and `η_V` move together (`ka ↔ CL/V`), and a cold
         // BFGS from η = 0 and every axis seed descend into the same shallower basin.
         // The screen scores `policy.screen` quasi-random points from `N(0, 4Ω)`, keyed
-        // by the subject's ID, and descends from the `SCREEN_TOP_K` lowest. A descent
+        // by the subject's ID, and descends from spread-out starts among the lowest. A descent
         // replaces the incumbent only when it is lower by more than the same `1e-9` the
         // axis scan uses AND lies more than `SCREEN_MIN_OMEGA_DIST` from it in the Ω⁻¹
         // metric: a descent that reconverges to the incumbent's basin, whatever its
@@ -3507,11 +3589,12 @@ fn find_ebe_solve(
             }
         }
         // Reset / TV-covariate subjects (family 1) scan every coordinate, exactly
-        // as before — bit-identical. Everyone else (family 2) is probed per
+        // as before — bit-identical; an inert first-record reset does not count (#2081).
+        // Everyone else (family 2) is probed per
         // coordinate and scans only the weakly-identified ones, so well-informed
         // subjects pay just `2·n_eta` cheap objective evaluations and their EBE
         // stays bit-identical to `inner_restarts = 0` (no seed solve runs).
-        let scan_all = subject.has_resets() || subject.has_tv_covariates();
+        let scan_all = subject.has_effective_resets() || subject.has_tv_covariates();
         let scan_coord: Vec<bool> = if scan_all {
             vec![true; n_eta]
         } else {
@@ -3528,6 +3611,8 @@ fn find_ebe_solve(
             restarts,
             Some(&params.omega.matrix),
         ) {
+            // No kink escape on this probe (#3159 review): a restart seed already starts at a
+            // sizeable step, not on the search's own mode.
             let ok = inner_minimize_with_grad(
                 &obj,
                 &agrad,
@@ -3539,6 +3624,7 @@ fn find_ebe_solve(
                 None,
                 stop_precond,
                 &stall_at,
+                false,
                 false,
             );
             if cand.iter().all(|v| v.is_finite()) {
@@ -3555,6 +3641,54 @@ fn find_ebe_solve(
             }
         }
         MULTISTART_PROFILE.record(twin_moved, screen_moved, axis_moved);
+    }
+
+    // Kick restarts around the incumbent (#3159): a second mode a barrier away. Each probe is
+    // capped and cheap; the walk's end point is re-descended to the search's own tolerance
+    // before it is compared and adopted (`kink::kick_restarts`'s `finish`, #3159 review).
+    if policy.kick {
+        let sds: Vec<f64> =
+            omega_prior_diag(&params.omega, n_eta).iter().map(|p| p.var.max(0.0).sqrt()).collect();
+        let probe = |cand: &mut Vec<f64>| {
+            inner_minimize_with_grad(
+                &obj,
+                &agrad,
+                cand,
+                n_eta,
+                max_iter.min(kink::KICK_MAX_ITER),
+                tol,
+                precond.as_deref(),
+                None,
+                stop_precond,
+                &stall_at,
+                false,
+                false,
+            );
+        };
+        let finish = |cand: &mut Vec<f64>| {
+            inner_minimize_with_grad(
+                &obj,
+                &agrad,
+                cand,
+                n_eta,
+                max_iter,
+                tol,
+                precond.as_deref(),
+                None,
+                stop_precond,
+                &stall_at,
+                false,
+                use_analytic,
+            )
+        };
+        if let Some((cand, cand_nll, ok)) =
+            kink::kick_restarts(&eta, nll, &sds, &obj, probe, finish)
+        {
+            nll = cand_nll;
+            eta = cand;
+            ebe_exit = ok;
+            used_fallback = false;
+        }
     }
 
     // ── Runaway-EBE guard (#958) ───────────────────────────────────────────
@@ -3661,9 +3795,8 @@ fn find_ebe_solve(
     let ipreds = if at_mode(&preds_at.borrow()) && pred_recycle.borrow().len() == n_obs {
         Some(pred_recycle.take())
     } else {
-        // The last walk was another point (a finite-difference probe beside the mode).
-        let kept =
-            best_walk.take().filter(|(k, _, p)| at_mode(k) && p.len() == n_obs).map(|(_, _, p)| p);
+        // The last walk was another point (a line-search trial beside the mode).
+        let kept = best_walk.take().take_at(&eta_true, n_obs);
         #[cfg(test)]
         BEST_WALK_RESTORES.with(|c| c.set(c.get() + usize::from(kept.is_some())));
         kept
@@ -3828,6 +3961,28 @@ thread_local! {
     /// on the analytic route" distinguishable from "no step ran" (#2209).
     pub(crate) static INNER_AGRAD_ROUTE: std::cell::Cell<(usize, usize, usize)> =
         const { std::cell::Cell::new((0, 0, 0)) };
+    /// The integrating step taken (`None`: the roundoff step) and the `origin` of every
+    /// `ebe_gradient_fd` call on this thread, so a test can read which step and which origin
+    /// each inner solve differenced with (#2868, #3145). `None` until a
+    /// test arms it ([`arm_ebe_fd_calls`]), so the worker threads of the cached fit pools,
+    /// which nothing arms, do not grow it across the lib test run.
+    pub(crate) static EBE_FD_CALLS: RefCell<Option<Vec<EbeFdCall>>> = const { RefCell::new(None) };
+}
+
+/// One `ebe_gradient_fd` call: the integrating step it took, if it did, and its `origin`.
+#[cfg(test)]
+pub(crate) type EbeFdCall = (Option<f64>, Option<Vec<f64>>);
+
+/// Start recording [`EBE_FD_CALLS`] on this thread, from empty.
+#[cfg(test)]
+pub(crate) fn arm_ebe_fd_calls() {
+    EBE_FD_CALLS.with(|c| *c.borrow_mut() = Some(Vec::new()));
+}
+
+/// The calls recorded on this thread since [`arm_ebe_fd_calls`], disarming it.
+#[cfg(test)]
+pub(crate) fn take_ebe_fd_calls() -> Vec<EbeFdCall> {
+    EBE_FD_CALLS.with(|c| c.borrow_mut().take()).expect("arm_ebe_fd_calls before take_ebe_fd_calls")
 }
 
 /// IOV inner optimizer: optimizes [bsv_psi, kappa_1, ..., kappa_K] jointly,
@@ -3855,7 +4010,9 @@ fn find_ebe_iov(
         0,
         ebe_variance,
         init_is_mode,
+        false,
         InnerHessianSeed::GaussNewton,
+        false,
     )
 }
 
@@ -3865,7 +4022,7 @@ fn find_ebe_iov(
 fn find_ebe_iov_seeded(
     model: &CompiledModel, subject: &Subject, params: &ModelParameters, max_iter: usize, tol: f64,
     eta_init: Option<&[f64]>, mu_k: Option<&[f64]>, restarts: usize, ebe_variance: EbeVariance,
-    init_is_mode: bool, seed: InnerHessianSeed,
+    init_is_mode: bool, init_is_warm: bool, seed: InnerHessianSeed, kick: bool,
 ) -> EbeResult {
     let n_eta = model.n_eta;
     let n_kappa = model.n_kappa;
@@ -3935,6 +4092,10 @@ fn find_ebe_iov_seeded(
         None => eta_init,
     };
     let mut x = iov_initial_vector(n_eta, n_flat, &mu, warm);
+    // A solved start is warm only when it carries κ̂ too (#2900): an all-zero η̂-only one (the
+    // ODE+IOV cache's, a nested subject's) restarts κ at 0, which the multi-start still scans.
+    let joint = warm.is_some_and(|w| w.len() == n_flat);
+    let warm_start = is_warm_start(eta_init, init_is_mode || (init_is_warm && joint));
     #[cfg(test)]
     with_recording(|r| {
         r.starts.push(IovStart {
@@ -3969,7 +4130,7 @@ fn find_ebe_iov_seeded(
     let schedule_cached = cacheable_schedule_iov_cached(model, subject);
     let schedule = schedule_cached.as_ref().as_ref();
 
-    let obj = |p: &[f64]| -> f64 {
+    let obj_uncached = |p: &[f64]| -> f64 {
         // Recover bsv_eta = psi - mu; kappas pass through unchanged.
         let eta_t: Vec<f64> = p[..n_eta].iter().zip(mu.iter()).map(|(pi, mi)| pi - mi).collect();
         let Some(layout) = &layout else {
@@ -3993,6 +4154,31 @@ fn find_ebe_iov_seeded(
             schedule,
             frozen,
         )
+    };
+    // The objective memo of `find_ebe_solve` (#3088): the native values the search scored, and
+    // the values the gradient pass scored with them where those are bit-equal to the native
+    // objective (`route_at(..).1` below), so the line search's `obj(x)` after a `grad(x)` is a
+    // lookup instead of a second walk of the subject.
+    let memo: RefCell<Vec<(Vec<u64>, f64)>> = RefCell::new(Vec::with_capacity(OBJ_MEMO));
+    let memo_get = |p: &[f64]| -> Option<f64> {
+        memo.borrow().iter().find_map(|(k, v)| {
+            (k.len() == p.len() && k.iter().zip(p).all(|(&b, &x)| b == x.to_bits())).then_some(*v)
+        })
+    };
+    let memo_put = |p: &[f64], v: f64| {
+        let mut m = memo.borrow_mut();
+        let mut key = if m.len() == OBJ_MEMO { m.remove(0).0 } else { Vec::with_capacity(p.len()) };
+        key.clear();
+        key.extend(p.iter().map(|x| x.to_bits()));
+        m.push((key, v));
+    };
+    let obj = |p: &[f64]| -> f64 {
+        if let Some(v) = memo_get(p) {
+            return v;
+        }
+        let v = obj_uncached(p);
+        memo_put(p, v);
+        v
     };
 
     // IOV models are not FREM, so no inner preconditioner (identity H0). Use the exact
@@ -4031,7 +4217,17 @@ fn find_ebe_iov_seeded(
     // cannot serve at this iterate, whose objective is evaluated on the ODE twin (#719/#814,
     // #1560). Evaluated per iterate and latched in the cores: κ moves the walk's per-pair
     // flip-flop domain. See `inner_stall_enabled_at_iov`.
-    let stall_at = |p: &[f64]| {
+    //
+    // One decision per evaluated point ([`iov_eval_route`]), shared by the stall stop and the
+    // fused-value checks, as `find_ebe_solve`'s `route_at`.
+    let route_cache: RefCell<Option<(Vec<u64>, IovRoute)>> = RefCell::new(None);
+    let route_at = |p: &[f64]| -> IovRoute {
+        let mut c = route_cache.borrow_mut();
+        let same =
+            |k: &[u64]| k.len() == p.len() && k.iter().zip(p).all(|(&b, &x)| b == x.to_bits());
+        if let Some((_, r)) = c.as_ref().filter(|(k, _)| same(k)) {
+            return *r;
+        }
         let mut stacked_true = p.to_vec();
         for (k, st) in stacked_true.iter_mut().take(n_eta).enumerate() {
             *st = p[k] - mu[k];
@@ -4041,11 +4237,17 @@ fn find_ebe_iov_seeded(
             stacked_true.truncate(n_eta);
             stacked_true.extend(to_kappas(p).into_iter().flatten());
         }
-        inner_stall_enabled_at_iov(model, subject, &params.theta, &stacked_true)
+        let r = iov_eval_route(model, subject, &params.theta, &stacked_true);
+        *c = Some((p.iter().map(|v| v.to_bits()).collect(), r));
+        r
     };
+    let stall_at = |p: &[f64]| route_at(p).0;
     // Custom / time-varying residual-magnitude (#484/#576): η-independent, so
     // computed once per subject here rather than inside `agrad` (see `find_ebe`).
     let mult = model.ruv_obs_mult(subject, &params.theta);
+    // The recording's row buffer, reused by every analytic gradient of this search
+    // (#3088), as `find_ebe_solve`'s `obs_grad_recycle`.
+    let obs_grad_recycle = RefCell::new(Vec::<crate::sens::provider::ObsGrad>::new());
     // One gradient closure for both the optimizer and the fallback stationarity check
     // (analytic stacked-η IOV gradient when in scope, else FD), so they agree on
     // convergence — see the matching note in `find_ebe`.
@@ -4074,7 +4276,28 @@ fn find_ebe_iov_seeded(
             frozen,
         )
     };
+    // Central differences, every FD arm below: stepped from η, not ψ (#2868).
+    let integrating_step = model_integrating_fd_step(model);
+    let fd = |p: &[f64]| {
+        #[cfg(test)]
+        IOV_AGRAD_ROUTE.with(|c| c.set((c.get().0, c.get().1 + 1)));
+        ebe_gradient_fd(&obj, p, Some(&mu), n_flat, integrating_step.filter(|_| stall_at(p)))
+    };
+    // The gradient a fused trial ([`PrimeFn`]) took at the exact bits of its point.
+    let primed: RefCell<Option<(Vec<u64>, Vec<f64>)>> = RefCell::new(None);
+    // The gradient pass scores its value against the declared residual correlation; the
+    // objective above scores the live ρ (#847), so the value is asked for only where neither
+    // is dense (the pass's own scope covers the declared one).
+    let want_value = !model.residual_cov_at(params).is_dense();
     let agrad = |p: &[f64]| -> Vec<f64> {
+        {
+            let mut held = primed.borrow_mut();
+            if held.as_ref().is_some_and(|(k, _)| {
+                k.len() == p.len() && k.iter().zip(p).all(|(&b, &x)| b == x.to_bits())
+            }) {
+                return held.take().map(|(_, g)| g).unwrap_or_default();
+            }
+        }
         if !analytic_iov_inner {
             // The kernel's exact gradient where it serves the subject, a cross-row
             // (dense) IOV residual included (#1082 PR5, #2101); central differences else.
@@ -4084,11 +4307,7 @@ fn find_ebe_iov_seeded(
                     IOV_AGRAD_ROUTE.with(|c| c.set((c.get().0 + 1, c.get().1)));
                     g
                 }
-                None => {
-                    #[cfg(test)]
-                    IOV_AGRAD_ROUTE.with(|c| c.set((c.get().0, c.get().1 + 1)));
-                    gradient_fd(&obj, p, n_flat)
-                }
+                None => fd(p),
             };
         }
         let Some(layout) = &layout else {
@@ -4110,7 +4329,8 @@ fn find_ebe_iov_seeded(
             stacked_true.truncate(n_eta);
             stacked_true.extend(to_kappas(p).into_iter().flatten());
         }
-        match analytic_eta_nll_gradient_iov_frozen(
+        let mut fused_value = None::<f64>;
+        match analytic_eta_nll_value_gradient_iov_frozen(
             model,
             subject,
             layout,
@@ -4121,8 +4341,18 @@ fn find_ebe_iov_seeded(
             &params.sigma.values,
             mult.as_deref(),
             frozen,
+            &mut obs_grad_recycle.borrow_mut(),
+            want_value.then_some(&mut fused_value),
         ) {
             Some(g) => {
+                // The objective's value at `p` from the pass that just took its gradient, where
+                // it is the native value bit for bit (`route_at`): the search's next `obj(p)` is
+                // a memo hit instead of a second walk (#3088).
+                if let Some(v) = fused_value.filter(|_| route_at(p).1) {
+                    #[cfg(test)]
+                    IOV_MEMO_FUSED_PUTS.with(|c| c.set(c.get() + 1));
+                    memo_put(p, v);
+                }
                 #[cfg(test)]
                 IOV_AGRAD_ROUTE.with(|c| c.set((c.get().0 + 1, c.get().1)));
                 g
@@ -4133,11 +4363,7 @@ fn find_ebe_iov_seeded(
                     IOV_AGRAD_ROUTE.with(|c| c.set((c.get().0 + 1, c.get().1)));
                     g
                 }
-                None => {
-                    #[cfg(test)]
-                    IOV_AGRAD_ROUTE.with(|c| c.set((c.get().0, c.get().1 + 1)));
-                    gradient_fd(&obj, p, n_flat)
-                }
+                None => fd(p),
             },
         }
     };
@@ -4220,7 +4446,7 @@ fn find_ebe_iov_seeded(
         && !model.has_covariate_nn()
         && !matches!(inner_optimizer_mode(), crate::types::InnerOptimizer::NelderMead)
         && !inner_use_lbfgs(n_flat);
-    let iov_seed = (seeded && is_warm_start(eta_init, init_is_mode))
+    let iov_seed = (seeded && warm_start)
         .then(|| {
             let mut st: Vec<f64> = x[..n_eta].iter().zip(mu.iter()).map(|(p, m)| p - m).collect();
             for k in to_kappas(&x) {
@@ -4232,8 +4458,45 @@ fn find_ebe_iov_seeded(
         })
         .flatten()
         .filter(|h| h.nrows() == n_flat && h.ncols() == n_flat);
-    let primary = inner_minimize_with_grad(
+    #[cfg(test)]
+    LAST_INITIAL_HESSIAN.with(|h| *h.borrow_mut() = iov_seed.clone());
+    // Value/gradient fusion on the line search's full-step trial, as in `find_ebe_solve`:
+    // where the gradient pass also scores the value bit-equal to the native objective, the
+    // trial runs that one pass — value for the Armijo test, gradient parked in `primed` for the
+    // driver's next `grad(x)` — instead of the native walk followed by the gradient pass.
+    // Closed-form objectives only, as there: on an ODE objective the gradient integration costs
+    // more than the value integration, and a rejected full step would pay it for nothing.
+    let fuse_eligible = analytic_iov_inner
+        && !opted_out
+        && layout.is_some()
+        && nested.is_none()
+        && !stall_at(&x)
+        && want_value
+        && model.frem_config.is_none()
+        && !model.is_sde()
+        && !matches!(model.bloq_in_force(), crate::types::BloqMethod::M3)
+        && subject.obs_records.is_empty()
+        && subject.fremtype.iter().all(|&ft| ft == 0);
+    let prime_fn = |p: &[f64]| -> Option<f64> {
+        if !route_at(p).1 {
+            return None;
+        }
+        let g = agrad(p);
+        {
+            let mut held = primed.borrow_mut();
+            let key = held.get_or_insert_with(|| (Vec::new(), Vec::new()));
+            key.0.clear();
+            key.0.extend(p.iter().map(|v| v.to_bits()));
+            key.1 = g;
+        }
+        // The value `agrad` just memoised (absent when its pass could not score `p`: the
+        // gradient stays parked for the `grad(p)` the driver takes anyway).
+        memo_get(p)
+    };
+    let prime: Option<&PrimeFn<'_>> = fuse_eligible.then_some(&prime_fn as &PrimeFn<'_>);
+    let primary = inner_minimize_with_prime(
         &obj,
+        prime,
         &agrad,
         &mut x,
         n_flat,
@@ -4244,6 +4507,7 @@ fn find_ebe_iov_seeded(
         None,
         &stall_at,
         false,
+        kink::kink_escape_allowed(model, analytic_iov_inner, kick),
     );
     // On BFGS failure, recover exactly as the non-IOV `find_ebe` does (cold seed = prior
     // mode `bsv_psi = μ`, κ = 0): keep the lower-objective of {BFGS partial, NM restart}
@@ -4331,7 +4595,7 @@ fn find_ebe_iov_seeded(
     // Cost: `2·restarts` descents per scanned coordinate, so linear in the occasions, and
     // on cold solves only; the probes are objective evaluations, `2` per seed. The Sobol
     // screen and the twin seed stay off this path.
-    if restarts > 0 && !is_warm_start(eta_init, init_is_mode) {
+    if restarts > 0 && !warm_start {
         #[cfg(test)]
         EBE_MULTISTARTS_STARTED.with(|n| n.set(n.get() + 1));
         let mut nll = obj(&x);
@@ -4371,8 +4635,11 @@ fn find_ebe_iov_seeded(
                     }
                 });
             }
+            // No kink escape on this probe (#3159 review): a restart seed already starts at a
+            // sizeable step, not on the search's own mode.
             let ok = inner_minimize_with_grad(
                 &obj, &agrad, &mut cand, n_flat, max_iter, tol, None, None, None, &stall_at, false,
+                false,
             );
             if cand.iter().all(|v| v.is_finite()) {
                 let cand_nll = obj(&cand);
@@ -4393,6 +4660,54 @@ fn find_ebe_iov_seeded(
             }
         }
         MULTISTART_PROFILE.record(false, false, axis_moved);
+    }
+
+    // Kick restarts around the incumbent (#3159), on the flat `[ψ, κ_1, …, κ_K]`. Each probe is
+    // capped and cheap; the walk's end point is re-descended to the search's own tolerance
+    // before it is compared and adopted (`kink::kick_restarts`'s `finish`, #3159 review).
+    if kick {
+        let nll = obj(&x);
+        let sds: Vec<f64> = iov_prior_diag(n_eta, n_kappa, k_occasions, nested, params)
+            .iter()
+            .map(|p| p.var.max(0.0).sqrt())
+            .collect();
+        let probe = |cand: &mut Vec<f64>| {
+            inner_minimize_with_grad(
+                &obj,
+                &agrad,
+                cand,
+                n_flat,
+                max_iter.min(kink::KICK_MAX_ITER),
+                tol,
+                None,
+                None,
+                None,
+                &stall_at,
+                false,
+                false,
+            );
+        };
+        let finish = |cand: &mut Vec<f64>| {
+            inner_minimize_with_grad(
+                &obj,
+                &agrad,
+                cand,
+                n_flat,
+                max_iter,
+                tol,
+                None,
+                None,
+                None,
+                &stall_at,
+                false,
+                analytic_iov_inner,
+            )
+        };
+        if let Some((cand, _, ok)) = kink::kick_restarts(&x, nll, &sds, &obj, probe, finish) {
+            x = cand;
+            ebe_exit = ok;
+            used_fallback = false;
+        }
     }
 
     let runaway_limit = RUNAWAY_EBE_MAHA_PER_ETA * n_flat as f64;
@@ -4715,7 +5030,7 @@ impl InnerSettings {
 // thread could switch the inner solver of a fit, SIR or covariance step running in another,
 // mid-run. The per-subject solves fan out over rayon, so arming the calling thread is not
 // enough: a call with non-default settings runs on a pool whose workers were started with the
-// same value installed (`api::pool::FitScope`), and a worker of the shared pool installs
+// same value installed (`pool::FitScope`), and a worker of the shared pool installs
 // nothing and reads the default.
 thread_local! {
     /// `None` outside any fit-scoped call (and on every worker of the shared pool), which
@@ -4744,8 +5059,8 @@ pub(crate) fn install_worker_inner_settings(s: InnerSettings) {
 
 /// Arms the inner settings on this thread until the guard drops, restoring whatever was in
 /// force before — on every exit path, a panic included. Arming reaches this thread only; work
-/// that fans out over rayon goes through `api::pool::with_fit_scope` or
-/// `api::pool::install_on_fit_pool`, which also put it on a pool carrying the same value.
+/// that fans out over rayon goes through `pool::with_fit_scope` or
+/// `pool::install_on_fit_pool`, which also put it on a pool carrying the same value.
 #[must_use = "the inner settings are disarmed as soon as this guard drops"]
 pub(crate) struct InnerSettingsGuard {
     prev: Option<InnerSettings>,
@@ -5910,6 +6225,7 @@ pub(crate) fn analytic_eta_nll_gradient_iov(
         sigma,
         mult,
         None,
+        &mut Vec::new(),
     )
 }
 
@@ -5922,13 +6238,53 @@ pub(crate) fn analytic_eta_nll_gradient_iov(
 /// [`StackedLayout::sens_of`](crate::stats::stacked_layout::StackedLayout::sens_of),
 /// built once per EBE search by the caller (#2037); it carries `n_eta`, the κ width and
 /// the group count, so none of them is a parameter that could disagree with it.
+///
+/// `obs_grad_recycle` is the caller's per-subject row buffer, as in the non-IOV
+/// [`analytic_eta_nll_value_gradient_with_schedule`]: the recording fills it in place, so
+/// an EBE search reuses one `∂f/∂η` row per observation across its iterations (#3088).
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn analytic_eta_nll_gradient_iov_frozen(
     model: &CompiledModel, subject: &Subject, layout: &crate::stats::stacked_layout::StackedLayout,
     theta: &[f64], stacked_true: &[f64], omega_bsv: &crate::types::OmegaMatrix,
     omega_iov: &crate::types::OmegaMatrix, sigma: &[f64], mult: Option<&[Vec<f64>]>,
-    frozen_var_preds: Option<&[f64]>,
+    frozen_var_preds: Option<&[f64]>, obs_grad_recycle: &mut Vec<crate::sens::provider::ObsGrad>,
 ) -> Option<Vec<f64>> {
+    analytic_eta_nll_value_gradient_iov_frozen(
+        model,
+        subject,
+        layout,
+        theta,
+        stacked_true,
+        omega_bsv,
+        omega_iov,
+        sigma,
+        mult,
+        frozen_var_preds,
+        obs_grad_recycle,
+        None,
+    )
+}
+
+/// [`analytic_eta_nll_gradient_iov_frozen`] that also reports the IOV objective's **value**
+/// through `value_out`, from the same pass (value/gradient fusion, as
+/// [`analytic_eta_nll_value_gradient_with_schedule`] does without IOV): the predictions the
+/// gradient is built from are the ones `individual_nll_iov_frozen_in` scores, so the value
+/// costs a few flops where the native objective re-predicts the whole subject (#3088).
+/// `*value_out` is `Some(l)` only for a plain Gaussian row sum on one IOV level — no nested
+/// levels, dense `R`, censored or FREM row, SDE variance or non-Gaussian record — with a
+/// finite value; `None` otherwise (the caller takes the native objective there). Under
+/// `frozen_var_preds` each row's variance is taken at `f₀[j]`, as the native objective does.
+#[allow(clippy::too_many_arguments)]
+fn analytic_eta_nll_value_gradient_iov_frozen(
+    model: &CompiledModel, subject: &Subject, layout: &crate::stats::stacked_layout::StackedLayout,
+    theta: &[f64], stacked_true: &[f64], omega_bsv: &crate::types::OmegaMatrix,
+    omega_iov: &crate::types::OmegaMatrix, sigma: &[f64], mult: Option<&[Vec<f64>]>,
+    frozen_var_preds: Option<&[f64]>, obs_grad_recycle: &mut Vec<crate::sens::provider::ObsGrad>,
+    mut value_out: Option<&mut Option<f64>>,
+) -> Option<Vec<f64>> {
+    if let Some(v) = value_out.as_deref_mut() {
+        *v = None;
+    }
     // A record without an exact η-channel would leave its term out of the gradient: refuse
     // the subject here too, not only at the routing gate (direct callers skip that).
     if !non_gaussian_eta_grad_served(model, subject) {
@@ -5937,22 +6293,64 @@ pub(crate) fn analytic_eta_nll_gradient_iov_frozen(
     // The recording reads the per-cell `stacked_true` and returns the jet over the
     // layout's axes — the compact vector under nested levels (#1082), the stack itself
     // otherwise — so the gradient below is over the vector the EBE search moves.
-    let n_eta = layout.n_eta();
-    let axes = layout.to_axes(stacked_true)?;
+    // One level: the axes are the stack itself, read in place (no copy per call).
+    let axes: std::borrow::Cow<'_, [f64]> = if layout.nested().is_some() {
+        std::borrow::Cow::Owned(layout.to_axes(stacked_true)?)
+    } else if stacked_true.len() == layout.n_stacked() {
+        std::borrow::Cow::Borrowed(stacked_true)
+    } else {
+        return None;
+    };
     // No Gaussian rows ⇒ no Gaussian data term and nothing to record (an endpoint-only
     // subject: its inner gradient is the prior plus the non-Gaussian terms below).
-    let sens = if subject.obs_times.is_empty() {
-        Vec::new()
-    } else {
-        crate::sens::ode_provider::adjoint::exact_obs_grads_in(
-            model,
-            subject,
-            Some(layout),
-            theta,
-            model.is_sde().then_some(sigma),
-            stacked_true,
-        )?
-    };
+    // Otherwise the recording fills the caller's buffer in place, handed back on every exit.
+    let mut rows = std::mem::take(obs_grad_recycle);
+    if subject.obs_times.is_empty() {
+        rows.clear();
+    } else if !crate::sens::ode_provider::adjoint::exact_obs_grads_into(
+        model,
+        subject,
+        Some(layout),
+        theta,
+        model.is_sde().then_some(sigma),
+        stacked_true,
+        &mut rows,
+    ) {
+        *obs_grad_recycle = rows;
+        return None;
+    }
+    let grad = iov_gradient_from_rows(
+        model,
+        subject,
+        layout,
+        &rows,
+        theta,
+        stacked_true,
+        &axes,
+        omega_bsv,
+        omega_iov,
+        sigma,
+        mult,
+        frozen_var_preds,
+        value_out,
+    );
+    *obs_grad_recycle = rows;
+    grad
+}
+
+/// The body of [`analytic_eta_nll_gradient_iov_frozen`] over the recorded rows `sens`
+/// (the subject's prediction rows, then an SDE subject's EKF variance rows) and the search
+/// vector `axes`, so the caller hands its row buffer back on every exit. `value_out`: the
+/// fused objective value (see [`analytic_eta_nll_value_gradient_iov_frozen`]).
+#[allow(clippy::too_many_arguments)]
+fn iov_gradient_from_rows(
+    model: &CompiledModel, subject: &Subject, layout: &crate::stats::stacked_layout::StackedLayout,
+    sens: &[crate::sens::provider::ObsGrad], theta: &[f64], stacked_true: &[f64], axes: &[f64],
+    omega_bsv: &crate::types::OmegaMatrix, omega_iov: &crate::types::OmegaMatrix, sigma: &[f64],
+    mult: Option<&[Vec<f64>]>, frozen_var_preds: Option<&[f64]>,
+    value_out: Option<&mut Option<f64>>,
+) -> Option<Vec<f64>> {
+    let n_eta = layout.n_eta();
     // An SDE subject's EKF variance rows (BSV-only filter: their κ columns are zero).
     let (sens, p_rows) = sens.split_at(sens.len().min(subject.observations.len()));
     let n_stacked = layout.n_axes();
@@ -5982,6 +6380,19 @@ pub(crate) fn analytic_eta_nll_gradient_iov_frozen(
     let mut ruv_grad = 0.0_f64;
     // #658: per-observation residual endpoint keys (covariate selector or CMT).
     let err_keys = model.error_spec.obs_keys(subject);
+    // The value is scored only where `individual_nll_iov_frozen_in` is a plain Gaussian row
+    // sum over these predictions (see `analytic_eta_nll_value_gradient_iov_frozen`).
+    let value_ok = value_out.is_some()
+        && layout.nested().is_none()
+        && p_rows.is_empty()
+        && !model.is_sde()
+        && !model.bloq_in_force().has_censored_row(&subject.cens)
+        && !subject.fremtype.iter().any(|&ft| ft > 0)
+        && subject.obs_records.is_empty()
+        && !model.residual_cov_theta(theta).is_dense()
+        && omega_bsv.log_det.is_finite()
+        && omega_iov.log_det.is_finite();
+    let mut data_ll = 0.0_f64;
     for (j, obs) in sens.iter().enumerate() {
         let cens = if m3 { subject.cens.get(j).copied().unwrap_or(0) } else { 0 };
         // The residual logic is shared with the non-IOV inner via `residual_inner_obs`
@@ -6005,6 +6416,18 @@ pub(crate) fn analytic_eta_nll_gradient_iov_frozen(
             *g += coef * obs.df_deta[k] + p.map_or(0.0, |p| coef_p * p.df_deta[k]);
         }
         ruv_grad += ruv_term; // 0 unless `iiv_on_ruv`
+        if value_ok {
+            // `individual_nll_iov_frozen_in`'s row term, the same expression: the variance at
+            // `f₀[j]` under a frozen variance (where `ruv_scale` is 1, as there).
+            let v = model.residual_variance_at_scaled(
+                err_keys[j],
+                frozen_var_preds.map_or(obs.f, |f0| f0[j]),
+                sigma,
+                mult.and_then(|m| m.get(j)).map(Vec::as_slice),
+            ) * ruv_scale;
+            let resid = subject.observations[j] - obs.f;
+            data_ll += resid * resid / v + v.ln();
+        }
     }
     if let Some(r) = ruv_idx {
         grad[r] += ruv_grad;
@@ -6021,26 +6444,52 @@ pub(crate) fn analytic_eta_nll_gradient_iov_frozen(
     // Prior: block-diagonal Σ_b⁻¹·b. BSV block Ω_bsv⁻¹·η_bsv, each κ block Ω_L⁻¹·κ_g —
     // one block per occasion group (the κ-variance shared across occasions, SAME), or under
     // nested levels one per group of each level, `Ω_L` the rows and columns of its κs.
-    let eta_bsv = DVector::from_column_slice(&axes[..n_eta]);
-    let prior_bsv = &omega_bsv.inv * &eta_bsv;
-    for (k, g) in grad.iter_mut().take(n_eta).enumerate() {
-        *g += prior_bsv[k];
-    }
-    for (ks, base) in layout.kappa_blocks() {
-        let w = ks.len();
-        let kappa_g = DVector::from_column_slice(&axes[base..base + w]);
-        // A block carrying every κ in order (each one-level group) reads `Ω_iov⁻¹` as is;
-        // only a nested level's subset is copied out (#2037).
-        let prior_kg = if ks.iter().copied().eq(0..omega_iov.inv.nrows()) {
-            &omega_iov.inv * &kappa_g
-        } else {
-            &omega_iov.inv.select_rows(&ks).select_columns(&ks) * &kappa_g
-        };
-        for c in 0..w {
-            grad[base + c] += prior_kg[c];
+    // Each block's product is read straight off the inverse, with no submatrix or vector
+    // copied out per call (#3088); the sum runs in the column order of a matrix product.
+    add_block_prior(&mut grad, &omega_bsv.inv, 0..n_eta, 0, axes);
+    if layout.nested().is_some() {
+        for (ks, base) in layout.kappa_blocks() {
+            add_block_prior(&mut grad, &omega_iov.inv, ks.iter().copied(), base, axes);
+        }
+    } else {
+        for g in 0..layout.n_groups() {
+            let base = layout.kappa_offset(g);
+            add_block_prior(&mut grad, &omega_iov.inv, 0..layout.n_kappa(), base, axes);
         }
     }
+    if let Some(out) = value_out.filter(|_| value_ok) {
+        // `½(ηᵀΩ⁻¹η + log|Ω| + Σ_g κ_gᵀΩ_IOV⁻¹κ_g + K·log|Ω_IOV| + data)`, the native order.
+        let quad = crate::stats::likelihood::quad_form;
+        let eta_prior = quad(&omega_bsv.inv, &stacked_true[..n_eta]);
+        let mut kappa_prior = 0.0;
+        for g in 0..layout.n_groups() {
+            let base = layout.kappa_offset(g);
+            kappa_prior += quad(&omega_iov.inv, &axes[base..base + layout.n_kappa()]);
+        }
+        let nll = 0.5
+            * (eta_prior
+                + omega_bsv.log_det
+                + kappa_prior
+                + (layout.n_groups() as f64) * omega_iov.log_det
+                + data_ll);
+        *out = nll.is_finite().then_some(nll);
+    }
     Some(grad)
+}
+
+/// `grad[base..base + w] += A·x[base..base + w]` with `A` the rows and columns `idx` of
+/// `inv` (`w = idx.len()`): one block of the block-diagonal stacked prior.
+fn add_block_prior(
+    grad: &mut [f64], inv: &DMatrix<f64>, idx: impl Iterator<Item = usize> + Clone, base: usize,
+    x: &[f64],
+) {
+    for (c, r) in idx.clone().enumerate() {
+        let mut acc = 0.0;
+        for (d, s) in idx.clone().enumerate() {
+            acc += inv[(r, s)] * x[base + d];
+        }
+        grad[base + c] += acc;
+    }
 }
 
 /// Build the diagonal inner-BFGS preconditioner (the search `H0`) for a subject.
@@ -6291,6 +6740,7 @@ fn inner_minimize_with_grad(
     obj: &dyn Fn(&[f64]) -> f64, grad: &dyn Fn(&[f64]) -> Vec<f64>, x: &mut [f64], n: usize,
     max_iter: usize, tol: f64, precond: Option<&[f64]>, hessian_seed: Option<&DMatrix<f64>>,
     stop_precond: Option<&[f64]>, stall_at: &dyn Fn(&[f64]) -> bool, short_line_search: bool,
+    allow_kink_escape: bool,
 ) -> InnerExit {
     inner_minimize_with_prime(
         obj,
@@ -6305,6 +6755,7 @@ fn inner_minimize_with_grad(
         stop_precond,
         stall_at,
         short_line_search,
+        allow_kink_escape,
     )
 }
 
@@ -6322,7 +6773,7 @@ fn inner_minimize_with_prime(
     obj: &dyn Fn(&[f64]) -> f64, prime: Option<&PrimeFn<'_>>, grad: &dyn Fn(&[f64]) -> Vec<f64>,
     x: &mut [f64], n: usize, max_iter: usize, tol: f64, precond: Option<&[f64]>,
     hessian_seed: Option<&DMatrix<f64>>, stop_precond: Option<&[f64]>,
-    stall_at: &dyn Fn(&[f64]) -> bool, short_line_search: bool,
+    stall_at: &dyn Fn(&[f64]) -> bool, short_line_search: bool, allow_kink_escape: bool,
 ) -> InnerExit {
     if matches!(inner_optimizer_mode(), crate::types::InnerOptimizer::NelderMead) {
         // NM's simplex-spread exit is its stopping rule, not a certificate (#1527): measured
@@ -6353,6 +6804,7 @@ fn inner_minimize_with_prime(
             stop_precond,
             stall_at,
             short_line_search,
+            allow_kink_escape,
         )
     } else {
         dense_bfgs_run(
@@ -6368,6 +6820,7 @@ fn inner_minimize_with_prime(
             stop_precond,
             stall_at,
             short_line_search,
+            allow_kink_escape,
         )
     };
     #[cfg(test)]
@@ -6385,6 +6838,8 @@ fn lbfgs_core(
     max_iter: usize, tol: f64, precond: Option<&[f64]>, stop_precond: Option<&[f64]>,
     stall_at: &dyn Fn(&[f64]) -> bool, short_line_search: bool,
 ) -> bool {
+    // The fallback certifier's polish is a generic recovery primitive used far outside the
+    // primary search (covariance, SIR, profile): no kink escape here (#3159 review).
     lbfgs_run(
         obj,
         None,
@@ -6397,6 +6852,7 @@ fn lbfgs_core(
         stop_precond,
         stall_at,
         short_line_search,
+        false,
     )
     .converged()
 }
@@ -6407,6 +6863,7 @@ fn lbfgs_run(
     obj: &dyn Fn(&[f64]) -> f64, prime: Option<&PrimeFn<'_>>, grad: &dyn Fn(&[f64]) -> Vec<f64>,
     x: &mut [f64], n: usize, max_iter: usize, tol: f64, precond: Option<&[f64]>,
     stop_precond: Option<&[f64]>, stall_at: &dyn Fn(&[f64]) -> bool, short_line_search: bool,
+    allow_kink_escape: bool,
 ) -> InnerExit {
     let mut s_hist: Vec<Vec<f64>> = Vec::new();
     let mut y_hist: Vec<Vec<f64>> = Vec::new();
@@ -6421,6 +6878,8 @@ fn lbfgs_run(
     let mut stall = 0u32;
     // Accepted non-moves in a row ([`exact_search_stuck`], #2497).
     let mut non_moves = NonMoveStreak::default();
+    // Kink escapes this solve has attempted ([`kink::stall_escape`], #3159).
+    let mut escapes = 0usize;
     let mut best_gnorm = f64::INFINITY;
     // The regime is a property of the *iterate*, not of the start point (#1521 review): a
     // transit/IG subject can begin inside the closed form's domain and cross the flip-flop
@@ -6520,6 +6979,27 @@ fn lbfgs_run(
             x[i] += s[i];
         }
         if stalled {
+            // A stall at a kink is not a minimum unless the gradients around it say so (#3159).
+            // Only with a gradient this solve already trusts to be exact: `stall_escape` reads
+            // the same `grad` closure, and on an FD-gradient ODE objective its samples carry
+            // the same solver noise `enable_stall` exists to tolerate — a model with no kink,
+            // forced to `gradient = fd`, moved OFV -442.3578 to -438.8685 on a measured
+            // example before this gate (#3159 review). `allow_kink_escape` is the caller's
+            // `analytic_inner_grad_supported` / `analytic_iov_inner_supported` verdict, and `inner_kick`.
+            if allow_kink_escape && escapes < kink::MAX_STALL_ESCAPES {
+                escapes += 1;
+                if let Some(e) = kink::stall_escape(obj, grad, x, f_cur, &g) {
+                    x.copy_from_slice(&e.x);
+                    f_cur = e.f;
+                    g = e.g;
+                    s_hist.clear();
+                    y_hist.clear();
+                    rho_hist.clear();
+                    stall = 0;
+                    best_gnorm = f64::INFINITY;
+                    continue;
+                }
+            }
             return InnerExit::Converged;
         }
         enable_stall = enable_stall || stall_at(x);
@@ -6670,6 +7150,8 @@ fn dense_bfgs_core(
     max_iter: usize, tol: f64, precond: Option<&[f64]>, hessian_seed: Option<&DMatrix<f64>>,
     stop_precond: Option<&[f64]>, stall_at: &dyn Fn(&[f64]) -> bool, short_line_search: bool,
 ) -> bool {
+    // The fallback certifier's polish is a generic recovery primitive used far outside the
+    // primary search (covariance, SIR, profile): no kink escape here (#3159 review).
     dense_bfgs_run(
         obj,
         None,
@@ -6683,6 +7165,7 @@ fn dense_bfgs_core(
         stop_precond,
         stall_at,
         short_line_search,
+        false,
     )
     .converged()
 }
@@ -6693,7 +7176,7 @@ fn dense_bfgs_run(
     obj: &dyn Fn(&[f64]) -> f64, prime: Option<&PrimeFn<'_>>, grad: &dyn Fn(&[f64]) -> Vec<f64>,
     x: &mut [f64], n: usize, max_iter: usize, tol: f64, precond: Option<&[f64]>,
     hessian_seed: Option<&DMatrix<f64>>, stop_precond: Option<&[f64]>,
-    stall_at: &dyn Fn(&[f64]) -> bool, short_line_search: bool,
+    stall_at: &dyn Fn(&[f64]) -> bool, short_line_search: bool, allow_kink_escape: bool,
 ) -> InnerExit {
     let seed_inv = seed_h_inv(n, hessian_seed);
     let mut h_inv = init_h_inv(n, precond, seed_inv.as_ref());
@@ -6725,6 +7208,8 @@ fn dense_bfgs_run(
     let mut stall = 0u32;
     // Accepted non-moves in a row ([`exact_search_stuck`], #2497).
     let mut non_moves = NonMoveStreak::default();
+    // Kink escapes this solve has attempted ([`kink::stall_escape`], #3159).
+    let mut escapes = 0usize;
     let mut best_gnorm = f64::INFINITY;
     // The regime is a property of the *iterate*, not of the start point (#1521 review): a
     // transit/IG subject can begin inside the closed form's domain and cross the flip-flop
@@ -6839,6 +7324,26 @@ fn dense_bfgs_run(
         let f_old = f_cur;
         f_cur = f_new;
         if stalled {
+            // A stall at a kink is not a minimum unless the gradients around it say so (#3159).
+            // Only with a gradient this solve already trusts to be exact: `stall_escape` reads
+            // the same `grad` closure, and on an FD-gradient ODE objective its samples carry
+            // the same solver noise `enable_stall` exists to tolerate — a model with no kink,
+            // forced to `gradient = fd`, moved OFV -442.3578 to -438.8685 on a measured
+            // example before this gate (#3159 review). `allow_kink_escape` is the caller's
+            // `analytic_inner_grad_supported` / `analytic_iov_inner_supported` verdict, and `inner_kick`.
+            if allow_kink_escape && escapes < kink::MAX_STALL_ESCAPES {
+                escapes += 1;
+                if let Some(e) = kink::stall_escape(obj, grad, x, f_cur, &g) {
+                    x.copy_from_slice(&e.x);
+                    f_cur = e.f;
+                    g = e.g;
+                    h_inv = init_h_inv(n, precond, seed_inv.as_ref());
+                    h_unshaped = true;
+                    stall = 0;
+                    best_gnorm = f64::INFINITY;
+                    continue;
+                }
+            }
             return InnerExit::Converged;
         }
         enable_stall = enable_stall || stall_at(x);
@@ -7077,8 +7582,10 @@ const INNER_FTOL_GNORM_PLATEAU: f64 = 1e-3;
 /// covariate's own variance, so its Mahalanobis distance stays O(1) and it never trips this.
 const RUNAWAY_EBE_MAHA_PER_ETA: f64 = 100.0;
 
-/// Starts the #2013 screen descends from: the lowest-objective Sobol points it scores.
+/// Most starts the #2013 screen descends from (see [`screen_starts`]).
 const SCREEN_TOP_K: usize = 3;
+/// The lowest-objective screen points [`screen_starts`] picks its spread-out starts from.
+const SCREEN_POOL: usize = 32;
 /// Scale of the #2013 screen's proposal: `N(0, (2)²·Ω)`, twice the prior SD per axis.
 const SCREEN_SD_MULT: f64 = 2.0;
 /// Least Ω⁻¹-metric distance from the incumbent η̂ at which a #2013 screen descent counts
@@ -7098,6 +7605,8 @@ fn screen_descents(
     screen_starts(obj, omega, n_eta, n, subject_id)
         .into_iter()
         .map(|mut cand| {
+            // No kink escape on this probe (#3159 review): one of many Sobol-screen points,
+            // not the search's own mode.
             let ok = inner_minimize_with_grad(
                 obj,
                 agrad,
@@ -7110,6 +7619,7 @@ fn screen_descents(
                 stop_precond,
                 stall_at,
                 false,
+                false,
             );
             cand.iter().all(|v| v.is_finite()).then(|| {
                 let v = obj(&cand);
@@ -7119,9 +7629,10 @@ fn screen_descents(
         .collect()
 }
 
-/// Starts the #2013 screen keeps: the [`SCREEN_TOP_K`] lowest of `n` Sobol points from
-/// `N(0, (SCREEN_SD_MULT)²·Ω)`, by `obj`, lowest first. A point whose objective is not
-/// finite is dropped. The stream is keyed by [`screen_seed`] of the subject's ID, so it
+/// Starts the #2013 screen keeps: up to [`SCREEN_TOP_K`] of the [`SCREEN_POOL`] lowest of
+/// `n` Sobol points from `N(0, (SCREEN_SD_MULT)²·Ω)`, by `obj`, lowest first, each more than
+/// [`SCREEN_MIN_OMEGA_DIST`] from those before it in the Ω⁻¹ metric. A point whose
+/// objective is not finite is dropped. The stream is keyed by [`screen_seed`] of the subject's ID, so it
 /// depends neither on the worker thread nor on the subject's position in the data. Empty
 /// when there is nothing to draw, or more random effects than the Sobol table carries.
 fn screen_starts(
@@ -7134,11 +7645,10 @@ fn screen_starts(
     if n == 0 || n_eta == 0 || n_eta > SOBOL_MAX_DIMS || omega.chol.nrows() != n_eta {
         return Vec::new();
     }
-    // The lowest `SCREEN_TOP_K` so far, lowest first. A point goes in after every
-    // kept point it ties (`total_cmp` is a total order), which is the order a
-    // stable sort of all `n` scored points gives, so only the kept starts are
-    // ever copied out of the reused buffers.
-    let mut best: Vec<(f64, Vec<f64>)> = Vec::with_capacity(SCREEN_TOP_K + 1);
+    // The lowest `SCREEN_POOL` so far, lowest first. A point goes in after every kept point
+    // it ties (`total_cmp` is a total order), which is the order a stable sort of all `n`
+    // scored points gives, so only the kept points are ever copied out of the reused buffers.
+    let mut best: Vec<(f64, Vec<f64>)> = Vec::with_capacity(SCREEN_POOL + 1);
     let mut z = DVector::<f64>::zeros(n_eta);
     let mut e = DVector::<f64>::zeros(n_eta);
     for_each_sobol_uniform(n_eta, n, screen_seed(subject_id), |u| {
@@ -7151,12 +7661,22 @@ fn screen_starts(
             return;
         }
         let at = best.partition_point(|(b, _)| b.total_cmp(&v).is_le());
-        if at < SCREEN_TOP_K {
+        if at < SCREEN_POOL {
             best.insert(at, (v, e.as_slice().to_vec()));
-            best.truncate(SCREEN_TOP_K);
+            best.truncate(SCREEN_POOL);
         }
     });
-    best.into_iter().map(|(_, e)| e).collect()
+    // The starts, lowest first, each farther than `SCREEN_MIN_OMEGA_DIST` from those kept
+    // before it: a larger screen holds more points near one mode, and the plain lowest
+    // `SCREEN_TOP_K` would all descend into it (#2863).
+    let mut starts: Vec<Vec<f64>> = Vec::with_capacity(SCREEN_TOP_K);
+    for (_, e) in best {
+        let far = |s: &Vec<f64>| omega_distance(s, &e, omega) > SCREEN_MIN_OMEGA_DIST;
+        if starts.len() < SCREEN_TOP_K && starts.iter().all(far) {
+            starts.push(e);
+        }
+    }
+    starts
 }
 
 /// 64-bit FNV-1a of a subject ID: the #2013 screen's Sobol scramble seed. A fixed
@@ -7723,13 +8243,115 @@ fn backtracking_line_search(
     (0.0, f0)
 }
 
+/// Central-difference step of the FD inner gradient on an objective that never integrates,
+/// per unit of `1 + |x|`, where only roundoff limits the difference.
+const FD_GRADIENT_STEP: f64 = 1e-7;
+
+/// Central-difference step of the FD inner gradient on an objective that integrates (#2868),
+/// per unit of `1 + |η|`. An adaptive solve is a different function of η at every step
+/// sequence, so a difference over `2e-7` reads the jump between two sequences as slope, and
+/// the search stops on it at an EBE that is not the mode. On the full-TMDD fixture of #2845
+/// (30 subjects, `rodas4`, `gradient = fd`, default tolerances, 25 `TVKON` points from 1.300
+/// to 1.348, OFV against the analytic inner gradient at the same tolerance), the worst point
+/// was 2.0 OFV off at `1e-7` and 0.0059 at `1e-3` (75.9 and 0.012 before #2939, which also
+/// measured 0.135 at `1e-5`, 0.009 at `1e-4` and 0.205 at `1e-2`). Under `rk45`, whose step
+/// sequence changes more often, `1e-7` leaves 109.3, `1e-4` left 0.506 and `1e-3` 0.125. At
+/// `1e-5` / `1e-8` the roundoff step leaves 0.57 and the step
+/// [`integrating_fd_step`] gives 0.0011; at `1e-6` / `1e-9`, 0.0007 and 0.0007. Taking the
+/// difference at the tightened [`ODE_FD_JACOBIAN_RELTOL`] did no better at `1e-3` and cost
+/// 6× the wall. Same value as [`ODE_FD_JACOBIAN_STEP`], for the same reason. This is the step
+/// at [`ODE_FD_GRADIENT_STEP_RELTOL`]; [`integrating_fd_step`] scales it to the fit's.
+const ODE_FD_GRADIENT_STEP: f64 = 1e-3;
+
+/// The `ode_reltol` at which the integrating step is [`ODE_FD_GRADIENT_STEP`]: the default.
+const ODE_FD_GRADIENT_STEP_RELTOL: f64 = crate::ode::solver::DEFAULT_RELTOL;
+
+/// The integrating step of the FD inner gradient at `ode_reltol = reltol` (#2868):
+/// [`ODE_FD_GRADIENT_STEP`] scaled by `(reltol / 1e-4)^(1/3)`, between [`FD_GRADIENT_STEP`]
+/// and [`ODE_FD_GRADIENT_STEP`]. A central difference errs by `h²·f‴/6` from truncation and by
+/// `ε/h` from noise in the objective, so its best step grows as `ε^(1/3)`, and the integrator's
+/// noise is of order `ode_reltol`. A fixed `1e-3` is too long at a tight tolerance: on
+/// `examples/warfarin_sde` at `1e-6` / `1e-8`, from six starts (every θ scaled by 0.90 to 1.10),
+/// it ended a median 0.009 OFV above the roundoff step, while this rule (`2.15e-4` there)
+/// ended 0.0013 below it, at a median wall ratio of 1.06 (0.81 to 1.30 per start). Exactly
+/// `1e-3` at the default, so the default-tolerance TMDD figures above stand. At an `ode_reltol`
+/// looser than the default the step stays at `1e-3`, a direction no fit has measured.
+fn integrating_fd_step(reltol: f64) -> f64 {
+    (ODE_FD_GRADIENT_STEP * (reltol / ODE_FD_GRADIENT_STEP_RELTOL).cbrt())
+        .clamp(FD_GRADIENT_STEP, ODE_FD_GRADIENT_STEP)
+}
+
+/// [`integrating_fd_step`] at the tolerance `model` integrates at on this thread, where the
+/// fit's override is in force; `None` when it never integrates adaptively. That is a model
+/// with no integrator, and one whose solve resolves to the matrix exponential
+/// ([`OdeMethod::Linear`](crate::ode::OdeMethod::Linear), #852): exact to roundoff, so a long
+/// step only adds truncation error. On `examples/emax_pkpd` (on that path under the default
+/// `auto`) at seven fixed θ scaled by 0.90 to 1.10, `1e-3` left the FD route 3.6e-5 OFV from the
+/// analytic one where `1e-7` left 1.1e-5. A segment the propagator declines is integrated at
+/// the roundoff step, as before #2868; no measured fit has declined one. A closed-form transit
+/// or inverse-Gaussian absorption model counts its ODE twin as its integrator, so it gets the
+/// step too, and the inner solves take it only at an iterate the twin serves (their per-iterate
+/// stall predicate).
+fn model_integrating_fd_step(model: &CompiledModel) -> Option<f64> {
+    let opts = model.integrator_spec()?.effective_solver_opts();
+    (opts.method != crate::ode::OdeMethod::Linear).then(|| integrating_fd_step(opts.reltol))
+}
+
 /// Central finite difference gradient (optimized step size)
 fn gradient_fd(obj: &dyn Fn(&[f64]) -> f64, x: &[f64], n: usize) -> Vec<f64> {
+    gradient_fd_step(obj, x, None, n, FD_GRADIENT_STEP)
+}
+
+/// The inner search's FD gradient: [`gradient_fd`] on an objective that never integrates, the
+/// given `integrating_step` on one that does — `Some` exactly when
+/// [`model_integrating_fd_step`] gives one and the inner solve's per-iterate
+/// [`inner_stall_enabled_at`] / [`inner_stall_enabled_at_iov`] holds. `origin` is the point
+/// the integrating step scales from, `x − origin` being η: the IOV search moves `ψ = η + μ`,
+/// and a step scaled by `|ψ|` would grow with the typical value `μ` carries. `None` is the
+/// origin. The roundoff step ignores it, so an objective that never integrates differences
+/// exactly as before #2868.
+///
+/// Where an evaluation of the integrating difference leaves a segment unfinished, the gradient
+/// is the roundoff one (#3145). The integrating step is sized for an integrator error of order
+/// `ode_reltol`, which a solve that ran out of steps does not have. Such points are reached on
+/// outer trials the EBE guard goes on to reject. On an 8-state `auto` model whose inner gradient
+/// is otherwise analytic, the recorders declined there, and the integrating step let more of those
+/// searches converge: of the solves that differenced, the fit needed 68 to reach the 17
+/// unconverged the guard stops at, against 36 here and at the roundoff step, at up to a minute
+/// each (3407 s against 2165 s and 2127 s for the fit, with identical results). The check reads
+/// the solver counters of the evaluations the difference makes anyway; only a declined one costs a
+/// second difference. On the TMDD fixture above it moves only `rk45`: worst point 0.103 OFV from
+/// the analytic route, 0.129 without it (Linux), for 7% more wall.
+fn ebe_gradient_fd(
+    obj: &dyn Fn(&[f64]) -> f64, x: &[f64], origin: Option<&[f64]>, n: usize,
+    integrating_step: Option<f64>,
+) -> Vec<f64> {
+    let integrated = integrating_step.and_then(|step| {
+        let (g, stats) =
+            crate::ode::solver::with_solver_stats(|| gradient_fd_step(obj, x, origin, n, step));
+        (stats.kept_unfinished_segments() == 0).then_some(g)
+    });
+    #[cfg(test)]
+    EBE_FD_CALLS.with(|c| {
+        if let Some(calls) = c.borrow_mut().as_mut() {
+            let taken = integrating_step.filter(|_| integrated.is_some());
+            calls.push((taken, origin.map(<[f64]>::to_vec)));
+        }
+    });
+    integrated.unwrap_or_else(|| gradient_fd(obj, x, n))
+}
+
+/// Central differences of `obj` at `x`, coordinate `i` stepped by
+/// `step · (1 + |x[i] − origin[i]|)` (the origin past its end, or when `None`, is 0).
+fn gradient_fd_step(
+    obj: &dyn Fn(&[f64]) -> f64, x: &[f64], origin: Option<&[f64]>, n: usize, step: f64,
+) -> Vec<f64> {
     let t0 = GRADIENT_TIMINGS.start();
     let mut g = vec![0.0; n];
     let mut x_work = x.to_vec();
     for i in 0..n {
-        let h = 1e-7 * (1.0 + x[i].abs());
+        let o = origin.and_then(|o| o.get(i)).copied().unwrap_or(0.0);
+        let h = step * (1.0 + (x[i] - o).abs());
         x_work[i] = x[i] + h;
         let fp = obj(&x_work);
         x_work[i] = x[i] - h;
@@ -8404,6 +9026,10 @@ fn run_inner_loop_warm_map_impl<T: Send + Default>(
 
     (eta_hats, h_matrices, stats, kappas, extras)
 }
+
+#[cfg(test)]
+#[path = "inner_kink_tests.rs"]
+mod kink_tests;
 
 #[cfg(test)]
 #[path = "inner_optimizer_tests.rs"]

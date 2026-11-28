@@ -276,7 +276,7 @@ fn a_second_ss_dose_keeps_the_hazard_and_matches_nonmem() {
 
 /// Every committed reference run is what it claims to be, checked before any table is read.
 ///
-/// The run recipe for these anchors says to inspect the `.lst` for `PRDERR` / `+INF` /
+/// The run recipe for these anchors says to inspect the listing for `PRDERR` / `+INF` /
 /// `PROGRAM TERMINATED` before trusting the corresponding `.tab` — that is how `r1` announced
 /// itself. That check was performed by hand at each run and recorded in prose; nothing enforced
 /// it, so a future re-run pasted in with a silent solver failure would be compared against
@@ -294,33 +294,38 @@ fn a_second_ss_dose_keeps_the_hazard_and_matches_nonmem() {
 fn every_committed_reference_run_is_what_it_claims_to_be() {
     const FAILURE_MARKERS: [&str; 3] = ["PRDERR", "NUMERICAL DIFFICULTIES", "PROGRAM TERMINATED"];
 
+    let run = |arm: &str| -> serde_json::Value {
+        let path = format!("nonmem_anchor/results/ss_chz_{arm}.nm.json");
+        let text = std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("{path}: {e}"));
+        serde_json::from_str(&text).unwrap_or_else(|e| panic!("{path}: {e}"))
+    };
+    let failures = |run: &serde_json::Value| -> Vec<String> {
+        let markers = run["markers"].as_array().expect("markers");
+        let markers = markers.iter().map(|m| m.as_str().expect("marker").to_string());
+        markers.filter(|m| FAILURE_MARKERS.contains(&m.as_str())).collect()
+    };
+
     for arm in ["r2_const", "r2_drug", "r2_tdep", "r3_const", "r3_drug", "r4_const", "r5_drug_lag"]
     {
-        let path = format!("nonmem_anchor/results/ss_chz_{arm}.lst");
-        let lst = std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("{path}: {e}"));
-        for marker in FAILURE_MARKERS {
-            assert!(
-                !lst.contains(marker),
-                "{arm}: the committed run carries `{marker}` — its table is not trustworthy \
-                 and must not be used as a reference"
-            );
-        }
+        let found = failures(&run(arm));
+        assert!(
+            found.is_empty(),
+            "{arm}: the committed run carries {found:?} — its table is not trustworthy \
+             and must not be used as a reference"
+        );
     }
 
     // The negative result, still negative. `r1_drug` terminates outright; `r1_const` "succeeds"
     // but reports `+INF` for the objective with a wildly negative `A(3)`, so it is pinned on the
     // objective rather than on a termination marker.
-    let drug = std::fs::read_to_string("nonmem_anchor/results/ss_chz_r1_drug.lst")
-        .expect("r1_drug .lst is committed");
     assert!(
-        FAILURE_MARKERS.iter().any(|m| drug.contains(m)),
+        !failures(&run("r1_drug")).is_empty(),
         "r1_drug is the anchor for `NONMEM cannot solve this system`; it no longer fails, \
          which changes the premise of every arm in this file"
     );
-    let konst = std::fs::read_to_string("nonmem_anchor/results/ss_chz_r1_const.lst")
-        .expect("r1_const .lst is committed");
-    assert!(
-        konst.contains("INF"),
+    assert_eq!(
+        run("r1_const")["steps"][0]["objv"],
+        "+INF",
         "r1_const is the anchor for NONMEM's SS routine returning a non-finite objective on \
          the augmented system; it no longer does"
     );

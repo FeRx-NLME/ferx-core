@@ -1,6 +1,6 @@
 ; Provenance: Douglas Eleveld's NONMEM 7.6 reproduction from FeRx-NLME/ferx-r#154
 ; (the "DATASIM" PAGE blind-analysis dataset, 1-cpt oral, log-scale DV). This
-; control file and the sibling datsim_oral.lst (its verbatim NONMEM output;
+; control file and the sibling datsim_oral.nm.json (the numbers of its NONMEM listing;
 ; #OBJV 70.851 WITHOUT CONSTANT) are the cross-engine reference for
 ; tests/structural_param_nonmem.rs. The $DATA line names data.ferx.csv as Doug
 ; ran it; the same data is committed here as data/datsim_oral.csv (identical

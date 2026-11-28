@@ -23,7 +23,7 @@
 //! **NONMEM 7.6.0**, `$ESTIMATION METHOD=1 INTER MAXEVAL=0 POSTHOC`, parameters at the
 //! `$THETA`/`$OMEGA`/`$SIGMA` initial values. DVs were simulated by NONMEM itself from the same
 //! model (`advan5_liver_sim.ctl`, seed 852). Files: `nonmem_anchor/advan5_liver{.ctl,_sim.ctl,
-//! .csv}` and the verbatim output `nonmem_anchor/results/advan5_liver{.lst,.tab}`. (NONMEM
+//! .csv}` and the output `nonmem_anchor/results/advan5_liver{.nm.json,.tab}`. (NONMEM
 //! 7.5.1 segfaults on the evaluation in the `pharma_ai_r` image; the simulation runs on either.)
 //!
 //! Tier 2: one `predict()` and one evaluation-only `fit()` on four subjects; not gated.
@@ -37,7 +37,7 @@ use ferx_core::{fit, predict, read_nonmem_csv};
 const DATA: &str = "nonmem_anchor/advan5_liver.csv";
 const TABLE: &str = "nonmem_anchor/results/advan5_liver.tab";
 
-/// NONMEM `OBJECTIVE FUNCTION VALUE` (`advan5_liver.lst`).
+/// NONMEM `OBJECTIVE FUNCTION VALUE` (`advan5_liver.nm.json`).
 const NM_OFV: f64 = -340.39027326310884;
 
 /// The same model as `advan5_liver.ctl`, `K` constants written out as equations. `{tail}` is

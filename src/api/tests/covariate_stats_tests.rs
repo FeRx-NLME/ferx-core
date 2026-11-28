@@ -192,10 +192,9 @@ fn categorical2_binds_its_reference_to_the_mode() {
 }
 
 #[test]
-fn linear_bounds_follow_the_psn_table() {
-    // PsN state 2: init 0.001/(med−min), lower 1/(med−max), upper 1/(med−min).
-    // These bounds are what keep `1 + θ(COV − med)` positive over the observed
-    // range, so they are adopted verbatim rather than re-invented.
+fn linear_default_bounds_follow_the_covariate_range() {
+    // init 0.001/(med−min), lower 1/(med−max), upper 1/(med−min): the range that
+    // keeps `1 + θ(COV − med)` non-negative over the observed covariate values.
     let text = model("  WT continuous", "  CL ~ WT linear(center = median)");
     let pop = population("WT", &[50.0, 60.0, 70.0, 80.0, 90.0]);
     let bound = bind(&text, &pop).expect("binding should succeed");
@@ -206,7 +205,7 @@ fn linear_bounds_follow_the_psn_table() {
 }
 
 #[test]
-fn hockey_bounds_follow_the_psn_table() {
+fn hockey_default_bounds_follow_the_covariate_range() {
     let text = model("  WT continuous", "  CL ~ WT hockey(breakpoint = median)");
     let pop = population("WT", &[50.0, 60.0, 70.0, 80.0, 90.0]);
     let bound = bind(&text, &pop).expect("binding should succeed");

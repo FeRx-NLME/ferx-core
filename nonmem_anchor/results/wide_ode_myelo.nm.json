@@ -1,0 +1,121 @@
+{
+ "nonmem_version": "7.5.1",
+ "data_file": "wide_ode_myelo.csv",
+ "data_records": 480,
+ "observations": 288,
+ "individuals": 24,
+ "nmtran_warnings": [2],
+ "markers": [
+  "MINIMIZATION TERMINATED",
+  "ROUNDING ERRORS"
+ ],
+ "steps": [
+  {
+   "method": "First Order Conditional Estimation with Interaction",
+   "objv": 95.685,
+   "objv_without_constant": 95.68525725429892,
+   "objv_with_constant": 624.9938523801903,
+   "function_evaluations": 281,
+   "etabar": [
+    [0.013418, -0.0076347, 0.055997]
+   ],
+   "etabar_se": [
+    [0.054097, 0.047101, 0.057809]
+   ],
+   "p_val": [
+    [0.80411, 0.87123, 0.33272]
+   ],
+   "etashrinksd": [
+    [3.3893, 8.9614, 20.847]
+   ],
+   "etashrinkvr": [
+    [6.6638, 17.12, 37.348]
+   ],
+   "ebvshrinksd": [
+    [2.8791, 9.2138, 22.652]
+   ],
+   "ebvshrinkvr": [
+    [5.6754, 17.579, 40.173]
+   ],
+   "relativeinf": [
+    [92.187, 81.246, 57.734]
+   ],
+   "epsshrinksd": [
+    [10.134]
+   ],
+   "epsshrinkvr": [
+    [19.241]
+   ],
+   "final": {
+    "theta": [4.69, 83.9, 0.0876, 0.158],
+    "omega": {
+     "ETA1": [0.0752],
+     "ETA2": [0.0, 0.0642],
+     "ETA3": [0.0, 0.0, 0.128]
+    },
+    "sigma": {
+     "EPS1": [0.0212]
+    }
+   },
+   "markers": [
+    "MINIMIZATION TERMINATED",
+    "ROUNDING ERRORS"
+   ]
+  }
+ ],
+ "control_stream_as_run": [
+  "$PROBLEM #1661 wide-ODE anchor: FOCEI fit of the NONMEM-simulated cell counts",
+  "; Same model as wide_ode_myelo_sim.ctl, fitted from initial estimates deliberately",
+  "; off the simulation truth (BAS 5, MTT 100, SLOPE 0.1, GAM 0.17; OMEGA 0.1/0.05/0.1;",
+  "; proportional SD 0.15). The ferx twin is wide_ode_myelo_fit.ferx.",
+  "$INPUT ID TIME AMT CMT EVID MDV DV V1I K10I K12I K21I",
+  "$DATA wide_ode_myelo.csv IGNORE=@",
+  "",
+  "$SUBROUTINE ADVAN13 TOL=10",
+  "$MODEL COMP=(CENT DEFDOSE) COMP=(PERI) COMP=(PROL) COMP=(TR1) COMP=(TR2)",
+  "       COMP=(TR3) COMP=(CIRC DEFOBS)",
+  "",
+  "$PK",
+  "V1  = V1I",
+  "K10 = K10I",
+  "K12 = K12I",
+  "K21 = K21I",
+  "BAS   = THETA(1)*EXP(ETA(1))",
+  "MTT   = THETA(2)*EXP(ETA(2))",
+  "SLOPE = THETA(3)*EXP(ETA(3))",
+  "GAM   = THETA(4)",
+  "KTR   = 4/MTT",
+  "F3 = BAS",
+  "F4 = BAS",
+  "F5 = BAS",
+  "F6 = BAS",
+  "F7 = BAS",
+  "",
+  "$DES",
+  "CP    = A(1)/V1",
+  "EDRUG = SLOPE*CP",
+  "FEED  = (BAS/A(7))**GAM",
+  "DADT(1) = -K10*A(1) - K12*A(1) + K21*A(2)",
+  "DADT(2) =  K12*A(1) - K21*A(2)",
+  "DADT(3) =  KTR*A(3)*(1 - EDRUG)*FEED - KTR*A(3)",
+  "DADT(4) =  KTR*A(3) - KTR*A(4)",
+  "DADT(5) =  KTR*A(4) - KTR*A(5)",
+  "DADT(6) =  KTR*A(5) - KTR*A(6)",
+  "DADT(7) =  KTR*A(6) - KTR*A(7)",
+  "",
+  "$ERROR",
+  "IPRED = F",
+  "Y = IPRED*(1 + EPS(1))",
+  "",
+  "$THETA (0.1, 4, 100)       ; TVBAS",
+  "$THETA (1, 80, 1000)       ; TVMTT",
+  "$THETA (0.0001, 0.06, 10)  ; TVSLOPE",
+  "$THETA (0.01, 0.25, 2)     ; TVGAM",
+  "$OMEGA 0.05 0.05 0.05",
+  "$SIGMA 0.04",
+  "",
+  "$ESTIMATION METHOD=1 INTERACTION MAXEVAL=9999 PRINT=5 NOABORT SIGDIGITS=4",
+  "$COVARIANCE MATRIX=R UNCONDITIONAL",
+  "$TABLE ID TIME DV PRED IPRED CWRES ETA1 ETA2 ETA3 NOPRINT ONEHEADER FILE=wide_ode_myelo.tab"
+ ]
+}

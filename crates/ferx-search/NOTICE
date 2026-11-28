@@ -1,0 +1,18 @@
+ferx-search
+Copyright (c) 2026 the FeRx core developer team (the ferx contributors)
+
+This crate is licensed under the GNU Lesser General Public License, version 3
+or (at your option) any later version (SPDX: LGPL-3.0-or-later). The LGPL
+version 3 is a set of additional permissions on top of the GNU General Public
+License, version 3, so both texts are included: COPYING.LESSER (LGPL-3.0) and
+COPYING (GPL-3.0).
+
+Parts of this crate follow the behaviour of Pharmpy
+(https://github.com/pharmpy/pharmpy, LGPL-3.0-or-later, (c) the Pharmpy
+authors) and were written with its source as a reference.
+
+Earlier contributions: the model-search code in this crate was released under
+the MIT License as part of ferx-tools, up to and including ferx-tools 0.4.0.
+Those releases remain MIT; LICENSE-MIT reproduces that license and its
+copyright notice. This crate as a whole is distributed under the LGPL from its
+first release.

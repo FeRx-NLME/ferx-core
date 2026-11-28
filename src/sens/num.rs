@@ -1208,6 +1208,23 @@ pub(crate) mod vm {
         /// cache (`RhsHoist` in the parser): a lifted value is a pure function of the
         /// inputs it reads, so bit-identical inputs give a bit-identical value.
         fn same_bits(&self, other: &Self) -> bool;
+        /// The bytecode VM's `Op::Sqrt`: the type's `sqrt` of a positive argument, else the
+        /// constant `±0` (a zero keeps its sign) or `+0` (negative, `NaN`), with zero jets
+        /// (#2892, #2844). A recording type records one total node instead: its branches
+        /// would be guards (#3002).
+        fn sqrt_vm(self) -> Self
+        where
+            Self: super::PkNum,
+        {
+            use super::BranchCmp::{Ge, Gt};
+            if self.br_cmp_c(Gt, 0.0) {
+                self.sqrt()
+            } else if self.br_cmp_c(Ge, 0.0) {
+                self.value_only()
+            } else {
+                Self::from_f64(0.0)
+            }
+        }
     }
 
     /// [`super::PkNum`] plus the VM's in-place arithmetic: the bound for code that runs

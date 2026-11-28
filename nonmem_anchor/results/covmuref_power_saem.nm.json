@@ -1,0 +1,153 @@
+{
+ "nonmem_version": "7.5.1",
+ "data_file": "covmuref_power.csv",
+ "data_records": 480,
+ "observations": 420,
+ "individuals": 60,
+ "nmtran_warnings": [2],
+ "markers": [],
+ "steps": [
+  {
+   "method": "Stochastic Approximation Expectation-Maximization",
+   "objv": -1887.202,
+   "objv_without_constant": -1887.2023031350107,
+   "objv_with_constant": -1115.2939352430856,
+   "etabar": [
+    [-9.6541e-07, 1.1972e-06]
+   ],
+   "etabar_se": [
+    [0.033567, 0.026915]
+   ],
+   "p_val": [
+    [0.99998, 0.99996]
+   ],
+   "etashrinksd": [
+    [1.4838, 2.68]
+   ],
+   "etashrinkvr": [
+    [2.9455, 5.2883]
+   ],
+   "ebvshrinksd": [
+    [1.4835, 2.682]
+   ],
+   "ebvshrinkvr": [
+    [2.9449, 5.292]
+   ],
+   "relativeinf": [
+    [97.039, 94.692]
+   ],
+   "epsshrinksd": [
+    [14.748]
+   ],
+   "epsshrinkvr": [
+    [27.321]
+   ],
+   "final": {
+    "theta": [4.79, 0.921, 49.5],
+    "omega": {
+     "ETA1": [0.0697],
+     "ETA2": [0.0, 0.0459]
+    },
+    "sigma": {
+     "EPS1": [0.00967]
+    }
+   },
+   "markers": []
+  },
+  {
+   "method": "Objective Function Evaluation by Importance Sampling",
+   "objv": -1202.372,
+   "objv_without_constant": -1202.3723542561856,
+   "objv_with_constant": -430.46398636426056,
+   "etabar": [
+    [-3.0603e-05, -5.4589e-07]
+   ],
+   "etabar_se": [
+    [0.03359, 0.02692]
+   ],
+   "p_val": [
+    [0.99927, 0.99998]
+   ],
+   "etashrinksd": [
+    [1.4155, 2.6602]
+   ],
+   "etashrinkvr": [
+    [2.811, 5.2497]
+   ],
+   "ebvshrinksd": [
+    [1.488, 2.685]
+   ],
+   "ebvshrinkvr": [
+    [2.9538, 5.298]
+   ],
+   "relativeinf": [
+    [97.029, 94.686]
+   ],
+   "epsshrinksd": [
+    [14.757]
+   ],
+   "epsshrinkvr": [
+    [27.336]
+   ],
+   "final": {
+    "theta": [4.79, 0.921, 49.5],
+    "omega": {
+     "ETA1": [0.0697],
+     "ETA2": [0.0, 0.0459]
+    },
+    "sigma": {
+     "EPS1": [0.00967]
+    }
+   },
+   "markers": []
+  }
+ ],
+ "control_stream_as_run": [
+  "$PROBLEM Allometric CL with estimated exponent, SAEM with a linear MU -- anchor for ferx covariate mu-referencing [#619]",
+  "; Reference SAEM fit for the second shape of ferx's covariate mu-referencing:",
+  ";",
+  ";     CL_i = THETA(1) * (WT_i/70)**THETA(2) * EXP(ETA(1))",
+  ";",
+  "; i.e. MU_1 = LOG(THETA(1)) + THETA(2)*LOG(WT/70) -- linear in THETA, NONMEM's",
+  "; efficient MU form. ferx used to mu-reference only THETA(1) here (the power",
+  "; factor hides THETA(2) from the single-anchor detector) and left THETA(2) on",
+  "; the eta-frozen numerical M-step; with #619 both thetas form one covariate",
+  "; mu-reference group and are re-fitted jointly.",
+  ";",
+  "; Data covmuref_power.csv is simulated FROM this model",
+  "; (nonmem_anchor/simulate_covmuref_data.py). Truths: TVCL=5, TH_WT=0.75,",
+  "; TVV=50, omega^2 = 0.09 (CL), 0.04 (V), sigma^2 = 0.01. WT constant per subject.",
+  "",
+  "$INPUT ID TIME DV AMT EVID CMT WT",
+  "$DATA covmuref_power.csv IGNORE=@",
+  "",
+  "$SUBROUTINES ADVAN1 TRANS2",
+  "",
+  "$PK",
+  "  MU_1 = LOG(THETA(1)) + THETA(2)*LOG(WT/70.0)",
+  "  MU_2 = LOG(THETA(3))",
+  "  CL = EXP(MU_1 + ETA(1))",
+  "  V  = EXP(MU_2 + ETA(2))",
+  "  S1 = V",
+  "",
+  "$ERROR",
+  "  IPRED = F",
+  "  Y = IPRED*(1.0 + EPS(1))",
+  "",
+  "$THETA",
+  "  (0.0,  4.0,  100)   ; 1 TVCL   (L/h)  truth 5",
+  "  (-2.0, 0.3,  3.0)   ; 2 TH_WT  allometric exponent, truth 0.75",
+  "  (1.0,  40.0, 500)   ; 3 TVV    (L)    truth 50",
+  "",
+  "$OMEGA",
+  "  0.1    ; IIV CL   truth 0.09",
+  "  0.1    ; IIV V    truth 0.04",
+  "",
+  "$SIGMA",
+  "  0.02   ; proportional residual variance, truth 0.01",
+  "",
+  "$ESTIMATION METHOD=SAEM INTERACTION NBURN=2000 NITER=1000 ISAMPLE=10 PRINT=200 SEED=619 NOABORT",
+  "$ESTIMATION METHOD=IMP INTERACTION EONLY=1 NITER=10 ISAMPLE=3000 PRINT=1 SEED=619 NOABORT",
+  "$TABLE ID TIME DV IPRED CWRES NOPRINT ONEHEADER FILE=covmuref_power_saem.tab"
+ ]
+}
