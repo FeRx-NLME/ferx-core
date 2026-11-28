@@ -664,9 +664,13 @@ fn a_shaped_eta_beside_a_kappa_is_no_kappa_mu_reference() {
         ))
         .unwrap()
     };
-    let shaped = model("TVCL * exp(ETA_CL + KAPPA_CL)", "[eta_shape]\n  ETA_CL ~ boxcox()\n\n");
-    assert!(shaped.kappa_mu_refs.is_empty(), "{:?}", shaped.kappa_mu_refs);
-    assert!(!shaped.mu_refs.contains_key("ETA_CL"));
+    // Both operand orders: each reaches its own arm of `find_exp_eta_in_mul` (#1721 review
+    // r3, row 3: the κ-first order had no test).
+    for cl in ["TVCL * exp(ETA_CL + KAPPA_CL)", "TVCL * exp(KAPPA_CL + ETA_CL)"] {
+        let shaped = model(cl, "[eta_shape]\n  ETA_CL ~ boxcox()\n\n");
+        assert!(shaped.kappa_mu_refs.is_empty(), "{cl}: {:?}", shaped.kappa_mu_refs);
+        assert!(!shaped.mu_refs.contains_key("ETA_CL"), "{cl}");
+    }
     for cl in ["TVCL * exp(ETA_CL + KAPPA_CL)", "TVCL * exp(ETA_CL + 0.5 * KAPPA_CL)"] {
         let m = model(cl, "");
         assert!(m.mu_refs.contains_key("ETA_CL"), "{cl}: {:?}", m.mu_refs);
