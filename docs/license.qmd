@@ -39,7 +39,11 @@ alone.
 The change is not retroactive. The model-search code was MIT-licensed while it
 lived in `ferx-tools`, and every release of it up to and including
 `ferx-tools` 0.4.0 remains MIT. `crates/ferx-search/LICENSE-MIT` reproduces that
-license.
+license. The LGPL applies from 0.5.0, the first release of `ferx-search`.
+
+Those earlier `ferx-tools` releases are not yanked from crates.io. Yanking would
+not withdraw the MIT grant on code already published, and it would break builds
+pinned to them.
 
 ## The ferx binary
 

@@ -1,6 +1,6 @@
 [package]
 name = "ferx-cli"
-version = "0.4.0"
+version = "0.5.0"
 edition = "2021"
 description = "Command-line interface for the ferx NLME modeling engine"
 license = "MIT"
@@ -36,11 +36,11 @@ search = ["dep:ferx-search"]
 # instead of linking the rlib it just built, and `--no-default-features` is
 # silently defeated for `ferx-core` everywhere (harmless only while
 # `default = []`; `survival` is slated to become default-on).
-ferx-core = { path = "../..", version = "0.4.0", default-features = false }
-ferx-tools = { path = "../ferx-tools", version = "0.4.0" }
+ferx-core = { path = "../..", version = "0.5.0", default-features = false }
+ferx-tools = { path = "../ferx-tools", version = "0.5.0" }
 # Optional behind the default-on `search` feature (#3187). LGPL-3.0-or-later
 # (#3183): a build with it links LGPL code, which `ferx --licenses` covers.
-ferx-search = { path = "../ferx-search", version = "0.4.0", optional = true }
+ferx-search = { path = "../ferx-search", version = "0.5.0", optional = true }
 indicatif = "0.18.4"
 # The binary's global allocator (`src/main.rs`): an estimation allocates many small,
 # short-lived buffers per subject per evaluation. A binary-level choice; the `ferx-core`
