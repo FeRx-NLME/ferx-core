@@ -292,7 +292,7 @@ impl<T: PkNum> ErkStepper<T> {
     }
 
     /// The error estimate of the last [`Self::stages`].
-    /// Non-recording: the adaptive driver decides on the value lane. A recording type never reaches it: `T::ode_segment` records the segment as a loop call (the f64 driver runs at run time) and returns before this code, except after the recording has already failed.
+    /// Non-recording: the adaptive driver decides on the value lane. A recording type never reaches it: `T::ode_segment` records the segment as a loop call (the f64 driver runs at run time) and returns before this code.
     pub(crate) fn err_norm(&self, u: &[T], dt: f64, opts: &OdeSolverOptions) -> f64 {
         erk_err_norm(
             self.n,

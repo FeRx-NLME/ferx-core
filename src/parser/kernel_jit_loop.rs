@@ -312,11 +312,27 @@ fn record_body(
     )
 }
 
+/// [`record_segment_bodies`], with a failed recording answered by the entry state at every time and
+/// never `None`: `None` makes the caller integrate the segment over the recording type, a loop of
+/// up to `ode_max_steps` steps recorded into a recording that is discarded (#3161).
+#[allow(clippy::too_many_arguments)]
+pub(super) fn record_segment(
+    rhs: &dyn Fn(&[Tr], &[Tr], Tr, &mut [Tr]), u0: &[Tr], t_span: (f64, f64), params: &[Tr],
+    saveat: &[f64], interp_at: &[f64], opts: &OdeSolverOptions, auto: &mut sol::OdeAutoSwitchState,
+) -> Option<(Vec<SolPointG<Tr>>, Vec<SolPointG<Tr>>)> {
+    record_segment_bodies(rhs, u0, t_span, params, saveat, interp_at, opts, auto).or_else(|| {
+        let at = |ts: &[f64]| -> Vec<SolPointG<Tr>> {
+            ts.iter().map(|&t| SolPointG { t, u: u0.to_vec() }).collect()
+        };
+        Some((at(saveat), at(interp_at)))
+    })
+}
+
 /// Record one ODE segment (see the module docs): the bodies, a value-only run for the
 /// record-time outputs, and the call in the outer recording. `None` — the recording fails — if
 /// a body cannot be recorded or the run does not complete.
 #[allow(clippy::too_many_arguments)]
-pub(super) fn record_segment(
+fn record_segment_bodies(
     rhs: &dyn Fn(&[Tr], &[Tr], Tr, &mut [Tr]), u0: &[Tr], t_span: (f64, f64), params: &[Tr],
     saveat: &[f64], interp_at: &[f64], opts: &OdeSolverOptions, auto: &mut sol::OdeAutoSwitchState,
 ) -> Option<(Vec<SolPointG<Tr>>, Vec<SolPointG<Tr>>)> {

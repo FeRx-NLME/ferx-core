@@ -957,7 +957,7 @@ impl<T: PkNum> RosWorkspace<T> {
     /// RMS error norm over the scale band `abstol + reltol·max(|u_new|, |u|)`, on **values
     /// only** — identical in form to the RK45 control so a model that converges under one
     /// integrator sees the same accuracy contract under the other.
-    /// Non-recording: the adaptive driver decides on the value lane. A recording type never reaches it: `T::ode_segment` records the segment as a loop call (the f64 driver runs at run time) and returns before this code, except after the recording has already failed.
+    /// Non-recording: the adaptive driver decides on the value lane. A recording type never reaches it: `T::ode_segment` records the segment as a loop call (the f64 driver runs at run time) and returns before this code.
     fn err_norm(&self, u: &[T], opts: &OdeSolverOptions) -> f64 {
         ros_err_norm(
             self.n,

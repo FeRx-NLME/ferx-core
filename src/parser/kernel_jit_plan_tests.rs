@@ -1667,6 +1667,66 @@ fn a_failure_at_an_overflowed_point_is_repelled_and_a_finite_one_keeps_its_scope
     assert!(rec.finite());
 }
 
+/// A replay that meets another structure while an ODE segment's step bodies are recorded ends there
+/// and records afresh; it does not trace the segment's adaptive loop over the recording type, a
+/// loop whose result the discarded replay never reads and whose steps (up to `ode_max_steps`)
+/// would each land in the recording. `auto` records the stiff stepper `stiff_method_for` names, so
+/// the same segment at `reltol = 1e-8` (Rodas4) and `1e-9` (Rodas5P) is two structures: the
+/// post-fit tolerance check re-records every subject at the second (#2846). The control side
+/// asserts the second recording is a replay's mismatch, not a first recording. Mutation: make
+/// `record_segment` return `None` after a failed body recording -> the count below is in the
+/// thousands.
+#[test]
+fn a_replay_mismatch_in_an_ode_segment_does_not_trace_the_adaptive_loop() {
+    use crate::ode::solver::{OdeAutoSwitchState, OdeMethod, OdeSolverOptions};
+    let subject = crate::types::Subject::default();
+    let m = crate::types::test_helpers::analytical_model(crate::types::GradientMethod::default());
+    let family =
+        SubjectKey::new(&m, &subject, 1, 2).with_variant(Desc::of_value(&0x7e_4412u64)).family();
+    let calls = std::cell::Cell::new(0usize);
+    let segment = |reltol: f64| {
+        let calls = &calls;
+        move || {
+            let k = Tr::from_f64;
+            let et: Vec<Tr> = (0..2).map(|j| Tr::eta(j, 0.1)).collect();
+            let p = [k(20.0) * et[0].exp(), k(0.5) * et[1].exp()];
+            let rhs = |u: &[Tr], p: &[Tr], _t: Tr, du: &mut [Tr]| {
+                calls.set(calls.get() + 1);
+                du[0] = -p[0] * u[0];
+                du[1] = p[0] * u[0] - p[1] * u[1];
+            };
+            let opts = OdeSolverOptions {
+                reltol,
+                method: OdeMethod::Auto,
+                auto_switch: false,
+                ..Default::default()
+            };
+            let hard = crate::ode::solver::solve_ode_g_with_auto_state(
+                &rhs,
+                &[k(1.0), k(0.0)],
+                (0.0, 200.0),
+                &p,
+                &[200.0],
+                &opts,
+                &mut OdeAutoSwitchState::default(),
+            );
+            Some(vec![hard[0].u[1].reg()])
+        }
+    };
+    recorded(&family, segment(1e-8)).expect("records").plan(l2(), 2, 0).expect("plans");
+    let before = REPLAYS.with(std::cell::Cell::get);
+    recorded(&family, segment(1e-8)).expect("records").plan(l2(), 2, 0).expect("plans");
+    assert_eq!(REPLAYS.with(std::cell::Cell::get), before + 1, "the same structure replays");
+    calls.set(0);
+    recorded(&family, segment(1e-9)).expect("records afresh");
+    assert_eq!(REPLAYS.with(std::cell::Cell::get), before + 1, "the other structure is no replay");
+    assert!(
+        calls.get() < 500,
+        "the mismatch traced the loop: {} right-hand-side calls",
+        calls.get()
+    );
+}
+
 /// A subject whose structure is not its family's template's is recorded afresh, never failed: the
 /// replay that meets another structure ("another structure than its template") is discarded by
 /// [`recorded`], which records again without the template. The control side asserts the replay

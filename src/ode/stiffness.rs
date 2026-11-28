@@ -194,7 +194,7 @@ const PROBE_STACK_N: usize = 8;
 ///
 /// Non-recording: the adaptive driver decides on the value lane. A recording type never reaches
 /// it: `T::ode_segment` records the segment as a loop call (the f64 driver runs at run time)
-/// and returns before this code, except after the recording has already failed.
+/// and returns before this code.
 fn fd_jacobian_into<T: PkNum>(
     rhs: &crate::ode::solver::RhsG<'_, T>, u: &[T], params: &[T], t: f64, jac: &mut [f64],
 ) -> bool {
