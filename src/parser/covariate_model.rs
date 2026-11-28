@@ -583,7 +583,9 @@ fn check_kind(form: &CovariateForm, decl: &CovariateDecl) -> Result<(), String> 
 }
 
 /// `=> NAME(init, lower, upper)[, NAME(...)]` — an explicit θ declaration,
-/// overriding the form's defaults. One entry per θ the form generates.
+/// overriding the form's defaults. One entry per θ the form generates. `NAME(init)`
+/// keeps the form's default bounds (`NaN` here, filled by [`build_thetas`]): what
+/// `SeedInits` writes for a fitted coefficient, whose bounds the fit does not carry (#2864).
 fn parse_theta_clause(
     clause: &str, ctx: &CovariateModelContext<'_>,
 ) -> Result<Vec<CovariateTheta>, String> {
@@ -597,22 +599,27 @@ fn parse_theta_clause(
             .split_once('(')
             .and_then(|(n, a)| a.strip_suffix(')').map(|a| (n.trim(), a)))
             .ok_or_else(|| {
-                format!("[covariate_model]: expected `=> NAME(init, lower, upper)`, got `{part}`")
+                format!("[covariate_model]: expected `=> NAME(init[, lower, upper])`, got `{part}`")
             })?;
         let nums: Vec<f64> = args
             .split(',')
             .map(|t| {
-                t.trim().parse::<f64>().map_err(|_| {
+                // `NaN` is refused: it marks the bounds `NAME(init)` leaves to the form.
+                t.trim().parse::<f64>().ok().filter(|v| !v.is_nan()).ok_or_else(|| {
                     format!("[covariate_model]: `{}` is not a number in `{part}`", t.trim())
                 })
             })
             .collect::<Result<_, _>>()?;
-        let [init, lower, upper] = nums[..] else {
-            return Err(format!(
-                "[covariate_model]: `{name}(...)` needs exactly (init, lower, upper), got \
-                 {} values",
-                nums.len()
-            ));
+        let (init, lower, upper) = match nums[..] {
+            [init] => (init, f64::NAN, f64::NAN),
+            [init, lower, upper] => (init, lower, upper),
+            _ => {
+                return Err(format!(
+                    "[covariate_model]: `{name}(...)` needs (init) or (init, lower, upper), got \
+                     {} values",
+                    nums.len()
+                ))
+            }
         };
         if ctx.declared_thetas.contains(name) {
             return Err(format!(
@@ -701,6 +708,18 @@ fn build_thetas(
             ));
         }
         let mut out = explicit.to_vec();
+        // `NAME(init)`: the bounds are the form's defaults, by position. Until those are
+        // known (a centre or range still to bind), the relation is unresolved, as with no
+        // clause at all.
+        if out.iter().any(|t| t.lower.is_nan()) {
+            let defaults = build_thetas(rel, decl, summary, None)?;
+            if defaults.is_empty() {
+                return Ok(Vec::new());
+            }
+            for (t, d) in out.iter_mut().zip(&defaults).filter(|(t, _)| t.lower.is_nan()) {
+                (t.lower, t.upper) = (d.lower, d.upper);
+            }
+        }
         apply_fix(&mut out, rel);
         if rel.form.is_categorical() {
             for (theta, level) in out.iter_mut().zip(non_reference_levels(rel, decl, summary)?) {
