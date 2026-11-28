@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: LGPL-3.0-or-later
 //! Tier-2 end-to-end checks for the candidate runner (#1178), on a real model
 //! and dataset but never to convergence: every fit here is an evaluation
 //! (`outer_maxiter = 0`, ferx's `MAXEVAL=0`).

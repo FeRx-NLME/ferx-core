@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: LGPL-3.0-or-later
 //! The candidate journal, the fit cache and the resume manifest (#1178).
 
 use std::collections::HashMap;

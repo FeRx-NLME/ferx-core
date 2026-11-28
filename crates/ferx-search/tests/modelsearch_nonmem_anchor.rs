@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: LGPL-3.0-or-later
 //! The NONMEM anchor for modelsearch (#1181): the same base, the same
 //! space and the same candidate inits, fitted by NONMEM 7.5.1 and by ferx,
 //! must give the same objective and the same BIC ranking.

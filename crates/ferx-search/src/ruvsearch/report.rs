@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: LGPL-3.0-or-later
 //! `steps.csv`, `models/<id>.ferx` and `final.ferx` — what a residual-error
 //! search leaves behind (#1182).
 //!

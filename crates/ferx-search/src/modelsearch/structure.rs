@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: LGPL-3.0-or-later
 //! The structural coordinates a candidate lives at, and how a set of them
 //! becomes a template line (#1181, #1257).
 //!
@@ -31,6 +32,13 @@
 //! Pharmpy's own enumeration in `pharmpy_anchor.rs`. Where ferx goes further
 //! — a candidate that no template can express — the reason is a named
 //! [`Structure::unbuildable`] string rather than a silent gap.
+//!
+//! # Attribution
+//!
+//! The structural space, its feature keys and the move rules here follow the
+//! behaviour of Pharmpy (<https://github.com/pharmpy/pharmpy>,
+//! LGPL-3.0-or-later, (c) the Pharmpy authors), and were written with its
+//! source as a reference. No Pharmpy code is copied; see the crate's `NOTICE`.
 
 use std::collections::HashMap;
 use std::fmt;

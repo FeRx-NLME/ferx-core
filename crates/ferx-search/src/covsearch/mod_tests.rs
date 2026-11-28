@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: LGPL-3.0-or-later
 //! Tier-1 tests for the SCM search logic (#1180).
 //!
 //! Every test here drives [`search`] with a *scripted* fitter — a table of

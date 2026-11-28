@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: LGPL-3.0-or-later
 //! Structural PK model search — Pharmpy `modelsearch` (#1181, #1257).
 //!
 //! The second search tool of the #1175 epic. Where covsearch (#1180) adds

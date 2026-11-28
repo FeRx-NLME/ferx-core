@@ -177,6 +177,7 @@ A GitHub Actions CI pipeline runs on every push to `main` and on pull requests (
 | **Tests + coverage (TTE/CTMM endpoints)** | `codecov/codecov-action` on the shard reports | Uploads the four shards' lcov files as one report (`survival` + `markov` + `nn` flags) |
 | **Clippy** | `tools/preflight.sh clippy` | Lint `ferx-core` under `ci,markov,nn` with `--all-targets` (without it a third of the repo — every `#[cfg(test)]` module and all of `tests/` — goes unlinted, #1023), then the workspace members |
 | **Format** | `tools/preflight.sh fmt` | Enforce consistent formatting (`--all`: the workspace members too). `.githooks/pre-commit` runs this same group |
+| **Licenses** | `tools/preflight.sh licenses` | License fields, SPDX headers on `ferx-search`, the license files in each crate's `cargo package --list`, and the third-party notices behind `ferx --licenses` (#3183) |
 | **Public API baseline** | `tools/update-public-api.sh --check` | Diff `ferx-core`'s public surface against `api/ferx-core-public-api.txt`; any widening fails until the baseline is regenerated in the same PR (#1114) |
 
 There is deliberately **no** separate uninstrumented `Test` job, and no separate
@@ -246,7 +247,14 @@ An R package (`ferx`) wraps the Rust engine via the [extendr](https://extendr.gi
 
 ### License
 
-A license should be added to the repository root (`LICENSE` file) to clarify usage terms.
+`ferx-core`, `ferx-tools` and the `ferx-cli` source are MIT; `crates/ferx-search`
+is LGPL-3.0-or-later (#3183). The root `LICENSE` states the split, and
+`docs/license.qmd` explains it. Every crate tarball carries its own texts, the
+`ferx` binary prints its licenses and generated third-party notices with
+`ferx --licenses`, and `tools/preflight.sh licenses` (`tools/check-licenses.sh`)
+fails if a license field, an SPDX header, a packaged license file or the
+notices go missing or stale. After a `Cargo.lock` change, regenerate the
+notices with `tools/third-party-notices.py`.
 
 ### Contributing
 

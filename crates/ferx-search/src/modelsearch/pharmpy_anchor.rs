@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: LGPL-3.0-or-later
 //! The Pharmpy anchor for the candidate enumeration (#1181).
 //!
 //! `tests/data/modelsearch_pharmpy_anchor.json` is Pharmpy 2.0.0's own

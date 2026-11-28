@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: LGPL-3.0-or-later
 //! pyDarwin-style penalized fitness (#1185, P6 of the #1175 epic).
 //!
 //! pyDarwin ranks a candidate on one scalar: its OFV plus a charge for every

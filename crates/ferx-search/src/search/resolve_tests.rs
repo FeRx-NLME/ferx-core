@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: LGPL-3.0-or-later
 use super::*;
 use ferx_core::parser::model_parser::parse_full_model;
 use ferx_core::{Population, Subject};

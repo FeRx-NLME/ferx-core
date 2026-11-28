@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: LGPL-3.0-or-later
 //! The likelihood-ratio test an SCM step decides on (#1180).
 //!
 //! Two nested models, the *reduced* one with fewer free parameters, and

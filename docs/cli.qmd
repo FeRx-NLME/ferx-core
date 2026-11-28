@@ -22,7 +22,13 @@ ferx ruvsearch <search.ferxsearch> [--directory DIR] [--threads N] [--resume]
 ferx allometry <model.ferx> --data <data.csv> [--covariate WT] [--reference 70] [--estimate]
 ferx --help                    # or -h; also: ferx check --help, ferx summary --help,
                                # ferx bootstrap --help, ferx covsearch --help
+ferx --licenses                # licenses and third-party notices of this binary
 ```
+
+`ferx --licenses` prints the MIT license, the LGPL-3.0 and GPL-3.0 texts that
+cover the linked `ferx-search` crate, the third-party notices (NLopt among
+them), and how to rebuild the binary with a modified `ferx-search`; see
+[License](license.qmd).
 
 ## Commands
 

@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: LGPL-3.0-or-later
 //! `@`-symbol resolution: turning `COVARIATE?(@IIV, @CONTINUOUS, *)` into the
 //! explicit parameter × covariate × effect set it stands for on one base
 //! model (#1179).

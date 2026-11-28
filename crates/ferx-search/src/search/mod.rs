@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: LGPL-3.0-or-later
 //! Model-space search: the shared machinery every search tool sits on (#1175).
 //!
 //! `ferx-core::edit` can *generate* a candidate model, `ferx_core::fit` can fit

@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: LGPL-3.0-or-later
 //! The CWRES pre-screen (#1182): Pharmpy's `ruvsearch` fits its candidates
 //! not to the data but to the parent's **conditional weighted residuals**.
 //!

@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: LGPL-3.0-or-later
 //! Global model search — pyDarwin's genetic algorithm and exhaustive
 //! enumeration over one candidate grid, with penalized fitness (#1185, P6 of
 //! the #1175 epic).

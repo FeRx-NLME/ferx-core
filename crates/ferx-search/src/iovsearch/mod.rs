@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: LGPL-3.0-or-later
 //! Inter-occasion variability search — Pharmpy `iovsearch` (#1183).
 //!
 //! The κ counterpart of [`crate::iivsearch`]: which `[individual_parameters]`

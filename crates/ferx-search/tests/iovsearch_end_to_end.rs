@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: LGPL-3.0-or-later
 //! Tier-2 end-to-end checks for iovsearch (#1183), on the warfarin
 //! two-occasion dataset but never to convergence: every fit is an
 //! evaluation (`maxiter = 0`).

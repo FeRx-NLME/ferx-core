@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: LGPL-3.0-or-later
 //! Variability-structure search — Pharmpy `iivsearch` (#1183).
 //!
 //! The fourth search tool of the #1175 epic, over the block the others leave

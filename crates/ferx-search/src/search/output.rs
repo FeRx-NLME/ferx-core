@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: LGPL-3.0-or-later
 //! `candidates.csv` — the per-candidate table (#1178).
 //!
 //! One row per candidate the run was given, in the order it was given them,

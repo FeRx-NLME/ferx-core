@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: LGPL-3.0-or-later
 //! `amd` — the automatic model development pipeline (#1184).
 //!
 //! Pharmpy's `amd`: run the search tools of the epic one after another, each

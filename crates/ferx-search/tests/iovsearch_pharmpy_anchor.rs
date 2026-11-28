@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: LGPL-3.0-or-later
 //! Tier-3: Pharmpy 2.2.0 `iovsearch` (driven by NONMEM 7.5.1) as the
 //! trajectory anchor for `ferx iovsearch` (#1183).
 //!

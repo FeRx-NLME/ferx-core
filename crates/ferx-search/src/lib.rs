@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: LGPL-3.0-or-later
 //! Model-space search built on top of [`ferx_core`].
 //!
 //! # Boundary rule
@@ -14,6 +15,12 @@
 //! `ferx-core`. From `ferx-tools` this crate uses only
 //! [`ferx_tools::lanes::run_in_lanes`], and neither crate below may depend on
 //! this one. `tests/public_api_boundary.rs` in `ferx-core` pins it.
+//!
+//! # License
+//!
+//! LGPL-3.0-or-later (#3183), unlike the MIT crates below it; see the crate's
+//! `NOTICE`, `COPYING.LESSER` and `COPYING`. Releases of this code inside
+//! `ferx-tools`, up to and including 0.4.0, remain MIT.
 
 pub mod allometry;
 pub mod amd;

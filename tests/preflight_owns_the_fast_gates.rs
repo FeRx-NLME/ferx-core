@@ -337,6 +337,8 @@ fn the_fast_gate_jobs_delegate_to_preflight_and_never_inline_cargo() {
         ("rustdoc", "rustdoc"),
         // #1545. Runs no cargo, so (1a) is vacuous for it; (1b) and (2) are not.
         ("changelog", "changelog"),
+        // #3183. Runs no compile; its cargo calls live in tools/check-licenses.sh.
+        ("licenses", "licenses"),
         // #2634. Same shape as `docs`: its gate is its own test run.
         ("patterns", "patterns"),
         // NOT `debug-assertions`. It had a job of its own under #344; #1248
@@ -1115,8 +1117,9 @@ fn preflight_is_executable_and_lists_every_group() {
     // commands are actually *enforced* is
     // `a_failing_gate_fails_the_script_from_every_position`; `--list` executes nothing and
     // can never show it.
-    let expected: [(&str, usize); 10] = [
+    let expected: [(&str, usize); 11] = [
         ("changelog", 1),  // tools/changelog.sh check (#1545)
+        ("licenses", 1),   // tools/check-licenses.sh (#3183)
         ("fmt", 1),        // cargo fmt --all -- --check
         ("check", 5),      // ci · ci,survival,slow-tests · ci,markov · ci,nn,slow-tests · members
         ("clippy", 3),     // ferx-core ci,markov,nn · ferx-core ci --lib (#2075) · members
