@@ -1,14 +1,14 @@
 //! `ferx allometry` — allometric scaling (#1180).
 //!
 //! Thin by construction: parse flags, build the options, call
-//! [`ferx_tools::allometry::run_allometry`], print both fits. The convention
-//! — which parameters get which exponent — lives in `ferx-tools`.
+//! [`ferx_search::allometry::run_allometry`], print both fits. The convention
+//! — which parameters get which exponent — lives in `ferx-search`.
 
 use std::path::{Path, PathBuf};
 
 use ferx_core::edit::ModelText;
-use ferx_tools::allometry::{run_allometry, AllometryOptions, AllometryRun};
-use ferx_tools::search::{BaseModel, SearchConfig};
+use ferx_search::allometry::{run_allometry, AllometryOptions, AllometryRun};
+use ferx_search::search::{BaseModel, SearchConfig};
 
 use crate::covsearch_cmd::{parse_threads, scan_args};
 
@@ -157,7 +157,7 @@ fn run_allometry_command(args: &[String]) -> Result<i32, String> {
         ),
     };
 
-    let is_search = path.extension().is_some_and(|e| e == ferx_tools::search::config::EXTENSION);
+    let is_search = path.extension().is_some_and(|e| e == ferx_search::search::config::EXTENSION);
     let (base, mut options, mut run_options) = if is_search {
         if value(args, "--data")?.is_some() {
             return Err("--data does not apply to a .ferxsearch file, which names its own".into());
@@ -179,7 +179,7 @@ fn run_allometry_command(args: &[String]) -> Result<i32, String> {
         (
             BaseModel { prepared, text },
             AllometryOptions::default(),
-            ferx_tools::search::RunOptions::default(),
+            ferx_search::search::RunOptions::default(),
         )
     };
     apply_flags(args, &mut options)?;
@@ -217,7 +217,7 @@ fn run_allometry_command(args: &[String]) -> Result<i32, String> {
             }
         );
     }
-    let show = |label: &str, r: &ferx_tools::search::CandidateResult| {
+    let show = |label: &str, r: &ferx_search::search::CandidateResult| {
         println!(
             "  {label:<10} OFV {:>12}  converged={}  passed={}{}",
             r.ofv.map(|v| format!("{v:.3}")).unwrap_or_else(|| "-".into()),

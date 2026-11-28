@@ -1,14 +1,26 @@
-mod allometry_cmd;
-mod amd_cmd;
 mod bootstrap_cmd;
 mod bootstrap_progress;
-mod covsearch_cmd;
 mod export_dcm_cmd;
 mod gam_cmd;
+mod licenses;
+mod summary_json;
+
+// The model-search subcommands, behind the default-on `search` feature (#3187).
+#[cfg(feature = "search")]
+mod allometry_cmd;
+#[cfg(feature = "search")]
+mod amd_cmd;
+#[cfg(feature = "search")]
+mod covsearch_cmd;
+#[cfg(feature = "search")]
 mod globalsearch_cmd;
+#[cfg(feature = "search")]
 mod iivsearch_cmd;
+#[cfg(feature = "search")]
 mod iovsearch_cmd;
+#[cfg(feature = "search")]
 mod modelsearch_cmd;
+#[cfg(feature = "search")]
 mod ruvsearch_cmd;
 
 use ferx_core::NcaInit;
@@ -16,16 +28,25 @@ use std::env;
 use std::time::Instant;
 
 /// Top-level usage/help text, shared by the no-args error path (stderr, exit 1)
-/// and `ferx -h`/`--help` (stdout, exit 0) so the two can't drift apart.
-const MAIN_USAGE: &str = "\
+/// and `ferx -h`/`--help` (stdout, exit 0) so the two can't drift apart. The
+/// search lines sit between the two halves and depend on the `search` feature.
+fn main_usage() -> String {
+    format!("{USAGE_HEAD}{SEARCH_USAGE}{USAGE_TAIL}")
+}
+
+const USAGE_HEAD: &str = "\
 Usage: ferx <model.ferx> --data <data.csv> [--threads N|auto] [--output <run.fitrx>] [--include-data] [--inits-from-nca[=nca|nca_sweep|nca_ebe]] [--output-format yaml|json|both] [--clean]
        ferx <model.ferx> --simulate          [--threads N|auto] [--output <run.fitrx>]
        ferx check <model.ferx> [--data <data.csv>] [--json]
-       ferx summary <run.fitrx> [<run2.fitrx> ...]
+       ferx summary <run.fitrx> [<run2.fitrx> ...] [--json]
        ferx bootstrap <model.ferx> [--data <data.csv>] [--samples N] [--seed N]
                       [--stratify-on COL] [--threads N]   (see `ferx bootstrap --help`)
        ferx gam      <model.ferx>  --data <data.csv> [--csv gam.csv] [--threads N]
                                                          (see `ferx gam --help`)
+";
+
+#[cfg(feature = "search")]
+const SEARCH_USAGE: &str = "\
        ferx covsearch <search.ferxsearch> [--directory DIR] [--threads N] [--resume]
                                                          (see `ferx covsearch --help`)
        ferx allometry <model.ferx> --data <data.csv> [--covariate WT] [--reference 70]
@@ -42,6 +63,14 @@ Usage: ferx <model.ferx> --data <data.csv> [--threads N|auto] [--output <run.fit
                                                          (see `ferx amd --help`)
        ferx globalsearch <search.ferxsearch> [--directory DIR] [--threads N] [--resume]
                                                          (see `ferx globalsearch --help`)
+";
+
+#[cfg(not(feature = "search"))]
+const SEARCH_USAGE: &str = "\
+       (model search tools omitted: this ferx was built without the `search` feature)
+";
+
+const USAGE_TAIL: &str = "\
        ferx export-dcm <run.fitrx> [-o <out.ferx>] [--fixed-theta]
                                                          (see `ferx export-dcm --help`)
 
@@ -77,6 +106,7 @@ Data must be in NONMEM format (ID, TIME, DV, EVID, AMT, CMT, ...)
                Disable checkpointing entirely with [fit_options] checkpoint = false.
 
 -h, --help     print this help and exit
+--licenses     print the licenses and third-party notices of this binary
 ";
 
 /// True for either spelling of the help flag.
@@ -108,13 +138,16 @@ fn normalize_args(args: &[String]) -> Vec<String> {
         .collect()
 }
 
-/// Every `ferx <word> ...` subcommand, paired with the function that runs it
-/// and returns the process exit code.
+/// A subcommand's entry point: the full argument vector in, the process exit code out.
+type Runner = fn(&[String]) -> i32;
+
+/// Every `ferx <word> ...` subcommand that is not a model search, paired with the
+/// function that runs it and returns the process exit code.
 ///
-/// This table is the *only* list of tool names: `main` dispatches from it and
-/// the unknown-tool error below enumerates it, so a tool cannot be added to
-/// one and missed by the other (#1396).
-const SUBCOMMANDS: &[(&str, fn(&[String]) -> i32)] = &[
+/// This table and [`SEARCH_SUBCOMMANDS`] are the *only* lists of tool names: `main`
+/// dispatches from them and the unknown-tool error enumerates them, so a tool cannot
+/// be added to one and missed by the other (#1396).
+const SUBCOMMANDS: &[(&str, Runner)] = &[
     // Parse + validate a model (optionally against data) and report structured
     // diagnostics; no fit.
     ("check", run_check),
@@ -123,32 +156,75 @@ const SUBCOMMANDS: &[(&str, fn(&[String]) -> i32)] = &[
     // #1140, the first `ferx-tools` subcommand: many fits over resampled data.
     ("bootstrap", bootstrap_cmd::run),
     ("gam", gam_cmd::run),
-    // `covsearch` / `allometry` (#1180): the first model-space search tools,
-    // driven by a `.ferxsearch` file (or, for allometry, a model file + flags).
-    ("covsearch", covsearch_cmd::run),
-    ("allometry", allometry_cmd::run),
-    // #1181: structural PK search over the `pk` templates.
-    ("modelsearch", modelsearch_cmd::run),
-    // #1182: residual-error model search.
-    ("ruvsearch", ruvsearch_cmd::run),
-    // #1183: variability-structure search.
-    ("iivsearch", iivsearch_cmd::run),
-    ("iovsearch", iovsearch_cmd::run),
-    // #1184: the whole pipeline, one tool after another.
-    ("amd", amd_cmd::run),
-    // #1185: GA / exhaustive over one grid, penalized fitness.
-    ("globalsearch", globalsearch_cmd::run),
     // #1331: a fitted `[covariate_nn]` model written out as plain equations.
     ("export-dcm", export_dcm_cmd::run),
 ];
 
+/// The runner of a model-search subcommand: its module's `run` with the `search`
+/// feature, `built_without_search` without it (#3187).
+#[cfg(feature = "search")]
+macro_rules! search_tool {
+    ($module:ident) => {
+        $module::run
+    };
+}
+#[cfg(not(feature = "search"))]
+macro_rules! search_tool {
+    ($module:ident) => {
+        built_without_search
+    };
+}
+
+/// The model-search subcommands (`ferx-search`). Their names are in every build, so
+/// a build without the `search` feature reports that it was built without search
+/// rather than calling them unknown tools (#3187).
+const SEARCH_SUBCOMMANDS: &[(&str, Runner)] = &[
+    // `covsearch` / `allometry` (#1180): the first model-space search tools,
+    // driven by a `.ferxsearch` file (or, for allometry, a model file + flags).
+    ("covsearch", search_tool!(covsearch_cmd)),
+    ("allometry", search_tool!(allometry_cmd)),
+    // #1181: structural PK search over the `pk` templates.
+    ("modelsearch", search_tool!(modelsearch_cmd)),
+    // #1182: residual-error model search.
+    ("ruvsearch", search_tool!(ruvsearch_cmd)),
+    // #1183: variability-structure search.
+    ("iivsearch", search_tool!(iivsearch_cmd)),
+    ("iovsearch", search_tool!(iovsearch_cmd)),
+    // #1184: the whole pipeline, one tool after another.
+    ("amd", search_tool!(amd_cmd)),
+    // #1185: GA / exhaustive over one grid, penalized fitness.
+    ("globalsearch", search_tool!(globalsearch_cmd)),
+];
+
 /// The runner for `word`, when it names a subcommand.
-fn subcommand(word: &str) -> Option<fn(&[String]) -> i32> {
-    SUBCOMMANDS.iter().find(|(name, _)| *name == word).map(|(_, run)| *run)
+fn subcommand(word: &str) -> Option<Runner> {
+    SUBCOMMANDS
+        .iter()
+        .chain(SEARCH_SUBCOMMANDS)
+        .find(|(name, _)| *name == word)
+        .map(|(_, run)| *run)
+}
+
+/// The tools this build can run, in the order the unknown-tool error lists them:
+/// the search tools only when they were compiled in.
+fn available_tools() -> Vec<&'static str> {
+    let search: &[_] = if cfg!(feature = "search") { SEARCH_SUBCOMMANDS } else { &[] };
+    SUBCOMMANDS.iter().chain(search).map(|(name, _)| *name).collect()
+}
+
+/// What `ferx <search tool> ...` reports in a build without the `search` feature.
+#[cfg(not(feature = "search"))]
+fn built_without_search(args: &[String]) -> i32 {
+    eprintln!(
+        "Error: `{}` is a model-search tool, and this ferx was built without the `search` \
+         feature.\nRebuild ferx-cli with its default features (or `--features search`) to use it.",
+        args[1]
+    );
+    1
 }
 
 /// What the first argument means once it is known not to name a [`SUBCOMMANDS`]
-/// entry (#1396).
+/// or [`SEARCH_SUBCOMMANDS`] entry (#1396).
 #[derive(Debug, PartialEq, Eq)]
 enum FirstArg<'a> {
     /// A bare word — no dot, no path separator. The user meant a tool, and this
@@ -175,7 +251,7 @@ enum FirstArg<'a> {
 /// is a bare word by construction, so anything carrying a `.` or a path
 /// separator is a path the user got wrong rather than a tool we do not have.
 /// "Whatever the name" is bounded by the two decisions `main` takes first: a
-/// [`SUBCOMMANDS`] name runs its tool, and a leading `-` is a flag, so a file
+/// subcommand name runs its tool, and a leading `-` is a flag, so a file
 /// called `check` is reachable only by a path (`./check`).
 ///
 /// A probe that *fails* (`Err`) is not an absent file: an unreadable parent
@@ -202,7 +278,7 @@ fn classify_first_arg(arg: &str, exists: std::io::Result<bool>) -> FirstArg<'_> 
 /// The second line of the unknown-tool error: a `did you mean` when one tool
 /// name is within two edits of `word`, and the full list either way.
 fn unknown_tool_hint(word: &str) -> String {
-    let names: Vec<&str> = SUBCOMMANDS.iter().map(|(name, _)| *name).collect();
+    let names = available_tools();
     let mut hint = String::new();
     if let Some(near) = names
         .iter()
@@ -248,7 +324,11 @@ fn main() {
     let args = normalize_args(&raw_args);
 
     if is_help_flag(args.get(1)) {
-        print!("{MAIN_USAGE}");
+        print!("{}", main_usage());
+        std::process::exit(0);
+    }
+    if args.get(1).map(String::as_str) == Some("--licenses") {
+        print!("{}", licenses::text());
         std::process::exit(0);
     }
 
@@ -260,7 +340,7 @@ fn main() {
     }
 
     if args.len() < 2 {
-        eprint!("{MAIN_USAGE}");
+        eprint!("{}", main_usage());
         std::process::exit(1);
     }
 
@@ -283,7 +363,7 @@ fn main() {
         }
         FirstArg::Flag(flag) => {
             eprintln!("Error: expected a model file or a tool name, got the flag `{flag}`.");
-            eprint!("{MAIN_USAGE}");
+            eprint!("{}", main_usage());
             std::process::exit(1);
         }
         FirstArg::ModelFile(_) => {}
@@ -475,7 +555,7 @@ fn main() {
 }
 
 const SUMMARY_USAGE: &str = "\
-Usage: ferx summary <run.fitrx> [<run2.fitrx> ...]
+Usage: ferx summary <run.fitrx> [<run2.fitrx> ...] [--json]
 
 With one bundle: prints a psn::sumo-style summary — parameter estimates
 with %RSE plus basic run info.
@@ -483,26 +563,44 @@ with %RSE plus basic run info.
 With two or more bundles: prints a Markdown table comparing the runs
 (method, convergence, OFV/AIC/BIC, ΔOFV, runtime, sizes, and parameter
 estimates) side by side.
+
+--json   emit the summary as one JSON document on stdout instead: a
+         `runs` array with one object per bundle (status, objective,
+         name-keyed `estimates`, diagnostics, structured warnings — the
+         keys of {model}-fit.json), plus `delta_ofv` against the first
+         run when two or more bundles are given. A bundle that fails to
+         load gets an `error` entry and the exit code is 1.
 ";
+
+/// The column/run label for a bundle path: its file stem (`run1.fitrx` → `run1`).
+fn bundle_label(path: &str) -> String {
+    std::path::Path::new(path).file_stem().and_then(|s| s.to_str()).unwrap_or(path).to_string()
+}
 
 /// Run the `summary` subcommand: load one or more `.fitrx` bundles.
 ///
 /// A single bundle prints a `psn::sumo`-style summary (parameter estimates +
 /// basic run info). Two or more bundles print a Markdown comparison table.
-/// The column label for each run is the bundle's file stem.
+/// The column label for each run is the bundle's file stem. With `--json`
+/// (#3074) the same content is one JSON document on stdout (`summary_json::summary_json`).
 ///
 /// Returns the process exit code: `0` = printed (incl. `--help`), `1` = a load
 /// failed, `2` = usage (missing/flag-looking path).
 fn run_summary(args: &[String]) -> i32 {
-    // `summary` takes only bundle paths plus `-h`/`--help`. Scan every argument:
-    // help anywhere prints usage (exit 0); any other flag-looking argument is a
-    // usage error (exit 2) rather than being silently ignored or mistaken for a
-    // file path. Everything else is a bundle path.
+    // `summary` takes only bundle paths plus `--json` and `-h`/`--help`. Scan
+    // every argument: help anywhere prints usage (exit 0); any other flag-looking
+    // argument is a usage error (exit 2) rather than being silently ignored or
+    // mistaken for a file path. Everything else is a bundle path.
     let mut paths: Vec<&str> = Vec::new();
+    let mut json = false;
     for arg in &args[2..] {
         if is_help_flag(Some(arg)) {
             print!("{SUMMARY_USAGE}");
             return 0;
+        }
+        if arg == "--json" {
+            json = true;
+            continue;
         }
         if arg.starts_with('-') {
             eprintln!("Error: unknown option {}", arg);
@@ -514,6 +612,10 @@ fn run_summary(args: &[String]) -> i32 {
     if paths.is_empty() {
         eprint!("{SUMMARY_USAGE}");
         return 2;
+    }
+
+    if json {
+        return run_summary_json(&paths);
     }
 
     // Load all bundles up front so a bad path fails before any output.
@@ -531,21 +633,43 @@ fn run_summary(args: &[String]) -> i32 {
     if loaded.len() == 1 {
         print!("{}", ferx_core::io::output::format_summary(&loaded[0].1.fit));
     } else {
-        // Column label = file stem (e.g. `run1.fitrx` → `run1`).
-        let runs: Vec<(String, &ferx_core::FitResult)> = loaded
-            .iter()
-            .map(|(path, l)| {
-                let label = std::path::Path::new(path)
-                    .file_stem()
-                    .and_then(|s| s.to_str())
-                    .unwrap_or(path)
-                    .to_string();
-                (label, &l.fit)
-            })
-            .collect();
+        let runs: Vec<(String, &ferx_core::FitResult)> =
+            loaded.iter().map(|(path, l)| (bundle_label(path), &l.fit)).collect();
         print!("{}", ferx_core::io::output::format_comparison(&runs));
     }
     0
+}
+
+/// `ferx summary --json`: load every bundle (a failure does not stop the others,
+/// it becomes that run's `error` entry), print one JSON document, and return `1`
+/// when any bundle failed to load, else `0`.
+fn run_summary_json(paths: &[&str]) -> i32 {
+    let loaded: Vec<Result<ferx_core::io::fitrx::LoadedFit, String>> = paths
+        .iter()
+        .map(|p| ferx_core::io::fitrx::load_fit(std::path::Path::new(p)).map_err(|e| e.to_string()))
+        .collect();
+    let entries: Vec<summary_json::SummaryEntry<'_>> = paths
+        .iter()
+        .zip(&loaded)
+        .map(|(path, l)| summary_json::SummaryEntry {
+            path,
+            label: bundle_label(path),
+            fit: l.as_ref().map(|l| &l.fit).map_err(|e| format!("failed to load {path}: {e}")),
+        })
+        .collect();
+    let doc = summary_json::summary_json(&entries);
+    match serde_json::to_string_pretty(&doc) {
+        Ok(s) => println!("{s}"),
+        Err(e) => {
+            eprintln!("Error: failed to serialize summary: {e}");
+            return 2;
+        }
+    }
+    if loaded.iter().any(Result::is_err) {
+        1
+    } else {
+        0
+    }
 }
 
 /// Parsed `ferx check` arguments.
@@ -796,10 +920,11 @@ fn parse_inits_from_nca_flag(args: &[String]) -> Result<Option<NcaInit>, String>
 #[cfg(test)]
 mod tests {
     use super::{
-        check_summary_line, classify_first_arg, edit_distance, is_help_flag, normalize_args,
-        parse_check_args, parse_inits_from_nca_flag, parse_output_flag, parse_output_format,
-        parse_threads_flag, print_check_human, run_check, run_summary, subcommand,
-        unknown_tool_hint, CheckArgsError, EstimatesFormat, FirstArg, SUBCOMMANDS,
+        bundle_label, check_summary_line, classify_first_arg, edit_distance, is_help_flag,
+        normalize_args, parse_check_args, parse_inits_from_nca_flag, parse_output_flag,
+        parse_output_format, parse_threads_flag, print_check_human, run_check, run_summary,
+        subcommand, unknown_tool_hint, CheckArgsError, EstimatesFormat, FirstArg,
+        SEARCH_SUBCOMMANDS, SUBCOMMANDS,
     };
     use ferx_core::NcaInit;
 
@@ -895,7 +1020,7 @@ mod tests {
         // The table is the single list of tool names: dispatch reads it and the
         // unknown-tool error enumerates it. A name in the list that does not
         // resolve would be advertised and then rejected.
-        for (name, _) in SUBCOMMANDS {
+        for (name, _) in SUBCOMMANDS.iter().chain(SEARCH_SUBCOMMANDS) {
             assert!(subcommand(name).is_some(), "`{name}` is listed but does not dispatch");
         }
         // A listed name is a bare word, so `main` must consult `subcommand`
@@ -908,9 +1033,9 @@ mod tests {
 
     #[test]
     fn the_hint_names_a_near_miss_and_always_lists_the_tools() {
-        let typo = unknown_tool_hint("covsearh");
+        let typo = unknown_tool_hint("bootstrp");
         assert!(
-            typo.contains("Did you mean `covsearch`?"),
+            typo.contains("Did you mean `bootstrap`?"),
             "one-edit typo should suggest the tool: {typo}"
         );
         // Far from every name: no suggestion, but still the full list.
@@ -918,6 +1043,25 @@ mod tests {
         assert!(!far.contains("Did you mean"), "unrelated word should not suggest anything: {far}");
         for (name, _) in SUBCOMMANDS {
             assert!(far.contains(name), "hint should list `{name}`: {far}");
+        }
+        // The search tools are listed exactly when they were compiled in (#3187).
+        for (name, _) in SEARCH_SUBCOMMANDS {
+            assert_eq!(
+                far.contains(&format!(" {name},")) || far.contains(&format!(" {name}.")),
+                cfg!(feature = "search"),
+                "`{name}` listed iff built with `search`: {far}"
+            );
+        }
+    }
+
+    /// #3187: without `search` a search tool still dispatches — to the
+    /// built-without-search error, exit 1 — instead of being an unknown tool.
+    #[cfg(not(feature = "search"))]
+    #[test]
+    fn a_search_tool_without_the_search_feature_reports_the_build() {
+        for (name, _) in SEARCH_SUBCOMMANDS {
+            let run = subcommand(name).expect("search names dispatch in every build");
+            assert_eq!(run(&args(&[name, "--help"])), 1, "`{name}`");
         }
     }
 
@@ -1233,6 +1377,48 @@ mod tests {
         write_warfarin_fitrx(&p1);
         write_warfarin_fitrx(&p2);
         assert_eq!(run_summary(&args(&["summary", p1.to_str().unwrap(), p2.to_str().unwrap()])), 0);
+    }
+
+    /// #3074: `--json` is a summary flag, so it combines with `--help` (usage, 0)
+    /// in either order, and alone still needs a path (2).
+    #[test]
+    fn run_summary_json_with_help_returns_0_and_without_a_path_returns_2() {
+        assert_eq!(run_summary(&args(&["summary", "--json", "--help"])), 0);
+        assert_eq!(run_summary(&args(&["summary", "-h", "--json"])), 0);
+        assert_eq!(run_summary(&args(&["summary", "--json"])), 2);
+        assert_eq!(run_summary(&args(&["summary", "--json", "--bogus", "x.fitrx"])), 2);
+    }
+
+    #[test]
+    fn run_summary_json_one_and_several_bundles_return_0() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let p1 = dir.path().join("run1.fitrx");
+        let p2 = dir.path().join("run2.fitrx");
+        write_warfarin_fitrx(&p1);
+        write_warfarin_fitrx(&p2);
+        let (s1, s2) = (p1.to_str().unwrap(), p2.to_str().unwrap());
+        assert_eq!(run_summary(&args(&["summary", "--json", s1])), 0);
+        assert_eq!(run_summary(&args(&["summary", s1, s2, "--json"])), 0);
+    }
+
+    /// A bundle that fails to load is still exit 1 under `--json`, and the bundles
+    /// around it are loaded (the document carries an error entry for it).
+    #[test]
+    fn run_summary_json_load_failure_returns_1() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let good = dir.path().join("good.fitrx");
+        write_warfarin_fitrx(&good);
+        assert_eq!(run_summary(&args(&["summary", "--json", "/no/such/file.fitrx"])), 1);
+        assert_eq!(
+            run_summary(&args(&["summary", "--json", good.to_str().unwrap(), "/no/such.fitrx"])),
+            1
+        );
+    }
+
+    #[test]
+    fn bundle_label_is_the_file_stem() {
+        assert_eq!(bundle_label("a/b/run1.fitrx"), "run1");
+        assert_eq!(bundle_label("run2"), "run2");
     }
 
     #[test]

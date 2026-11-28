@@ -1,7 +1,7 @@
 # NONMEM run scratch + per-run byproducts written by running `nmfe*` inside this
 # directory. The anchor convention commits only the INPUTS at this level
 # (<name>.ctl, <name>.csv, <name>_fit.ferx, simulate_*.py, *.md) and the curated
-# OUTPUTS under results/ (<name>.{ext,lst,cov,...}). Everything NONMEM writes
+# OUTPUTS under results/ (<name>.{ext,nm.json,cov,...}). Everything NONMEM writes
 # in-place is disposable — this keeps `git status` clean after a run so anchor
 # scratch is never accidentally committed. `results/` is deliberately NOT ignored.
 

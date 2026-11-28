@@ -7,7 +7,7 @@ description-meta: "The .ferxsearch file: a TOML search configuration whose space
 
 > **Maturity: alpha** — see [Feature Maturity](../maturity.qmd) for what this means.
 
-Every automated model-development tool in `ferx-tools` — covariate search,
+Every automated model-development tool in `ferx-search` — covariate search,
 structural search, variability search — is the same loop: generate a candidate
 model, fit it, rank it. What differs between runs is *what to search over*, and
 that is configuration, not model. The
@@ -318,7 +318,7 @@ data with the same settings is re-scored under this file's `[rank]` and
 ## From Rust
 
 ```rust
-use ferx_tools::search::SearchConfig;
+use ferx_search::search::SearchConfig;
 
 let cfg = SearchConfig::load("warfarin.ferxsearch")?;   // parsed + coverage-checked
 let base = cfg.load_base()?;                              // model text, parsed model, data

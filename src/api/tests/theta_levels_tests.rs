@@ -3636,7 +3636,7 @@ mod bind_from_fit {
     /// the pre-bound `Median`-only twin binds `Ok` on the design's median.
     #[test]
     fn a_model_bound_to_other_data_still_needs_the_fits_bindings() {
-        use crate::api::covariate_stats::symbolic_covariates;
+        use crate::covariate_stats::symbolic_covariates;
         for (level, median) in [(false, true), (true, true), (true, false)] {
             let text = model(level, median);
             let cell = format!("level {level} median {median}");
@@ -11186,8 +11186,8 @@ mod rebind {
     use super::from_fit_repeated_labels::two_block_model;
     use super::readout_share::{cf_pop, T6};
     use super::*;
-    use crate::api::covariate_stats::symbolic_covariates;
     use crate::api::{bind_covariate_stats, bind_from_fit, bind_theta_levels_from_fit};
+    use crate::covariate_stats::symbolic_covariates;
     use crate::parser::model_parser::{DataBindings, LevelContrast};
     use crate::types::ParsedModel;
 
@@ -11379,7 +11379,7 @@ mod rebind {
     /// every fit of a model with both halves.
     #[test]
     fn binding_once_reads_the_declaration_without_a_parse() {
-        use crate::api::levels::{declared_model, Declared, Reads};
+        use crate::levels::{declared_model, Declared, Reads};
         let text = model(true, true);
         let borrowed = |p: &ParsedModel, r: Reads| {
             matches!(declared_model(p, &text, r).unwrap(), Declared::Borrowed(_))

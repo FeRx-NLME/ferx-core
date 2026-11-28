@@ -12,8 +12,8 @@ Runs *inside* the Pharmpy container — see run.sh. Two sections:
   categorical — the oracle for ferx's @-symbol resolution and Pharmpy's
   explicit-beats-symbol / forced-beats-optional rules.
 
-The output is committed at crates/ferx-tools/tests/data/mfl_pharmpy_anchor.json
-and read by crates/ferx-tools/src/search/mfl_pharmpy_anchor.rs.
+The output is committed at crates/ferx-search/tests/data/mfl_pharmpy_anchor.json
+and read by crates/ferx-search/src/search/mfl_pharmpy_anchor.rs.
 """
 
 import dataclasses

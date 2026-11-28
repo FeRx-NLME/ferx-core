@@ -28,7 +28,7 @@
 //! with its two θ exactly 1 apart. A single run would anchor the number but not
 //! the claim that the two forms are the same model.
 //!
-//! ## Reference values (`tests/nonmem/covariate_cat2.{ctl,lst,ext}`)
+//! ## Reference values (`tests/nonmem/covariate_cat2.{ctl,nm.json,ext}`)
 //!
 //! Converged FOCEI (`METHOD=1 INTER`) fits from the same starting values, both
 //! engines, both shapes:

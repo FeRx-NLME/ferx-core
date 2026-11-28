@@ -1,6 +1,9 @@
 project:
   type: website
   output-dir: _site
+  # Copies the curated llms.txt over Quarto's generated one and builds
+  # llms-full.txt from the per-page .llms.md twins (#3073).
+  post-render: _llms.py
 
 brand: _brand.yml
 
@@ -14,6 +17,8 @@ website:
   twitter-card: true
   repo-url: https://github.com/FeRx-NLME/ferx-core
   repo-actions: [edit, issue]
+  # A Markdown twin (<page>.llms.md) of every page, for language models (#3073).
+  llms-txt: true
 
   navbar:
     logo: assets/ferx-dsl-brackets.svg
@@ -53,6 +58,8 @@ website:
         href: index.qmd
       - text: "Feature Maturity"
         href: maturity.qmd
+      - text: "Using ferx from an Agent"
+        href: agents.qmd
       - text: "Getting Started"
         href: getting-started.qmd
         contents:
@@ -168,6 +175,8 @@ website:
           - api/model-editing.qmd
       - text: "FAQ"
         href: faq.qmd
+      - text: "License"
+        href: license.qmd
       - text: "Development"
         href: development/index.qmd
         contents:
@@ -175,11 +184,12 @@ website:
           - development/sdlc.qmd
           - development/docs-lint.qmd
           - development/golden-fits.qmd
+          - development/peak-memory.qmd
 
   page-footer:
     background: light
     border: true
-    left: "© 2026 FeRx-NLME · MIT licensed"
+    left: "© 2026 FeRx-NLME · MIT and LGPL-3.0 licensed"
     right: "Fe · 26 · Rx · 2026"
 
 format:

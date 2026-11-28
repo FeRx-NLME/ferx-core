@@ -586,6 +586,8 @@ pub(super) fn synthetic_fit(template: &ModelParameters) -> FitResult {
         method_chain: vec![EstimationMethod::FoceI],
         method_wall_times_secs: vec![0.0],
         covariance_wall_time_secs: 0.0,
+        ofv_settlement_wall_time_secs: 0.0,
+        subject_results_wall_time_secs: 0.0,
         converged: true,
         ofv: 0.0,
         aic: Some(0.0),
@@ -2640,7 +2642,7 @@ fn theta_boundary_side_detects_bounds() {
     assert_eq!(side(0.0, -1.0, 1.0), None);
     assert_eq!(side(-1.0, -1.0, 1.0), Some("lower"));
     assert_eq!(side(1.0, -1.0, 1.0), Some("upper"));
-    // Identity-packed with PsN's scm bounds for a power / exponential
+    // Identity-packed with ferx's default bounds for a power / exponential
     // covariate θ, (-100, 1e6): an estimate near 1 is interior. Judged by
     // its distance to each bound on that bound's scale — as a fraction of
     // the range it would sit at 1e-4 and read as "at the lower bound", which

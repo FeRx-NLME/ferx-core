@@ -199,7 +199,7 @@ pub(crate) fn predict_diag_undrained(
     // are simply absent, exactly as a binary endpoint's are (occupancy prediction is #820).
     #[cfg(feature = "markov")]
     if model.has_dtmm() && population.subjects.iter().all(|s| s.obs_times.is_empty()) {
-        return Err(super::entry_refusals::ctmm_unsupported(
+        return Err(crate::entry_refusals::ctmm_unsupported(
             "predict() does not support a [markov_model] `type = dtmm` endpoint yet, and this \
              population has no continuous observations either — so the call would return an \
              empty vec. DTMM state prediction is a later slice.",
@@ -207,7 +207,7 @@ pub(crate) fn predict_diag_undrained(
     }
     #[cfg(feature = "markov")]
     if model.has_ctmm() && population.subjects.iter().all(|s| s.obs_times.is_empty()) {
-        return Err(super::entry_refusals::ctmm_unsupported(
+        return Err(crate::entry_refusals::ctmm_unsupported(
             "predict() does not support a [markov_model] (CTMM) endpoint yet, and this population \
              has no continuous observations either — so the call would return an empty vec rather \
              than an occupancy π(t). State-occupancy prediction is a later slice (#820).",
@@ -272,7 +272,7 @@ pub(crate) fn predict_diag_undrained(
             predict_subjects()
         }
     } else {
-        match super::pool::default_fit_pool() {
+        match crate::pool::default_fit_pool() {
             Some(pool) if pool.current_num_threads() > 1 => pool.install(|| {
                 crate::parser::model_parser::rhs_regcode::kernel_jit::in_fit(run, predict_subjects)
             }),

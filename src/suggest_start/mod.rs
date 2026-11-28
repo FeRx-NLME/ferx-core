@@ -82,8 +82,8 @@ pub fn inits_from_nca(
     // entrypoint; the Sweep/Ebe strategies predict, so guard the modeled-`RATE`
     // dose precondition here too — same loud-not-silent contract as
     // `predict()`/`simulate()` (#324). No-op for the common all-`Fixed` dataset.
-    first_error(&crate::api::check_modeled_dose_rates(model, population))?;
-    first_error(&crate::api::check_dose_compartments(model, population))?;
+    first_error(&crate::model_checks::check_modeled_dose_rates(model, population))?;
+    first_error(&crate::model_checks::check_dose_compartments(model, population))?;
     match method {
         NcaInit::Nca => Ok(nca_only(model, population)),
         NcaInit::Sweep => nca_with_sweep(model, population),
@@ -409,7 +409,7 @@ fn run_nca(model: &CompiledModel, population: &Population) -> (PopNca, Vec<Strin
     // `par_iter` would otherwise land on Rayon's global pool at one worker per logical
     // CPU regardless of the requested thread count (#1460).
     let per_subject: Vec<SubjectNca> =
-        crate::api::install_on_engine_pool(|| match model.pk_model {
+        crate::pool::install_on_engine_pool(|| match model.pk_model {
             PkModel::OneCptOral
             | PkModel::OneCptTransit
             | PkModel::OneCptIg

@@ -1,0 +1,45 @@
+# Full TMDD (fast reversible binding to a turning-over target), IV bolus.
+# Public stiff-ish repro: binding rate KON*C is ~100/h right after the dose, then relaxes.
+
+[parameters]
+  theta TVCL(0.3,  0.001, 10.0)
+  theta TVV(3.0,   0.1,  100.0)
+  theta TVKON(1.0, 0.01, 50.0)
+  theta TVKOFF(0.1, 0.001, 10.0)
+  theta TVKINT(0.05, 0.001, 5.0)
+  theta TVKSYN(0.5, 0.001, 50.0)
+  theta TVKDEG(0.05, 0.001, 5.0)
+
+  omega ETA_CL ~ 0.09
+  omega ETA_V  ~ 0.04
+
+  sigma PROP_ERR ~ 0.04 (sd)
+
+[individual_parameters]
+  CL   = TVCL * exp(ETA_CL)
+  V    = TVV  * exp(ETA_V)
+  KON  = TVKON
+  KOFF = TVKOFF
+  KINT = TVKINT
+  KSYN = TVKSYN
+  KDEG = TVKDEG
+  KEL  = CL / V
+
+[structural_model]
+  ode(obs_cmt=drug, states=[drug, target, complex])
+
+[odes]
+  init(target) = KSYN / KDEG
+  d/dt(drug)    = -KEL * drug - (KON / V) * drug * target + KOFF * complex
+  d/dt(target)  =  KSYN - KDEG * target - (KON / V) * drug * target + KOFF * complex
+  d/dt(complex) =  (KON / V) * drug * target - (KOFF + KINT) * complex
+
+[scaling]
+  y = drug / V
+
+[error_model]
+  DV ~ proportional(PROP_ERR)
+
+[fit_options]
+  method  = focei
+  maxiter = 300

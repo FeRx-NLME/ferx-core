@@ -86,7 +86,7 @@ realized; it is now fixed in **both** copies with an independent test, so the
 - **NONMEM comparisons** (AGENTS.md requires one per numerical feature): warfarin
   FOCEI/FOCE and IOV (307.8 vs 308.8) exist. TV-cov is currently
   simulated-recovery only — add a klebsiella NONMEM cross-check for a WT-on-CL
-  model (FOCEI + FOCE, OFV + θ/Ω/σ) and commit the `.lst`. `NM_PASS` stays in
+  model (FOCEI + FOCE, OFV + θ/Ω/σ) and commit the `.nm.json` (`tools/nonmem-extract.py`), not the `.lst`. `NM_PASS` stays in
   env/memory only, never committed.
 - **Test sweep**: `cargo test --lib` green; `cargo check --tests` green; run the
   Tier-3 gated tests once locally (`--features slow-tests`: `reset_convergence`,

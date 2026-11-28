@@ -1872,9 +1872,7 @@ pub fn predict_concentration(
             // from the preceding pulse is `t − dose.time + p`, `p = max(II − lagtime, 0)`:
             // it CLAMPS for `lagtime ≥ II` (NONMEM 7.6.0, `crate::dosing::ss_seed_phase`).
             let tau = t - dose.time + crate::dosing::ss_seed_phase(dose, lagtime);
-            if tau >= 0.0 {
-                conc += single_dose_concentration(pk_model, dose, tau, pk_params);
-            }
+            conc += single_dose_concentration(pk_model, dose, tau, pk_params);
         }
     }
     // Floor at zero, but preserve `NaN` (`f64::max` would discard it, #1284, #1399
@@ -2117,18 +2115,32 @@ pub fn analytical_state_at_times(
                 if !crate::dosing::ss_reset_live(&subject.doses, cutoff, k) {
                     continue;
                 }
+                // `predict_concentration`'s two cases, term for term (#1121, #3028).
                 let t_eff = dose.time + lagtime;
                 let tau = if t_eff <= t {
-                    t - t_eff
-                } else if dose.ss && dose.ii > 0.0 && t >= dose.time {
-                    let raw = t - t_eff;
-                    let n = (-raw / dose.ii).ceil();
-                    let wrapped = raw + n * dose.ii;
-                    if wrapped >= 0.0 {
-                        wrapped
-                    } else {
+                    if dose.ss
+                        && dose.ii > 0.0
+                        && !crate::dosing::ss_arrival_is_trough(dose, lagtime)
+                    {
+                        // Past `lag = II`: the train from its pulse on the record, plus the one
+                        // real arrival on its own.
+                        let mut arrival = dose.clone();
+                        arrival.ss = false;
+                        let tail = t - dose.time + crate::dosing::ss_seed_phase(dose, lagtime);
+                        for (s, (a, b)) in state.iter_mut().zip(
+                            single_dose_states(pk_model, dose, tail, pk_params)
+                                .into_iter()
+                                .zip(single_dose_states(pk_model, &arrival, t - t_eff, pk_params)),
+                        ) {
+                            *s += a;
+                            *s += b;
+                        }
                         continue;
                     }
+                    t - t_eff
+                } else if dose.ss && dose.ii > 0.0 && t >= dose.time {
+                    // The pre-arrival tail: the pulse before the record, `ss_seed_phase` old.
+                    t - dose.time + crate::dosing::ss_seed_phase(dose, lagtime)
                 } else {
                     continue;
                 };
@@ -2171,8 +2183,12 @@ pub fn predict_all_states(
 pub fn compute_predictions_with_states(
     model: &crate::types::CompiledModel, subject: &Subject, theta: &[f64], eta: &[f64],
 ) -> (Vec<f64>, Vec<Vec<f64>>) {
-    // A transit subject the closed form can't serve routes to its ODE twin, so states
-    // come from the ODE integration (matches `compute_predictions_with_tv`, #486).
+    // A transit/IG subject the closed form can't serve routes to its ODE twin, for IPRED as
+    // in `compute_predictions_with_tv` (#486). The twin's states (`[central(, periph)]`
+    // amounts) are not the closed form's `[depot, central(, peripheral)]` concentrations
+    // `[derived]` names them by, so such a subject reports none (#1580,
+    // `W_DERIVED_CMT_TWIN_ANALYTICAL`).
+    let closed_form = model.ode_spec.is_none();
     let model = effective_model_for_eval(model, subject, theta, eta);
     let uses_time = model_uses_time_anywhere(model);
     if let Some(ref ode) = model.ode_spec {
@@ -2200,7 +2216,7 @@ pub fn compute_predictions_with_states(
         // The sink's tail ([scaling], LTBS, FREM override), as in
         // compute_predictions_with_tv_into_with_schedule (#2259).
         to_observation_scale(model, subject, theta, eta, &mut ipred);
-        (ipred, states)
+        (ipred, if closed_form { vec![] } else { states })
     } else {
         // Analytical path: ipred via compute_predictions_with_tv (handles SS, resets,
         // TV covariates); states via predict_all_states (superposition only — valid

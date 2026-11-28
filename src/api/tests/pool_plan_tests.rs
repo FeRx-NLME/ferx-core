@@ -10,6 +10,8 @@
 //! no existing test looks. Both halves are pinned below: the declared size, and
 //! a runtime probe that actually touches more stack than the default provides.
 
+use crate::api::fit;
+
 use super::*;
 
 #[test]

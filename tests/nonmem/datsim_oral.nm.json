@@ -1,0 +1,91 @@
+{
+ "nonmem_version": "7.6.0",
+ "data_file": "\"data.ferx.csv\"",
+ "data_records": 406,
+ "observations": 306,
+ "individuals": 100,
+ "nmtran_warnings": [2, 23],
+ "markers": [
+  "MINIMIZATION TERMINATED",
+  "ROUNDING ERRORS"
+ ],
+ "steps": [
+  {
+   "method": "First Order Conditional Estimation with Interaction",
+   "objv": 70.851,
+   "objv_without_constant": 70.85052802131906,
+   "objv_with_constant": 633.2409103425788,
+   "function_evaluations": 499,
+   "etabar": [
+    [-0.0015584, 0.0072268, -0.0018421]
+   ],
+   "etabar_se": [
+    [0.037992, 0.073512, 0.0057312]
+   ],
+   "p_val": [
+    [0.96728, 0.92169, 0.7479]
+   ],
+   "etashrinksd": [
+    [4.6405, 1.3687, 29.545]
+   ],
+   "etashrinkvr": [
+    [9.0656, 2.7186, 50.36]
+   ],
+   "ebvshrinksd": [
+    [4.6386, 0.86864, 30.274]
+   ],
+   "ebvshrinkvr": [
+    [9.0621, 1.7297, 51.383]
+   ],
+   "relativeinf": [
+    [1e-10, 1e-10, 0.013668]
+   ],
+   "epsshrinksd": [
+    [22.273]
+   ],
+   "epsshrinkvr": [
+    [39.584]
+   ],
+   "final": {
+    "theta": [3.32, -1.35, -1.2],
+    "omega": {
+     "ETA1": [0.159],
+     "ETA2": [0.273, 0.556],
+     "ETA3": [0.0263, 0.0319, 0.00662]
+    },
+    "sigma": {
+     "EPS1": [0.0685]
+    }
+   },
+   "markers": [
+    "MINIMIZATION TERMINATED",
+    "ROUNDING ERRORS"
+   ]
+  }
+ ],
+ "control_stream_as_run": [
+  "$PROB Datasim",
+  "$INPUT NSIM ID TIME RDV DV MDV AMT EVID",
+  "$DATA \"data.ferx.csv\" IGNORE=@",
+  "$SUBROUTINES ADVAN2 TRANS2",
+  "$PK",
+  "\tV  = EXP(THETA(1) + ETA(1));",
+  "\tKE = EXP(THETA(2) + ETA(2));",
+  "\tKA = KE + EXP(THETA(3) + ETA(3));",
+  "\tCL = KE * V;",
+  "$ERROR",
+  "\tCP = A(2)/V;",
+  "\tY  = log(CP) + ERR(1);",
+  "$THETA",
+  "\t( 1.61, 3.40, 4.1) ;\t/* V */",
+  "\t( -4.6, -1.2, 0.7) ;\t/* KE */",
+  "\t( -4.6, -0.7, 0.7) ;\t/* KA */",
+  "$OMEGA BLOCK(3)",
+  "\t1",
+  "\t0.001 1",
+  "\t0.001 0.001 1",
+  "$SIGMA",
+  "\t1",
+  "$ESTM SIG=5 MAX=5000 METHOD=1 INTERACT NOABORT POSTHOC PRINT=1"
+ ]
+}
