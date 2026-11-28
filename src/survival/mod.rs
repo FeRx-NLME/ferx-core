@@ -121,8 +121,8 @@ pub(crate) fn curves_nll_visit_g<T: PkNum>(
 }
 
 /// [`curves_nll_visit_g`] over an ODE-accumulated hazard's curves, which run on absolute time.
-/// Clock-reset needs each gap's own solve from its renewal state, so the parser refuses it
-/// with an ODE hazard and it is the repel sentinel here (#3152).
+/// Clock-reset needs each gap's own solve from its renewal state, so the parser and
+/// `check_rtte_records` refuse it with an ODE hazard and it is the repel sentinel here (#3152).
 pub(crate) fn ode_curves_nll_visit_g<T: PkNum>(
     records: &[ObsRecord], recurrence: TteRecurrence, cumhaz_at: impl Fn(f64) -> T,
     hazard_at: impl Fn(f64) -> T, tol: MonoTol, visit: &mut impl FnMut(RecordTerm<T>),

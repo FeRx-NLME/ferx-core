@@ -4,7 +4,8 @@
 //! the analytic side scores the closed form. Equal objectives at the start (`maxiter = 0`) pin
 //! the value; equal optima pin the gradient, which runs through the same scorer over dual
 //! numbers. Exponential is a constant hazard; Weibull (shape 1.5) varies in time through `TIME`.
-//! `clock = reset` with an ODE hazard is still refused, and `simulate()` refuses the model.
+//! Left truncation is twinned too. `clock = reset` with an ODE hazard is still refused, and
+//! `simulate()` refuses the model.
 //!
 //! Tier 2 (the converged pairs: Tier 3).
 
@@ -12,6 +13,7 @@
 mod pkrtte_ode {
     use ferx_core::api::read_population_for;
     use ferx_core::parser::model_parser::parse_model_string;
+    use ferx_core::types::ObsRecord;
     use ferx_core::{fit, FitOptions, FitResult};
 
     /// The analytic event model, or its `[odes]` transcription when `ode` is set: one inert
@@ -29,11 +31,17 @@ mod pkrtte_ode {
         )
     }
 
-    fn run(src: &str, data: &str, maxiter: usize) -> FitResult {
+    /// `entry`: each subject enters (left truncation) halfway to its first record.
+    fn run(src: &str, data: &str, maxiter: usize, entry: bool) -> FitResult {
         let m = parse_model_string(src).unwrap_or_else(|e| panic!("parses: {e}\n{src}"));
         let path = format!("{}/data/{data}", env!("CARGO_MANIFEST_DIR"));
         let (mut pop, _) = read_population_for(&m, &None, &path, None, None, None, &[]).unwrap();
         pop.subjects.truncate(20);
+        for s in pop.subjects.iter_mut().filter(|_| entry) {
+            if let Some(ObsRecord::Event { time, entry_time, .. }) = s.obs_records.first_mut() {
+                *entry_time = *time / 2.0;
+            }
+        }
         // The Weibull start gap falls 7e-3 → 1.7e-4 → 3.1e-6 → 4.6e-8 at `ode_reltol` 1e-4 → 1e-6
         // → 1e-8 → 1e-10 (200 subjects, Linux x86_64): the ODE twin's integration error, not
         // the scoring. 1e-8 keeps it under the bound at a fifth of 1e-10's cost.
@@ -52,11 +60,11 @@ mod pkrtte_ode {
     const BUDGETS: &[usize] = if cfg!(feature = "slow-tests") { &[0, 200] } else { &[0] };
 
     /// `|ΔOFV| < tol` and `|Δθ| < tol·|θ|` at each budget in `budgets`.
-    fn assert_twins(p: [&str; 4], data: &str, budgets: &[usize], tol: f64) {
+    fn assert_twins(p: [&str; 4], data: &str, budgets: &[usize], tol: f64, entry: bool) {
         let [params, indiv, family, hazard] = p;
         for &maxiter in budgets {
-            let a = run(&model(params, indiv, family, hazard, false), data, maxiter);
-            let o = run(&model(params, indiv, family, hazard, true), data, maxiter);
+            let a = run(&model(params, indiv, family, hazard, false), data, maxiter, entry);
+            let o = run(&model(params, indiv, family, hazard, true), data, maxiter, entry);
             assert!(a.theta.iter().chain(&o.theta).all(|v| v.is_finite()), "{data}: θ finite");
             let dth =
                 a.theta.iter().zip(&o.theta).map(|(x, y)| ((x - y) / x).abs()).fold(0.0, f64::max); // nan-ok: θ asserted finite above; every θ bound is > 0
@@ -83,19 +91,32 @@ mod pkrtte_ode {
             "  family = exponential\n  scale = TVLAMBDA * exp(ETA_LAMBDA)\n",
             "LAMBDA",
         ];
-        assert_twins(p, "rtte_exponential.csv", BUDGETS, BOUND_EXP);
+        assert_twins(p, "rtte_exponential.csv", BUDGETS, BOUND_EXP, false);
     }
+
+    const WEIBULL: [&str; 4] = [
+        "[parameters]\n  theta TVSCALE(5.0, 0.1, 100.0)\n  theta TVSHAPE(1.5, 0.1, 10.0)\n  \
+         omega ETA_SCALE ~ 0.09\n",
+        "  SCALE = TVSCALE * exp(ETA_SCALE)\n  SHAPE = TVSHAPE\n",
+        "  family = weibull\n  scale = TVSCALE * exp(ETA_SCALE)\n  shape = TVSHAPE\n",
+        "(SHAPE / SCALE) * (TIME / SCALE)^(SHAPE - 1)",
+    ];
 
     #[test]
     fn weibull_ode_hazard_matches_its_family() {
-        let p = [
-            "[parameters]\n  theta TVSCALE(5.0, 0.1, 100.0)\n  theta TVSHAPE(1.5, 0.1, 10.0)\n  \
-             omega ETA_SCALE ~ 0.09\n",
-            "  SCALE = TVSCALE * exp(ETA_SCALE)\n  SHAPE = TVSHAPE\n",
-            "  family = weibull\n  scale = TVSCALE * exp(ETA_SCALE)\n  shape = TVSHAPE\n",
-            "(SHAPE / SCALE) * (TIME / SCALE)^(SHAPE - 1)",
-        ];
-        assert_twins(p, "rtte_weibull_reset.csv", BUDGETS, BOUND_WEIBULL);
+        assert_twins(WEIBULL, "rtte_weibull_reset.csv", BUDGETS, BOUND_WEIBULL, false);
+    }
+
+    /// Left truncation (#3152 asks for it): each subject's first gap is `H(t₁) − H(entry)`, read
+    /// off the ODE twin's solve at the entry. The entry moves the objective, so it is live.
+    /// Measured |ΔOFV| 4.20e-7 (Linux x86_64), under the Weibull bound.
+    #[test]
+    fn left_truncation_matches_its_family() {
+        assert_twins(WEIBULL, "rtte_weibull_reset.csv", &[0], BOUND_WEIBULL, true);
+        let [params, indiv, family, hazard] = WEIBULL;
+        let src = model(params, indiv, family, hazard, false);
+        let ofv = |entry| run(&src, "rtte_weibull_reset.csv", 0, entry).ofv;
+        assert!((ofv(true) - ofv(false)).abs() > 1.0, "the entry is live");
     }
 
     // Measured (Linux x86_64, `ci-test`), worst of |ΔOFV| and relative |Δθ|: exponential 1.48e-8

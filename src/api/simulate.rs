@@ -279,7 +279,7 @@ pub(crate) fn validate_tte_simulatable(
         }) {
             return Err(tte_not_simulatable(format!(
                 "CMT={cmt}: simulating repeated events (`type = rtte`) with an ODE-accumulated \
-                 `hazard = ...` is not supported yet; fitting it is (#3152). Use an analytic \
+                 `hazard = ...` is not supported yet (#3224); fitting it is (#3152). Use an analytic \
                  `family` hazard to simulate repeated events."
             )));
         }

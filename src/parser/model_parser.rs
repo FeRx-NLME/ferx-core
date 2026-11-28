@@ -8885,7 +8885,7 @@ fn parse_event_model_block(
     if hazard_present {
         // Clock-reset RTTE with a drug-driven ODE hazard needs a fresh ODE solve from
         // each renewal state over gap time, integrating `h(τ, state_reset(τ))` per gap —
-        // a later slice (#3152). Clock-forward is fully supported: the cumulative hazard
+        // a later slice (#3224). Clock-forward is fully supported: the cumulative hazard
         // is integrated once over the absolute risk window and gap contributions are
         // `H(tₖ) − H(tₖ₋₁)` (#3152).
         if matches!(
@@ -8896,7 +8896,7 @@ fn parse_event_model_block(
                 "[event_model]: CMT={cmt} combines `type = rtte, clock = reset` with an \
                  ODE-accumulated `hazard = ...` (drug-driven joint PK-RTTE, clock-reset). Use \
                  `clock = forward` (Andersen–Gill) for an ODE-driven hazard, or an analytic \
-                 `family` hazard for clock-reset RTTE."
+                 `family` hazard for clock-reset RTTE (#3224)."
             ));
         }
         if family_opt.is_some()

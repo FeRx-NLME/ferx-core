@@ -417,7 +417,7 @@ Records of a non-Gaussian endpoint that its likelihood cannot score, each of whi
 
 | Code | Severity | Meaning |
 |------|----------|---------|
-| `E_RTTE_RECORDS` | error | A repeated-event (`type = rtte`) endpoint's records: interval-censored, a non-finite `TIME`, an entry time after the record's `TIME`, or out of time order; under `clock = reset` also a right-censored row before a later record, or two events at one `TIME`. The message names the subject. Block `event_model`. The reader drops some of these rows on load, so mostly a `Population` built in code reaches it. |
+| `E_RTTE_RECORDS` | error | A repeated-event (`type = rtte`) endpoint's records: interval-censored, a non-finite `TIME`, an entry time after the record's `TIME`, or out of time order; under `clock = reset` also a right-censored row before a later record, or two events at one `TIME`; with an ODE-accumulated `hazard =`, an EVID=3/4 reset inside the risk window, or (a model built in code) `clock = reset`. The message names the subject. Block `event_model`. The reader drops some of these rows on load, so mostly a `Population` built in code reaches it. |
 | `E_BINARY_STATE` | error | A `[binary_model]` record whose DV is not 0 or 1. The reader accepts any non-negative integer on a discrete compartment, since it cannot tell binary from ordinal. Block `binary_model`. |
 | `E_CTMM_RECORDS` | error | A `[markov_model]` (CTMM) record whose DV is not one of the declared `states`, or a subject whose CTMM observation times decrease (the reader sorts doses, not observations). Block `markov_model`. |
 

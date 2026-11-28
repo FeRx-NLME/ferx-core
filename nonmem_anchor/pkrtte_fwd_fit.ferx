@@ -1,0 +1,40 @@
+# Joint PK-RTTE, clock-forward, with a drug-driven ODE-accumulated hazard: the ferx twin of
+# `nonmem_anchor/pkrtte_fwd.ctl` (same fixed THETA, same data). Consumed by
+# `tests/pkrtte_fwd_nonmem_anchor.rs` (#3152). No Gaussian row: the sigma is a placeholder.
+
+[parameters]
+  theta TVCL(2.0, FIX)
+  theta TVV(10.0, FIX)
+  theta TVKA(1.0, FIX)
+  theta TVH0(0.03, FIX)
+  theta TVBETA(0.2, FIX)
+  sigma SIG ~ 0.1 FIX
+
+[individual_parameters]
+  CL   = TVCL
+  V    = TVV
+  KA   = TVKA
+  H0   = TVH0
+  BETA = TVBETA
+
+[structural_model]
+  ode(obs_cmt=central, states=[depot, central])
+
+[odes]
+  d/dt(depot)   = -KA * depot
+  d/dt(central) =  KA * depot - (CL/V) * central
+
+[event_model]
+  cmt    = 3
+  type   = rtte
+  clock  = forward
+  hazard = H0 * exp(BETA * central / V)
+
+[error_model]
+  DV ~ additive(SIG)
+
+[fit_options]
+  method     = focei
+  maxiter    = 0
+  ode_reltol = 1e-9
+  ode_abstol = 1e-11
