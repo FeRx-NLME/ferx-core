@@ -623,9 +623,8 @@ pub struct OdeSolverStats {
     /// half for anyone who needs it.
     ///
     /// Zero under every explicitly-named `ode_method`, so a non-zero value means `auto` was
-    /// asked and escalated. It is a floor, not a total: [`solve_ode_until_threshold`] takes no
-    /// stats, so escalations on the event-time path (TTE / adaptive dosing) are not counted
-    /// here.
+    /// asked and escalated. It is a floor, not a total: [`solve_ode_until_threshold`] counts its
+    /// escalations (#1412) except on a search that returns `Failed`, which tees nothing.
     pub auto_stiff_segments: usize,
     /// Integrations whose stepper was changed **in place** part-way through, because a
     /// mid-segment re-probe disagreed with the verdict the segment started on (#1080 Part C).
@@ -673,8 +672,10 @@ pub struct OdeSolverStats {
     /// outcome visible in the fit's `ode_solver` warning (#1080).
     ///
     /// Like every other `auto` counter it is a floor, not a total: [`solve_ode_until_threshold`]
-    /// takes no stats, so a failure on the event-time path (TTE / adaptive dosing) is not
-    /// counted here and a zero is not by itself proof that every solve in the fit was clean.
+    /// counts its steps (#1412) but not this, and a search that returns `Failed` tees nothing
+    /// (its caller reports it as `W_TTE_SOLVE_FAILED`), so a failure on the event-time path
+    /// (TTE / adaptive dosing) is not counted here and a zero is not by itself proof that every
+    /// solve in the fit was clean.
     pub auto_fallback_failed: usize,
     /// Integration attempts that stopped before reaching the end of their segment and freeze-padded the
     /// remaining output times with the last state (or with `NaN` when the stop was on a state that had
@@ -690,7 +691,8 @@ pub struct OdeSolverStats {
     /// a step at `min_dt`. Do not add this to those counters; the fit's `ode_solver` warning subtracts
     /// the abandoned ones first so its clauses stay disjoint. What is left is dominated by segments
     /// that exhausted [`OdeSolverOptions::max_steps`]. A floor, not a total: [`solve_ode_until_threshold`]
-    /// takes no stats, so event-time segments (TTE / adaptive dosing) are not counted.
+    /// counts its steps (#1412) but not this, so event-time segments (TTE / adaptive dosing) are
+    /// not counted.
     pub unfinished_segments: usize,
     /// Integrations abandoned early because their min-`dt` clamps crossed
     /// [`OdeSolverOptions::stiff_abort_after`] (#708, #1080 Part B).
@@ -754,12 +756,9 @@ pub struct OdeSolverStats {
     /// (through `api::postfit::solver_stats_scope`, the single gate), so this counter reaches a user on
     /// every entry point with a warnings channel. The CHZ site was never "the one silent hole": its sole
     /// production caller (`survival::draw_ode_tte_latent`) turns `SolveFailed` into a per-subject
-    /// `W_TTE_SOLVE_FAILED` warning (#2087). What is still true is narrower and lives in the *step*
-    /// counters: `ode_solve_until_chz_threshold` runs on `solve_ode_until_threshold`, which never tees
-    /// into `STATS_SINK`, so with a scope open its `attempted_steps` read `0` on a solve that crossed the
-    /// threshold normally (#1304 item 3, whose teeing is the remaining item), and the step counters cannot
-    /// serve as the "did anything integrate" discriminator there. This counter is recorded by the guard
-    /// directly and is unaffected.
+    /// `W_TTE_SOLVE_FAILED` warning (#2087). Its `solve_ode_until_threshold` tees its step counters
+    /// since #1412 (#1304 item 3), so a search that integrated reads non-zero steps there too. This
+    /// counter is recorded by the guard directly and is unaffected.
     pub abandoned_non_finite_timeline: usize,
     /// Segments whose integration stopped short **because a state went non-finite** — the
     /// right-hand side diverged — so the output times it did not reach were padded with `NaN`
@@ -776,8 +775,8 @@ pub struct OdeSolverStats {
     /// integrates `x → ∞` — so the fit's `ode_solver` warning reports it apart and drops the
     /// solver advice when every damaged segment is one of these. Non-zero means some
     /// predictions are `NaN` by construction; check the `[odes]` right-hand side and the
-    /// parameter values. Like the other step counters it is a floor:
-    /// [`solve_ode_until_threshold`] takes no stats.
+    /// parameter values. It is a floor:
+    /// [`solve_ode_until_threshold`] counts its steps (#1412) but not this.
     pub diverged_segments: usize,
     /// Segments of a model on the exact linear path ([`OdeMethod::Linear`], #852) that the
     /// matrix-exponential propagator **declined** and that were integrated instead — its
@@ -2817,6 +2816,27 @@ pub(crate) fn solve_ode_until_threshold_labelled(
     params: &[f64], opts: &OdeSolverOptions, monitor: usize, threshold: f64,
     labels: Option<&[String]>,
 ) -> ThresholdCrossing {
+    // The search's step counters, into the open `SolverStatsScope` (#1412). They count the steps
+    // of the integration that brackets the crossing; locating it inside the bracketing step
+    // evaluates the interpolant only and takes no step. The failing segment counts nothing: its
+    // caller reports it in its own words (`W_TTE_SOLVE_FAILED`), and its clamps would add the
+    // solver advice to a right-hand side that diverged, which no `ode_method` repairs.
+    let mut stats = OdeSolverStats::default();
+    let out =
+        threshold_search(rhs, u, t_span, params, opts, monitor, threshold, labels, &mut stats);
+    if !matches!(out, ThresholdCrossing::Failed(_)) {
+        record_to_stats_sink(&stats);
+    }
+    out
+}
+
+/// The body of [`solve_ode_until_threshold_labelled`], counting into `stats`.
+#[allow(clippy::too_many_arguments)]
+fn threshold_search(
+    rhs: &dyn Fn(&[f64], &[f64], f64, &mut [f64]), u: &mut [f64], t_span: (f64, f64),
+    params: &[f64], opts: &OdeSolverOptions, monitor: usize, threshold: f64,
+    labels: Option<&[String]>, stats: &mut OdeSolverStats,
+) -> ThresholdCrossing {
     // The crossing search bisects a step's continuous extension and has no exact counterpart,
     // so a linear model's search is stepped exactly as the default's is.
     let opts = &opts.for_integration();
@@ -2835,6 +2855,7 @@ pub(crate) fn solve_ode_until_threshold_labelled(
             threshold,
             OdeMethod::EXPLICIT_FALLBACK,
             labels,
+            stats,
         )
         .outcome;
     }
@@ -2846,7 +2867,7 @@ pub(crate) fn solve_ode_until_threshold_labelled(
         || (method == OdeMethod::EXPLICIT_FALLBACK && !opts.auto_switch)
     {
         return until_threshold_with(
-            rhs, u, t_span, params, opts, monitor, threshold, method, labels,
+            rhs, u, t_span, params, opts, monitor, threshold, method, labels, stats,
         )
         .outcome;
     }
@@ -2858,8 +2879,11 @@ pub(crate) fn solve_ode_until_threshold_labelled(
     // draw laundered out of a diverged stiff solve would be the worst possible outcome here,
     // so the retry is not optional.
     let u_entry = u.to_vec();
-    let run =
-        until_threshold_with(rhs, u, t_span, params, opts, monitor, threshold, method, labels);
+    // An escalation at the span's start; a later one is counted at its switch.
+    stats.auto_stiff_segments += usize::from(method != OdeMethod::EXPLICIT_FALLBACK);
+    let run = until_threshold_with(
+        rhs, u, t_span, params, opts, monitor, threshold, method, labels, stats,
+    );
 
     // Both halves of the dense driver's guard, in the shape this driver reports outcomes in.
     //
@@ -2879,8 +2903,11 @@ pub(crate) fn solve_ode_until_threshold_labelled(
         return run.outcome;
     }
     // `u` is unspecified after a failure and untrustworthy after a stall, so the re-solve
-    // starts from the entry state rather than from wherever the escalation left it.
+    // starts from the entry state rather than from wherever the escalation left it. The
+    // escalation's clamps describe a trajectory nobody receives, as the dense guard records them.
     u.copy_from_slice(&u_entry);
+    stats.auto_stiff_rejected += 1;
+    stats.discarded_clamped_steps = stats.min_step_clamped_steps;
     until_threshold_with(
         rhs,
         u,
@@ -2891,6 +2918,7 @@ pub(crate) fn solve_ode_until_threshold_labelled(
         threshold,
         OdeMethod::EXPLICIT_FALLBACK,
         labels,
+        stats,
     )
     .outcome
 }
@@ -2941,7 +2969,7 @@ struct ThresholdRun {
 fn until_threshold_with(
     rhs: &dyn Fn(&[f64], &[f64], f64, &mut [f64]), u: &mut [f64], t_span: (f64, f64),
     params: &[f64], opts: &OdeSolverOptions, monitor: usize, threshold: f64, method: OdeMethod,
-    labels: Option<&[String]>,
+    labels: Option<&[String]>, stats: &mut OdeSolverStats,
 ) -> ThresholdRun {
     let (t0, tf) = t_span;
     let ended = |outcome, stiff_min_step_clamped, ran_stiff| ThresholdRun {
@@ -2991,7 +3019,20 @@ fn until_threshold_with(
         let dt_eff = dt.min(tf - t);
         let err_norm = stepper.attempt(rhs, u, params, t, dt_eff, opts);
         let usable = stepper.attempt_usable();
-        if !usable && dt_eff <= opts.min_dt {
+        let accepted = usable && (err_norm <= 1.0 || dt_eff <= opts.min_dt);
+        let clamps_before = stats.min_step_clamped_steps;
+        // An attempt that cannot be formed at `min_dt` is a clamp and a rejection, as the dense
+        // driver counts it; any other clamp is a force-accept whose error test did not pass.
+        let unformable = !usable && dt_eff <= opts.min_dt;
+        if unformable {
+            stats.record_min_step_failure();
+        } else {
+            stats.record(accepted, err_norm, dt_eff, opts.min_dt);
+        }
+        let clamped = stats.min_step_clamped_steps > clamps_before;
+        let stiff = method != OdeMethod::EXPLICIT_FALLBACK;
+        stats.stiff_min_step_clamped_steps += usize::from(clamped && stiff);
+        if unformable {
             return failed(
                 format!(
                     "the step at t={t:.6} could not be formed even at min_dt \
@@ -3001,11 +3042,8 @@ fn until_threshold_with(
             );
         }
 
-        let accepted = usable && (err_norm <= 1.0 || dt_eff <= opts.min_dt);
-        // Mirrors `OdeSolverStats::record`: a force-accept at `min_dt` whose error test did not
-        // pass (`!(err_norm <= 1.0)`, which also catches a non-finite norm) is a clamp.
-        if accepted && !(err_norm <= 1.0) && dt_eff <= opts.min_dt {
-            stiff_min_step_clamped |= method != OdeMethod::EXPLICIT_FALLBACK;
+        if clamped {
+            stiff_min_step_clamped |= stiff;
             clamps += 1;
         }
         if accepted {
@@ -3080,6 +3118,9 @@ fn until_threshold_with(
                     stepper.set_dense_required(true);
                     err_exp = stepper.err_exp();
                     ran_stiff |= method != OdeMethod::EXPLICIT_FALLBACK;
+                    // As the dense driver counts a switch: an escalation decided later.
+                    stats.auto_switched_segments += 1;
+                    stats.auto_stiff_segments += 1;
                     // Fresh abort budget for the new stepper — see `integrate_dense_g`.
                     clamps = 0;
                 }
@@ -5893,5 +5934,31 @@ mod tests {
         assert!(res[0].u[0].value.is_nan());
         assert!(res[0].u[0].grad[0].is_nan());
         assert!(res[0].u[0].hess[0][0].is_nan());
+    }
+
+    /// #1412: the threshold search's steps reach an open `SolverStatsScope`, as every other
+    /// driver's do. They read `0` on a search that integrated before, because the driver never
+    /// tee'd. A search that ends on a crossing tees as one that reaches the end does. Mutation:
+    /// drop `record_to_stats_sink` from the driver's tee -> `0` on both.
+    #[test]
+    fn the_threshold_search_counts_its_steps_in_the_scope() {
+        let rhs = |u: &[f64], _: &[f64], _: f64, du: &mut [f64]| du[0] = 1.0 + u[0];
+        let opts = OdeSolverOptions { method: OdeMethod::Rk45, ..Default::default() };
+        for (threshold, crossed) in [(5.0, true), (1e9, false)] {
+            let scope = SolverStatsScope::enter();
+            let mut u = vec![0.0];
+            let got = solve_ode_until_threshold(&rhs, &mut u, (0.0, 4.0), &[], &opts, 0, threshold);
+            let s = scope.collected();
+            assert_eq!(matches!(got, ThresholdCrossing::Crossed(_)), crossed, "{got:?}");
+            assert!(s.accepted_steps > 0, "{threshold}: {s:?}");
+        }
+        // A `Failed` search tees nothing: its caller reports it, and its clamps would add solver
+        // advice to a diverged right-hand side. Mutation: tee on `Failed` too -> steps here.
+        let blowup = |u: &[f64], _: &[f64], _: f64, du: &mut [f64]| du[0] = u[0] * u[0];
+        let scope = SolverStatsScope::enter();
+        let mut u = vec![1.0];
+        let got = solve_ode_until_threshold(&blowup, &mut u, (0.0, 4.0), &[], &opts, 0, f64::MAX);
+        assert!(matches!(got, ThresholdCrossing::Failed(_)), "{got:?}");
+        assert_eq!(scope.collected().attempted_steps, 0);
     }
 }

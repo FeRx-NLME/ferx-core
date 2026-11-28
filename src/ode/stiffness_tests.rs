@@ -998,7 +998,12 @@ fn the_event_time_driver_never_demotes_a_stiff_span() {
     };
     let tight =
         |method| OdeSolverOptions { method, reltol: 1e-8, abstol: 1e-10, ..Default::default() };
+    let scope = crate::ode::solver::SolverStatsScope::enter();
     let auto = crossing(&tight(OdeMethod::Auto));
+    // The span starts stiff: one escalation, at its start, none at a switch (#1412).
+    let s = scope.collected();
+    assert_eq!((s.auto_stiff_segments, s.auto_switched_segments), (1, 0), "{s:?}");
+    drop(scope);
     let stiff = crossing(&tight(stiff_method_for(&tight(OdeMethod::Auto))));
     let explicit = crossing(&tight(OdeMethod::EXPLICIT_FALLBACK));
     assert!(
@@ -1097,6 +1102,30 @@ fn a_stalled_mid_segment_switch_is_discarded_and_re_solved_explicitly() {
         "the discarded attempt's clamps belong to it, not to the returned trajectory: {stats:?}"
     );
     assert!(stats.min_step_clamped_steps >= stats.discarded_clamped_steps, "{stats:?}");
+}
+
+/// The event-time driver's twin of the test above, read through the stats scope (#1412): the
+/// search switches mid-span, the stiff attempt stalls and is re-solved explicitly, and the scope
+/// reads that as the dense guard records it. At `min_dt = 1e-5` the explicit prefix clamps too
+/// (Linux x86_64: 6 clamps, 2 stiff, 3 discarded), so the discarded count is the whole attempt's,
+/// not only its stiff part. Mutations, each run: drop the switch's two counts,
+/// `auto_stiff_rejected += 1`, or the stiff clamp split, or set `discarded_clamped_steps` to the
+/// stiff clamps -> an assertion fails.
+#[test]
+fn the_event_time_search_records_a_discarded_mid_span_switch_in_the_scope() {
+    use crate::ode::solver::{solve_ode_until_threshold, SolverStatsScope, ThresholdCrossing};
+    let rhs = |u: &[f64], _p: &[f64], _t: f64, du: &mut [f64]| du[0] = u[0] * u[0];
+    let scope = SolverStatsScope::enter();
+    let mut u = [5.0];
+    let opts = OdeSolverOptions { min_dt: 1e-5, ..loose() };
+    let got = solve_ode_until_threshold(&rhs, &mut u, (0.0, 0.25), &[], &opts, 0, 1e12);
+    let s = scope.collected();
+    assert!(matches!(got, ThresholdCrossing::Crossed(_)), "{got:?}");
+    assert_eq!((s.auto_switched_segments, s.auto_stiff_segments), (1, 1), "{s:?}");
+    assert_eq!(s.auto_stiff_rejected, 1, "{s:?}");
+    assert!(s.discarded_clamped_steps > s.stiff_min_step_clamped_steps, "{s:?}");
+    assert!(s.stiff_min_step_clamped_steps > 0, "{s:?}");
+    assert!(s.min_step_clamped_steps >= s.discarded_clamped_steps, "{s:?}");
 }
 
 /// A segment that never leaves the explicit stepper is **not** guarded, even when it clamps:
