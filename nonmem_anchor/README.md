@@ -1402,7 +1402,10 @@ IV (or oral) 100 at 0/24/48 (`reset_f`, `reset_seed`: 0/24 per period), so every
 lands on residual drug. Worst `|ΔOFV|` over the twelve cells 1.7e-8 on Linux aarch64 (2.1e-8
 on macOS arm64), worst relative `IPRED` gap against the `.tab` 2.2e-8 on Linux (7.4e-8 on
 macOS). `reset_seed` fixes the step size (`THETA(4)
-FIX`): `BASE` is read only at a period start, so no record identifies it. Run folder:
+FIX`): `BASE` is read only at a period start, so no record identifies it. Its closed-form
+twin (`param_time_reset_seed_analytic.ferx`, `[initial_conditions]`) came with #3140, which
+lays the baseline down again at the reset as ADVAN1 does: `|ΔOFV|` 8.9e-9 on Linux x86_64,
+against 801.8 before (the baseline dropped at the reset). Run folder:
 `~/NONMEMruns/issue1969-param-time/` (`RUN.md`, generators `gen.py` / `gen2.py`).
 
 ## Profiled level blocks (#1065)

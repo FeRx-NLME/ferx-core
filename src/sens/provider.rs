@@ -254,7 +254,7 @@ impl<T: PkNum> SeededPkDuals<T> {
 /// the compartments, so the superposition excludes them — mirroring the event-driven
 /// walker's `event_reset_floor`.
 #[inline]
-fn reset_floor_at(subject: &Subject, t_obs: f64) -> f64 {
+pub(crate) fn reset_floor_at(subject: &Subject, t_obs: f64) -> f64 {
     subject.reset_times.iter().copied().filter(|&r| r <= t_obs).fold(f64::NEG_INFINITY, f64::max)
 }
 
@@ -1249,16 +1249,15 @@ pub struct ObsGrad {
 }
 
 /// The closed-form `init(...)` impulses over `T` (`pk::add_analytical_init_with`): each
-/// `A₀ = amount(θ, η, p)` from its compiled program, decayed by the closed-form kernel at
-/// every observation before the first reset, added to `preds` — before any scaling, as
-/// production adds them. `amount` is the PK-slot vector the amounts read; `decay[j]` the
+/// `A₀ = amount(θ, η, p)` from its compiled program, decayed by the closed-form kernel from
+/// the latest of `t = 0` and the resets before each observation, added to `preds` — before
+/// any scaling, as production adds them. `amount` is the PK-slot vector the amounts read; `decay[j]` the
 /// one observation `j` decays with (`None`: `amount`'s, the non-IOV convention). `None`
 /// when an init has no compiled amount program.
 pub(crate) fn add_closed_form_init_g<T: crate::sens::num::vm::VmNum>(
     model: &CompiledModel, subject: &Subject, theta: &[T], eta: &[T], amount: &[T],
     decay: Option<&[Vec<T>]>, preds: &mut [T],
 ) -> Option<()> {
-    let first_reset = subject.reset_times.iter().copied().fold(f64::INFINITY, f64::min);
     let slot = |p: &[T], s: usize| p.get(s).copied().unwrap_or(T::from_f64(0.0));
     for init in &model.analytical_init {
         let prog = init.amount_deriv.as_ref()?;
@@ -1270,7 +1269,8 @@ pub(crate) fn add_closed_form_init_g<T: crate::sens::num::vm::VmNum>(
             continue;
         }
         for (j, &t) in subject.obs_times.iter().enumerate() {
-            if t < 0.0 || t >= first_reset {
+            let origin = reset_floor_at(subject, t).max(0.0);
+            if t < origin {
                 continue;
             }
             let p: &[T] = decay.and_then(|d| d.get(j)).map_or(amount, |v| v.as_slice());
@@ -1278,7 +1278,7 @@ pub(crate) fn add_closed_form_init_g<T: crate::sens::num::vm::VmNum>(
                 model.pk_model,
                 init.cmt,
                 a0,
-                T::from_f64(t),
+                T::from_f64(t - origin),
                 slot(p, PK_IDX_CL),
                 slot(p, PK_IDX_V),
                 slot(p, PK_IDX_Q),

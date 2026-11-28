@@ -115,10 +115,9 @@ above — numerically equivalent, and still allocation-free.
   guard as a Form C ODE readout, issue #107); reference the occasion-dependent
   structural parameter (e.g. `CL`) instead. The baseline's *decay* over time does
   use each observation's occasion-specific PK parameters on the IOV path.
-- **System resets: `[odes]` re-deposits the baseline, `[initial_conditions]` does not.**
+- **System resets re-deposit the baseline.**
   A reset record (NONMEM `EVID = 3/4`) discards every compartment amount, including the
-  residual baseline. What happens next differs by engine, and only one of the two matches
-  NONMEM today:
+  residual baseline, and then lays the baseline down again, as NONMEM re-applies `A_0`:
   - On an **`[odes]`** model the reset re-applies `init(state) = <expr>`, evaluated at the
     **reset row's own data items** — `$PK` runs at that row, so a covariate-driven baseline
     restarts on that row's values, not the preceding record's and not the following one's
@@ -129,10 +128,13 @@ above — numerically equivalent, and still allocation-free.
     `nonmem_anchor/reset_init_snapshot_{A,B,C,D,E,F,G,H,J}.ctl` — including a reset that is the
     subject's first event (H), a reset with a separate dose row at the same time (G), and the
     occasion question in isolation (J).
-  - On an **analytical** model with `[initial_conditions]` nothing re-deposits the
-    baseline, so observations at or after the first reset carry no baseline contribution.
-    NONMEM re-applies `A_0` there too, so this is a known divergence (#1135) — use an
-    `[odes]` model if you need a baseline that survives a reset.
+  - On an **analytical** model with `[initial_conditions]` the same amount is laid down
+    again at the reset and decays from there (#3140), so an `EVID = 4` first dose predicts
+    what its `EVID = 1` spelling does. The amount is the subject's one `t = 0` evaluation (see
+    above), not a re-evaluation at the reset row, so a baseline that reads a covariate, or
+    an individual parameter that reads `TIME`, and steps at the reset restarts at its first
+    value; use an `[odes]` model for that case.
+    Anchored against NONMEM 7.6.0 (ADVAN1) in `nonmem_anchor/param_time_reset_seed.ctl`.
 - **Steady-state doses warn.** A steady-state dose (`SS = 1`) already
   pre-equilibrates an infinite dose history, so superposing an init baseline
   double-counts the starting amount. The combination raises

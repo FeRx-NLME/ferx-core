@@ -4912,6 +4912,21 @@ fn closed_form_init_impulse_static_and_event_walk() {
     assert!(worst < 1.7e-6, "event walk: {worst:.2e}");
 }
 
+/// #3140: a reset re-seeds the closed-form `init()` impulse in the value (`pk`) and in the
+/// adjoint (`provider`) alike. A dose before the reset, observations on both sides of it: a
+/// re-seed in only one of the two paths reddens this (measured 83.8 with only `provider`'s, 1.01
+/// with only `pk`'s).
+#[test]
+fn closed_form_init_reseeded_at_a_reset_matches_reconverged_fd() {
+    let model = parse_model_string(CF_INIT).unwrap();
+    let dose = vec![DoseEvent::new(2.0, 100.0, 1, 0.0, false, 0.0)];
+    let mut s = subject(&model, dose, &TIMES, &[0.1, -0.05]);
+    s.reset_times = vec![5.0];
+    let worst = fd_oracle(&model, &s, true);
+    // Measured 4.3e-10 on Linux x86_64; ~10× headroom.
+    assert!(worst < 5e-9, "{worst:.2e}");
+}
+
 /// #527, restored on the adjoint (#2093 review round 2, finding 3): an `init()` amount that
 /// evaluates to exactly 0 still carries a gradient. At `TVC0 = 0` (bounds admit it, and the
 /// oracle's `moved_params` keeps it at 0) `A₀ = TVC0·V = 0` but `∂A₀/∂TVC0 = V`, so the
