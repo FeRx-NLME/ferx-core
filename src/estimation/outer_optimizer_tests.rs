@@ -14986,6 +14986,48 @@ fn a_restart_is_probed_only_when_displacement_alone_rejects_it() {
     }
 }
 
+/// #2903: the restart gate's basin-shift input is wired to the leg's own cold re-solve. A
+/// BOBYQA restart leg started 0.4 % off `two_cpt_iv`'s optimum (θ only), with the optimum as
+/// the user's start, descends, plateaus and ends inside the escape step (macOS arm64: 89
+/// feasible evaluations, flat tail 55), so only displacement rejects it and it is probed. The
+/// same leg with a basin gap (`FORCED_BASIN_GAP`) is restarted instead, so it is not.
+/// Replacing `basin_gap.is_some()` with `false` at the gate fails it.
+#[test]
+fn an_unmoved_restart_with_a_basin_gap_is_not_probed() {
+    let (model, pop) = two_cpt_iv_fixture();
+    let opts = options_2506(crate::types::Optimizer::Bobyqa);
+    let mut optimum = model.default_params.clone();
+    optimum.theta = vec![4.414381, 15.532451, 3.137725, 29.347620];
+    optimum.omega = OmegaMatrix::from_diagonal(
+        &[0.0758052, 0.1038978, 0.1011922, 0.1555683],
+        model.default_params.omega.eta_names.clone(),
+    );
+    optimum.sigma.values = vec![0.01013468];
+    let mut start = optimum.clone();
+    start.theta = optimum.theta.iter().map(|t| 1.004 * t).collect();
+    for gap in [None, Some(1.0)] {
+        FORCED_BASIN_GAP.with(|g| g.set(gap));
+        let calls = std::cell::Cell::new(0);
+        let probe = |_: &ModelParameters, _: f64, _: usize| calls.set(calls.get() + 1);
+        let (_, outcome) = optimize_nlopt_attempt_probed(
+            &model,
+            &pop,
+            &start,
+            &opts,
+            false,
+            &OuterFdDeclineLog::new(pop.subjects.len()),
+            Some(RestartLeg { escape_from: &optimum, spent_evals: 0, start_eval: None }),
+            None,
+            &[],
+            false,
+            Some((&probe, ProbeWhen::DisplacementAloneRejects)),
+        );
+        FORCED_BASIN_GAP.with(|g| g.set(None));
+        assert!(!outcome.left_init, "{gap:?}: precondition, the restart did not move");
+        assert_eq!(calls.get(), usize::from(gap.is_none()), "{gap:?}: probe calls");
+    }
+}
+
 /// #2707: what a restart leg reports once its probe has answered. A verified restart reports
 /// the probe's verdict, warnings and restart cause through `verified_start_result`, at the
 /// lower of the two points; any other verdict reports the restart as its own rule left it —
