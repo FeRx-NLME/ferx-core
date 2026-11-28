@@ -2086,4 +2086,14 @@ fn a_fit_estimate_on_a_log_packed_bound_is_not_a_start_outside_it_2896() {
         let d = check_packed_start_in_box(&s.default_params, &FitOptions::default());
         assert!(d.is_empty(), "{d:#?}");
     }
+    // The mirror on a lower bound (#3053 review r2). No such bound is shared by the two libms
+    // measured, so one each: macOS arm64, then glibc 2.41 (x86_64 and aarch64 agree).
+    for b in [1.997291064244341_f64, 1.9965916000000001] {
+        let mut s = model_with_parameters(&format!("  theta TVCL(5.0, {b:?}, 10.0)\n{rest}"));
+        s.default_params.theta[0] = rt(b);
+        if rt(b) < b && rt(b).ln() != b.ln() {
+            let d = check_packed_start_in_box(&s.default_params, &FitOptions::default());
+            assert!(d.is_empty(), "lower {b:?}: {d:#?}");
+        }
+    }
 }
