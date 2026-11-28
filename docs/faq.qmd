@@ -450,8 +450,8 @@ No outer optimizer is built. What you get back:
 The reported OFV follows ferx's conventions (no `N·log 2π`, natural scale), so
 compare it with NONMEM's `OBJECTIVE FUNCTION VALUE WITHOUT CONSTANT`, or see
 [OFV conventions across tools](model-file/error-model.qmd#ofv-conventions).
-`maxiter` counts objective evaluations rather than outer iterations for some
-optimizers ([#1430](https://github.com/FeRx-NLME/ferx-core/issues/1430)), but `0`
+`maxiter` counts objective evaluations rather than iterations on the NLopt
+optimizers ([what it counts](model-file/fit-options.qmd#maxiter-budget)), but `0`
 means evaluation-only for all of them.
 
 ## How do I exclude records or subjects, like NONMEM's `$DATA IGNORE=`?

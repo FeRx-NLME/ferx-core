@@ -9229,7 +9229,7 @@ pub struct FitResult {
     /// LOQ censoring handling method: "drop" (treat CENS rows as ordinary) or
     /// "m3" (M3 likelihood for censored observations).
     pub bloq_method: String,
-    /// Maximum number of outer optimizer iterations allowed.
+    /// The [`FitOptions::outer_maxiter`] the fit ran with.
     pub outer_maxiter: usize,
     /// Gradient-norm convergence tolerance for the outer optimizer.
     pub outer_gtol: f64,
@@ -9637,6 +9637,11 @@ pub struct FitOptions {
     /// produces the reported fit (covariance, diagnostics, OFV). Leave empty
     /// to run a single stage using `method`.
     pub methods: Vec<EstimationMethod>,
+    /// The outer optimizer's budget (`maxiter`). On the NLopt optimizers it caps objective
+    /// evaluations: `outer_maxiter × (n + 1)`, plus `40 × (n + 1)` for BOBYQA, where `n` is the
+    /// packed parameter count (FIXed ones and every Ω-block entry included; a fit with a
+    /// `profile`d block counts only its free set). On `trust_region`, Gauss–Newton and the
+    /// built-in `Optimizer::Bfgs` / `Lbfgs` it caps iterations (#1430). `0` is evaluation-only.
     pub outer_maxiter: usize,
     pub outer_gtol: f64,
     /// Relative **step** tolerance for the derivative-free outer optimizer
