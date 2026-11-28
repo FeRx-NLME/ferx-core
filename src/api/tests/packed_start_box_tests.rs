@@ -336,7 +336,7 @@ fn the_theta_remedy_never_advertises_a_bound_ferx_cannot_represent() {
 /// premise.
 ///
 /// Both arms are shapes that live in this repo today: `theta TVF(1.0, 0.01,
-/// 1.0)` (`crates/ferx-tools/src/iivsearch/mod_tests.rs`) and `theta TVLAG(0.0,
+/// 1.0)` (`crates/ferx-search/src/iivsearch/mod_tests.rs`) and `theta TVLAG(0.0,
 /// 0.0, 12.0)` (`tests/per_route_lag.rs`). An inclusive rule would reject both
 /// to catch nothing.
 ///

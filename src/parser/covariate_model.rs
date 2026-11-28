@@ -635,7 +635,7 @@ fn parse_theta_clause(
     Ok(out)
 }
 
-// ── θ construction (PsN defaults) ──────────────────────────────────────────
+// ── θ construction (defaults) ──────────────────────────────────────────
 
 /// Build the θ a relation declares.
 ///
@@ -720,8 +720,8 @@ fn build_thetas(
             let base = format!("THETA_{}_{}", rel.parameter, rel.covariate);
             // The two shapes differ by `θ_cat2 = 1 + θ_cat`, so `categorical2`
             // takes the *image* of `categorical`'s defaults under exactly that
-            // map: bounds (−1, 5) → (0, 6) — which is what Pharmpy's `cat2`
-            // uses verbatim — and init −0.001 → 0.999, so the two forms start
+            // map: bounds (−1, 5) → (0, 6) — which are also Pharmpy's `cat2`
+            // bounds — and init −0.001 → 0.999, so the two forms start
             // at the identical model. (Pharmpy's own `cat2` init is 1.01; ferx
             // already differs on the `cat` init's sign, following PsN.)
             let (init, lower, upper) = match rel.form {
@@ -762,11 +762,11 @@ fn build_thetas(
     Ok(out)
 }
 
-/// PsN's default init/bounds for the linear family.
+/// Default init/bounds for the linear family.
 ///
 /// The bounds are not cosmetic: `θ ∈ [1/(med−max), 1/(med−min)]` is exactly
-/// what keeps `1 + θ·(COV − med)` positive over the observed covariate range,
-/// which is why they are adopted verbatim rather than re-invented. A constant
+/// what keeps `1 + θ·(COV − med)` non-negative over the observed covariate range,
+/// and it is the range PsN's `scm` uses. A constant
 /// covariate makes both bounds infinite, so it is rejected here instead of
 /// producing a θ the optimiser cannot move.
 fn linear_family_thetas(
@@ -782,9 +782,9 @@ fn linear_family_thetas(
     if !(below > 0.0 && above < 0.0) {
         return Err(format!(
             "[covariate_model]: `{} ~ {} {}` needs its centre ({center}) to lie strictly inside \
-             the observed range of `{}`, which spans [{}, {}] in the data — the PsN default \
+             the observed range of `{}`, which spans [{}, {}] in the data — the default \
              bounds 1/(centre − min) and 1/(centre − max) are only ordered (and only keep the \
-             covariate factor positive) there. State the θ explicitly with \
+             covariate factor non-negative) there. State the θ explicitly with \
              `=> NAME(init, lower, upper)`, or drop the relation.",
             rel.parameter,
             rel.covariate,
@@ -944,8 +944,8 @@ fn theta_declaration(theta: &CovariateTheta) -> String {
 /// `1`, so a covariate at its centre contributes `0` and so does a θ at the
 /// *form's* null — `0` everywhere except `categorical2`, whose θ is the factor
 /// itself and whose null is `1` (#1312), hence its `θ_k - 1`. This is
-/// where ferx parts company with Pharmpy, which reuses the multiplicative
-/// template verbatim under `+` — see [`CovariateOp`].
+/// where ferx parts company with Pharmpy, which keeps the multiplicative
+/// template's leading `1` under `+` — see [`CovariateOp`].
 fn relation_effect(rel: &CovariateRelation) -> Option<String> {
     let cov = &rel.covariate;
     let add = rel.op == CovariateOp::Add;

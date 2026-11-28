@@ -1,0 +1,88 @@
+---
+title: "License"
+---
+
+ferx is not under one license. Most of it is MIT; the model-search crate is
+LGPL-3.0-or-later; and the `ferx` binary links both, plus third-party code.
+
+## Which part is under which license
+
+| Part | License | Where the text is |
+|------|---------|-------------------|
+| `ferx-core` (the engine) | MIT | `LICENSE` |
+| `ferx-tools` (bootstrap, GAM screening) | MIT | `crates/ferx-tools/LICENSE` |
+| `ferx-cli` source | MIT | `crates/ferx-cli/LICENSE` |
+| `ferx-search` (modelsearch, covsearch, iivsearch, iovsearch, ruvsearch, allometry, amd, globalsearch) | LGPL-3.0-or-later | `crates/ferx-search/COPYING.LESSER`, `COPYING`, `NOTICE` |
+| The `ferx` binary | MIT and LGPL parts, plus third-party notices | `ferx --licenses` |
+| `data/mbma_naproxen.csv` (test data only) | CC BY-NC 4.0 | `data/mbma_naproxen.LICENSE` |
+
+The root `LICENSE` file states the same split. Everything under
+`crates/ferx-search` is LGPL, including its tests and test fixtures. The
+scripts under `tools/pharmpy-*`, which run Pharmpy to produce those fixtures,
+are MIT: they call Pharmpy as a program and contain none of its code.
+
+### Why ferx-search is LGPL
+
+The search tools follow the behaviour of
+[Pharmpy](https://github.com/pharmpy/pharmpy) (LGPL-3.0-or-later), and parts of
+them were written with its source as a reference. An audit found no copied
+Pharmpy code, so the crate is ferx's own work, licensed to match. The crate's
+`NOTICE` records this. The LGPL version 3 is a set of additional permissions on
+top of the GNU GPL version 3, so the crate ships both texts.
+
+`ferx-core` and `ferx-tools` never depend on `ferx-search`, so their source
+stays MIT. You can use them, and embed them in your own software, under MIT
+alone.
+
+### Earlier releases stay MIT
+
+The change is not retroactive. The model-search code was MIT-licensed while it
+lived in `ferx-tools`, and every release of it up to and including
+`ferx-tools` 0.4.0 remains MIT. `crates/ferx-search/LICENSE-MIT` reproduces that
+license. The LGPL applies from 0.5.0, the first release of `ferx-search`.
+
+Those earlier `ferx-tools` releases are not yanked from crates.io. Yanking would
+not withdraw the MIT grant on code already published, and it would break builds
+pinned to them.
+
+## The ferx binary
+
+`ferx` is built from all four crates. Its own source (`crates/ferx-cli`) is
+MIT, but it statically links `ferx-search`, so a copy of the binary carries the
+LGPL terms for that part. It also links the NLopt C library, whose Luksan
+routines (including L-BFGS) are LGPL-2.1-or-later; the `nlopt` crate declares
+only MIT, so crate metadata alone would miss this.
+
+`ferx --licenses` prints everything a binary has to carry: the MIT license, the
+LGPL-3.0 and GPL-3.0 texts, the `ferx-search` notice, how to rebuild the
+binary, and the notices of every third-party crate it links. The third-party
+part is generated from `Cargo.lock` by `tools/third-party-notices.py` into
+`crates/ferx-cli/THIRD-PARTY-NOTICES.txt`; the `Licenses` CI job fails when it
+is stale.
+
+The R package (ferx-r) links `ferx-search` the same way and documents its own
+notices.
+
+## Rebuilding ferx with a modified ferx-search
+
+The LGPL lets you replace the LGPL part of a binary with your own modified
+version. Because Rust links statically, you do that by rebuilding from source.
+The complete source of every released version is public:
+
+- the git tag `vX.Y.Z` of
+  [FeRx-NLME/ferx-core](https://github.com/FeRx-NLME/ferx-core), where `X.Y.Z`
+  is the version `ferx --licenses` prints, and
+- each crate on crates.io at that version.
+
+To rebuild:
+
+```bash
+git clone https://github.com/FeRx-NLME/ferx-core
+cd ferx-core
+git checkout vX.Y.Z
+# edit crates/ferx-search/...
+cargo build --release --locked -p ferx-cli
+```
+
+The new binary is `target/release/ferx`. `--locked` keeps every other
+dependency at the version the release used.

@@ -67,16 +67,20 @@ fn km_groups_ties_into_one_row() {
     assert_eq!(c.n_censor, [1, 0, 0, 1, 0, 1, 1]);
 }
 
-/// T3. Past the last time a curve is undefined unless it has reached zero. Always
-/// carrying the last value forward breaks the first assertion; always returning
-/// `None` breaks the second.
+/// T3. Past the last time a curve is undefined, also when it has reached zero
+/// (#2930), and the last time itself is defined. Returning `Some(0.0)` past the end
+/// of a curve that reached zero (the rule before #2930) breaks the `hit_zero.at(3.0)`
+/// assertion; carrying the last value forward breaks `censored_last.at(4.0)`; `>=`
+/// for `>` breaks both last-time assertions.
 #[test]
-fn km_at_past_last_time_is_none_unless_curve_reached_zero() {
+fn km_at_past_last_time_is_none() {
     let censored_last = kaplan_meier(&[1.0, 2.0, 3.0], &[true, true, false]).unwrap();
     assert_eq!(censored_last.at(4.0), None);
     assert!((censored_last.at(3.0).unwrap() - 1.0 / 3.0).abs() < 1e-15);
     let hit_zero = kaplan_meier(&[1.0, 2.0], &[true, true]).unwrap();
-    assert_eq!(hit_zero.at(3.0), Some(0.0));
+    assert_eq!(hit_zero.surv.last(), Some(&0.0), "fixture must reach zero");
+    assert_eq!(hit_zero.at(2.0), Some(0.0), "the last time is defined");
+    assert_eq!(hit_zero.at(3.0), None, "past the last time, even at zero");
     // Before the first time, and between steps.
     assert_eq!(hit_zero.at(0.5), Some(1.0));
     assert_eq!(hit_zero.at(1.5), Some(0.5));
@@ -116,6 +120,27 @@ fn band_uses_only_curves_defined_at_the_grid_time() {
     assert_eq!(band.hi[1], Some(quantile_sorted(&v, 0.95)));
 }
 
+/// A replicate whose curve reached 0 before the grid time is past its last time
+/// there, so it is left out like any other (#2930): 22 curves are followed to 10,
+/// 3 reach 0 at 2. Counting the 3 as 0 (the rule before #2930) gives `n_used` 25 and
+/// pulls `lo` to 0, a point mass the observed curve can then never fall below.
+#[test]
+fn band_leaves_out_a_replicate_that_reached_zero_before_the_grid_time() {
+    let mut curves: Vec<KmCurve> = (0..22).map(|i| flat((i + 1) as f64 / 30.0, 10.0)).collect();
+    let zero = kaplan_meier(&[1.0, 2.0], &[true, true]).unwrap();
+    assert_eq!(zero.surv.last(), Some(&0.0), "fixture must reach zero");
+    curves.extend((0..3).map(|_| zero.clone()));
+    let band = vpc_band(&curves, &[1.0, 5.0], [0.05, 0.5, 0.95]).unwrap();
+    assert_eq!(band.n_used, [25, 22], "the 3 zero curves count at 1, not at 5");
+    let mut v: Vec<f64> = (0..22).map(|i| (i + 1) as f64 / 30.0).collect();
+    v.sort_by(f64::total_cmp);
+    let lo = band.lo[1].expect("22 curves resolve the band");
+    assert_eq!(lo, quantile_sorted(&v, 0.05));
+    assert!(lo > 0.0, "lo = {lo}: the zero curves must not reach the quantile");
+    assert_eq!(band.med[1], Some(quantile_sorted(&v, 0.5)));
+    assert_eq!(band.hi[1], Some(quantile_sorted(&v, 0.95)));
+}
+
 /// T5. A grid time reached by fewer than 19 curves (the 5 %/95 % floor) has no band
 /// point; where there is one it is finite. Removing the floor makes the second
 /// point `Some`.
@@ -141,6 +166,34 @@ fn min_curves_for_reads_the_smallest_tail() {
     assert_eq!(min_curves_for([0.25, 0.5, 0.75]), 3);
     // The tail is the last probability's when it is the smaller one.
     assert_eq!(min_curves_for([0.2, 0.5, 0.95]), 19);
+}
+
+/// The per-probability floor that `min_curves_for` maximises over (#946 PR2): the median
+/// needs one value, 5 % and 95 % need 19, and the two tails of one `p` agree.
+///
+/// Mutations: `max` replaced by `min` in `min_curves_for` (the test above reddens with 1);
+/// the tail taken as `p` instead of `min(p, 1 − p)` (95 % gives 0).
+#[test]
+fn min_n_for_prob_reads_its_own_tail() {
+    assert_eq!(min_n_for_prob(0.5), 1);
+    assert_eq!(min_n_for_prob(0.05), 19);
+    assert_eq!(min_n_for_prob(0.95), 19);
+    assert_eq!(min_n_for_prob(0.25), 3);
+}
+
+/// Each quantile is gated by its own count, and a non-finite value is propagated into every
+/// quantile that is read rather than sorted past (`total_cmp` puts `NaN` last, so without
+/// the guard the lower quantiles would read the finite values only).
+///
+/// Mutations: dropping the `finite` guard (the 5 % and 50 % levels come back finite); one
+/// gate for all three levels.
+#[test]
+fn gated_quantiles_gates_each_level_and_propagates_nan() {
+    let mut v = vec![3.0, 1.0, 2.0];
+    assert_eq!(gated_quantiles(&mut v, [0.05, 0.5, 0.95], [19, 1, 19]), [None, Some(2.0), None]);
+    let mut v = vec![1.0, 2.0, 3.0, f64::NAN];
+    let q = gated_quantiles(&mut v, [0.05, 0.5, 0.95], [1, 1, 1]);
+    assert!(q.iter().all(|x| x.expect("gate passed").is_nan()), "{q:?}");
 }
 
 /// T6. The band is R's type-7 quantile. Against R 4.6 `quantile()`:

@@ -47,11 +47,21 @@ fn a_blown_up_first_trial_skips_the_salvage_under_slsqp_and_never_under_lbfgs() 
     let model = crate::parser::model_parser::parse_model_string(&src).expect("edited example");
     let mut pop =
         read_nonmem_csv(Path::new("data/warfarin_if.csv"), None, None).expect("bundled data");
+    // Sixteen subjects keep the fit to a few seconds; subject 0, the declined one, is kept.
+    pop.subjects.truncate(16);
     let dose = &mut pop.subjects[0].doses[0];
     *dose = crate::DoseEvent::new(dose.time, dose.amt, 1, 50.0, true, 24.0);
     // No regular-path shape declines after #2786, so force it (a `#[cfg(test)]` seam, which is
     // why this file moved from `tests/` into the lib).
     crate::parser::model_parser::rhs_regcode::kernel_jit::fail_plans_of(&pop.subjects[0]);
+    // Started at 0.3 × the example's own estimates. Since #3153 SLSQP's opening step is the
+    // capped one on a consistent objective, so from the example's own start it no longer blows
+    // up within 8 evaluations (the sweep behind #1520 saw excesses of 2.2e5 and 3.7e6 at
+    // evaluations 2 and 4); from this farther start it does (measured on Linux x86_64 at 6, 10
+    // and 16 subjects, not at 0.2, 0.5 or 1.0 ×, which is a property of the trajectory, not of
+    // the guard).
+    let mut start = model.default_params.clone();
+    start.theta.iter_mut().for_each(|t| *t *= 0.3);
     for (optimizer, expect_skips) in [(Optimizer::Slsqp, true), (Optimizer::NloptLbfgs, false)] {
         let opts = FitOptions {
             method: EstimationMethod::FoceI,
@@ -67,7 +77,7 @@ fn a_blown_up_first_trial_skips_the_salvage_under_slsqp_and_never_under_lbfgs() 
             verbose: false,
             ..FitOptions::default()
         };
-        let result = fit(&model, &pop, &model.default_params, &opts)
+        let result = fit(&model, &pop, &start, &opts)
             .unwrap_or_else(|e| panic!("{optimizer:?}: the short fit must return Ok: {e}"));
         let fd = result
             .warnings

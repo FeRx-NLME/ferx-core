@@ -238,12 +238,14 @@ fn check_levels_and_content(
     fingerprint: Option<&PopulationFingerprint>, model: &CompiledModel, population: &Population,
     source: PopulationSource,
 ) -> Result<(), EngineError> {
-    crate::diagnostics::first_error(&crate::api::check_covariate_levels(model, population))?;
+    crate::diagnostics::first_error(&crate::model_checks::check_covariate_levels(
+        model, population,
+    ))?;
     let Some(fingerprint) = fingerprint else {
-        return crate::diagnostics::first_error(&crate::api::check_level_index_columns(
+        return crate::diagnostics::first_error(&crate::model_checks::check_level_index_columns(
             model,
             population,
-            crate::api::LevelDataEntry::PostHoc,
+            crate::model_checks::LevelDataEntry::PostHoc,
         ));
     };
     match fingerprint.first_content_difference(population) {
@@ -276,8 +278,8 @@ pub(crate) fn verify_given_population(
 fn check_lent_stats(
     m: &CompiledModel, population: &Population, supplied: bool, with_model_file: bool,
 ) -> Result<(), EngineError> {
-    let mismatch =
-        crate::api::check_stats_on(m, population).map_err(EngineError::from_diagnostic)?;
+    let mismatch = crate::covariate_stats::check_stats_on(m, population)
+        .map_err(EngineError::from_diagnostic)?;
     let Some(d) = mismatch else {
         return Ok(());
     };
@@ -302,7 +304,7 @@ fn check_lent_stats(
         "`prepare_run` on the fit's model and data files. The model has a theta level \
          block, which `bind_covariate_stats` does not bind."
     };
-    Err(crate::api::fit_input_model(format!(
+    Err(crate::entry_refusals::fit_input_model(format!(
         "this fit records no data-derived bindings (an older `.fitrx`), so the \
          supplied model's covariate statistics were checked against {against}, and they \
          differ: the {field} of `{cov}` is {mv} in the model but {dv} in {there}. The model \
@@ -374,7 +376,7 @@ fn check_lent_stats(
 /// (`E_POPULATION_MISMATCH`, `E_FIT_SUBJECTS_MISMATCH`, #1813), an input neither
 /// passed nor recorded (`E_FIT_INPUT_MISSING`), a file changed since the fit
 /// (`E_FIT_INPUT_CHANGED`), a model that is not the fit's (`E_FIT_INPUT_MODEL`, and
-/// `E_THETA_LENGTH` for its θ count), from `crate::api::entry_refusals`.
+/// `E_THETA_LENGTH` for its θ count), from `crate::entry_refusals`.
 pub(crate) fn resolve_fit_inputs<'a>(
     fit: &FitResult, model: Option<&'a CompiledModel>, population: Option<&'a Population>,
     entry: &str,
@@ -407,7 +409,7 @@ fn resolve_fit_inputs_unattributed<'a>(
     // `iov_column` the fit read with, so they need no refusal.
     if let (Some(m), None, None) = (model, population, settings) {
         if m.n_kappa > 0 {
-            return Err(crate::api::fit_input_missing(
+            return Err(crate::entry_refusals::fit_input_missing(
                 "caller-supplied `model` for an IOV (n_kappa > 0) model \
                  requires `population` to also be supplied — the model carries no \
                  `iov_column`, and per-occasion kappas are parsed with it.",
@@ -421,7 +423,7 @@ fn resolve_fit_inputs_unattributed<'a>(
     let mut file: Option<(ParsedModel, String)> = None;
     if model.is_none() {
         let path = fit.model_path.as_deref().ok_or_else(|| {
-            crate::api::fit_input_missing(
+            crate::entry_refusals::fit_input_missing(
                 "no model supplied and fit.model_path is None. \
                  Either pass `model = Some(&model)` or re-fit via fit_from_files \
                  so the path is recorded.",
@@ -439,7 +441,7 @@ fn resolve_fit_inputs_unattributed<'a>(
         Some(p) => Cow::Borrowed(p),
         None => {
             let path = fit.data_path.as_deref().ok_or_else(|| {
-                crate::api::fit_input_missing(
+                crate::entry_refusals::fit_input_missing(
                     "no population supplied and fit.data_path is None. \
                      Either pass `population = Some(&pop)` or re-fit via fit_from_files \
                      so the path is recorded.",
@@ -452,7 +454,7 @@ fn resolve_fit_inputs_unattributed<'a>(
             if let Some(expected) = &fit.data_hash {
                 let actual = sha256_file(Path::new(path)).map_err(read_failed)?;
                 if &actual != expected {
-                    return Err(crate::api::fit_input_changed(format!(
+                    return Err(crate::entry_refusals::fit_input_changed(format!(
                         "data hash mismatch for {path}. Stored: {expected}, current: \
                          {actual}. The dataset has changed since the fit was produced — \
                          refusing to run against stale data."
@@ -516,13 +518,13 @@ fn resolve_fit_inputs_unattributed<'a>(
             } else {
                 Some(population.to_mut())
             };
-            crate::api::bind_from_fit_on(&mut parsed, &text, pop, &fit.data_bindings)
+            crate::levels::bind_from_fit_on(&mut parsed, &text, pop, &fit.data_bindings)
                 .map_err(EngineError::from_diagnostic)?;
             ModelRef::Built(Box::new(parsed.model))
         }
         Some(m) => {
             if !fit.data_bindings.is_empty() && m.data_bindings() != &fit.data_bindings {
-                return Err(crate::api::fit_input_model(
+                return Err(crate::entry_refusals::fit_input_model(
                     "the supplied model is not bound with this fit's bindings: its \
                      data-derived bindings (level layout, covariate statistics) differ from \
                      the fit's `data_bindings`. Pass `model = None` to rebuild it from the \
@@ -531,10 +533,10 @@ fn resolve_fit_inputs_unattributed<'a>(
                 ));
             }
             if let Cow::Owned(p) = &mut population {
-                crate::api::write_fitted_level_columns(m, p, &m.data_bindings().levels)
+                crate::levels::write_fitted_level_columns(m, p, &m.data_bindings().levels)
                     .map_err(EngineError::from_diagnostic)?;
             }
-            crate::diagnostics::first_error(&crate::api::check_covariate_model_bound(m))?;
+            crate::diagnostics::first_error(&crate::model_checks::check_covariate_model_bound(m))?;
             // No recorded bindings to compare (an older `.fitrx`): the population
             // decides. After the level index write, so a population with a level the
             // model never saw keeps that refusal.
@@ -550,7 +552,7 @@ fn resolve_fit_inputs_unattributed<'a>(
 
     let inputs = FitInputs { model, population, warnings };
     if inputs.model().n_theta != fit.theta.len() {
-        return Err(crate::api::theta_length(format!(
+        return Err(crate::entry_refusals::theta_length(format!(
             "the model has n_theta = {} but the fit has {} θ. Verify you supplied \
              the same model the fit used, bound the way the fit was (`bind_from_fit` with \
              the fit's `data_bindings`).",
@@ -627,7 +629,7 @@ fn unrecorded_rule_refusal(fit: &FitResult, file_rule: Option<&IovOccasionRule>)
          occasion labels the fit ran with, set `fit.iov_occasion` to the rule the fit \
          ran with, or refit so the rule is recorded.",
     );
-    crate::api::fit_input_missing(msg)
+    crate::entry_refusals::fit_input_missing(msg)
 }
 
 /// A rule in the DSL's spelling: `dose`, `time(24, 48)`.
@@ -695,7 +697,7 @@ fn population_mismatch(
 ) -> EngineError {
     // A population read without the model's endpoint routing keeps `fit()`'s own
     // refusal and code (`E_ENDPOINT_UNROUTED`, #1199): it names the reader to use.
-    let unrouted = crate::api::check_endpoint_routing(model, population, true);
+    let unrouted = crate::model_checks::check_endpoint_routing(model, population, true);
     if let Err(e) = crate::diagnostics::first_error(&unrouted) {
         return e;
     }
@@ -704,11 +706,14 @@ fn population_mismatch(
     // "`k` of `n`"): a population bound for other levels is not the fit's, and hears
     // so below — `E_THETA_LEVELS_DATA_MISMATCH`'s "a fit of a model bound on this
     // population" is advice for new data, not for a post-hoc step on this fit.
-    let unbound: Vec<_> =
-        crate::api::check_level_index_columns(model, population, crate::api::LevelDataEntry::Run)
-            .into_iter()
-            .filter(|d| d.code == "E_THETA_LEVELS_DATA_UNBOUND")
-            .collect();
+    let unbound: Vec<_> = crate::model_checks::check_level_index_columns(
+        model,
+        population,
+        crate::model_checks::LevelDataEntry::Run,
+    )
+    .into_iter()
+    .filter(|d| d.code == "E_THETA_LEVELS_DATA_UNBOUND")
+    .collect();
     if let Err(e) = crate::diagnostics::first_error(&unbound) {
         return e;
     }
@@ -867,6 +872,10 @@ pub struct ScoringSettings {
     /// twin seed, so a post-hoc step re-scores it without one.
     #[serde(default)]
     pub inner_twin_seed: bool,
+    /// `inner_kick`: the inner solves' kick restarts (#3159). `#[serde(default)]`: absent
+    /// from a record written before #3159 reads `false` — the old behaviour.
+    #[serde(default)]
+    pub inner_kick: bool,
     /// `mu_referencing`: the EBE warm start from μ-referenced typical values.
     pub mu_referencing: bool,
     /// `n_agq`: quadrature nodes of the scored marginal.
@@ -892,7 +901,7 @@ pub struct ScoringSettings {
     /// else `Auto`. A post-hoc step resolves it as a union with the caller's: either `Fd`
     /// wins (#1835).
     ///
-    /// Absent from a `FitResult` serialised before #1835 (the fit JSON, the ferx-tools search
+    /// Absent from a `FitResult` serialised before #1835 (the fit JSON, the ferx-search
     /// journal), which reads `Auto`: such a fit takes the caller's route, as it did then.
     #[serde(default)]
     pub gradient_method: GradientMethod,
@@ -920,6 +929,7 @@ impl ScoringSettings {
             inner_restarts: options.inner_restarts,
             inner_screen: options.inner_screen,
             inner_twin_seed: options.inner_twin_seed,
+            inner_kick: options.inner_kick,
             mu_referencing: options.mu_referencing,
             n_agq: options.n_agq,
             inner_optimizer: options.inner_optimizer,
@@ -969,6 +979,7 @@ impl ScoringSettings {
             inner_restarts,
             inner_screen,
             inner_twin_seed,
+            inner_kick,
             mu_referencing,
             n_agq,
             inner_optimizer,
@@ -991,6 +1002,7 @@ impl ScoringSettings {
             inner_restarts,
             inner_screen,
             inner_twin_seed,
+            inner_kick,
             mu_referencing,
             n_agq,
             inner_optimizer,
@@ -1142,6 +1154,7 @@ pub(crate) fn with_scoring_record(
         inner_restarts,
         inner_screen,
         inner_twin_seed,
+        inner_kick,
         mu_referencing,
         n_agq,
         inner_optimizer,
@@ -1169,6 +1182,7 @@ pub(crate) fn with_scoring_record(
     recorded!(inner_restarts);
     recorded!(inner_screen);
     recorded!(inner_twin_seed);
+    recorded!(inner_kick);
     recorded!(mu_referencing);
     recorded!(n_agq);
     recorded!(inner_optimizer);

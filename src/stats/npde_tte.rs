@@ -93,7 +93,7 @@ fn batch_seed(seed: u64, batch: usize) -> u64 {
 }
 
 fn refuse(message: String) -> EngineError {
-    crate::api::npde_tte_input(message)
+    crate::entry_refusals::npde_tte_input(message)
 }
 
 /// The model's one single-event TTE endpoint.

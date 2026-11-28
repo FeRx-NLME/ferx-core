@@ -153,7 +153,7 @@ pub fn run_sir(
     // `ode_method` would be ignored and the sampled OFVs would come from a different
     // integration accuracy than the fit being refined. The scope also puts the sample
     // fan-out on a pool whose workers carry the same settings.
-    crate::api::with_fit_scope(options, || run_sir_scoped(fit, model, population, options))?
+    crate::pool::with_fit_scope(options, || run_sir_scoped(fit, model, population, options))?
 }
 
 /// `options` with every SIR setting the caller left at its default taken from
@@ -221,24 +221,34 @@ fn run_sir_scoped(
     // Re-runs the inner loop (EBEs → the prediction walk), so it needs the same
     // dose-compartment precondition `fit()` enforces (#375) — a `Result`-returning
     // API must not abort the process from inside the walk. Mirrors `run_covariance`.
-    crate::diagnostics::first_error(&crate::api::check_dose_compartments(model_ref, pop_ref))?;
+    crate::diagnostics::first_error(&crate::model_checks::check_dose_compartments(
+        model_ref, pop_ref,
+    ))?;
     // …and the endpoint-routing precondition (#1199), as `fit()` enforces it: SIR on
     // a population read model-blind would resample the Gaussian half of a joint
     // likelihood. The re-read above is routed; this covers a supplied population.
-    crate::diagnostics::first_error(&crate::api::check_endpoint_routing(model_ref, pop_ref, true))?;
+    crate::diagnostics::first_error(&crate::model_checks::check_endpoint_routing(
+        model_ref, pop_ref, true,
+    ))?;
     // A caller's `ode_method = Linear` asserts the exact path, as it does for `fit()` (#852).
-    crate::diagnostics::first_error(&crate::api::check_ode_method_linear(model_ref, options))
-        .map_err(|e| e.in_context("run_sir"))?;
+    crate::diagnostics::first_error(&crate::model_checks::check_ode_method_linear(
+        model_ref, options,
+    ))
+    .map_err(|e| e.in_context("run_sir"))?;
     // A drug-driven CTMM generator reading a TIME-dependent disposition is scored under a
     // frozen TIME=0 `[odes]` solve (#1918). `fit()` refuses it; a fit from before that
     // refusal, or a caller-supplied `FitResult`, must not have it re-scored here.
     #[cfg(feature = "markov")]
-    crate::diagnostics::first_error(&crate::api::check_ctmm_time_dependent_pk_diags(model_ref))?;
+    crate::diagnostics::first_error(&crate::model_checks::check_ctmm_time_dependent_pk_diags(
+        model_ref,
+    ))?;
     // …and the data-dependent covariate axis of the same freeze (#1854): a time-varying
     // covariate on an endpoint read at the baseline snapshot — for a drug-driven CTMM, one
     // reaching the disposition its `[odes]` solve integrates. `fit()` refuses it (#741).
     #[cfg(feature = "survival")]
-    crate::diagnostics::first_error(&crate::api::check_survival_tv_covariates(model_ref, pop_ref))?;
+    crate::diagnostics::first_error(&crate::model_checks::check_survival_tv_covariates(
+        model_ref, pop_ref,
+    ))?;
 
     // --- Reconstruct ModelParameters (the shape gate) ----------------------
     // Ω, σ and Ω_IOV against the model (#1833), before the EBE check below: a fit of a
@@ -248,7 +258,7 @@ fn run_sir_scoped(
 
     // --- Sanity-check dimensions ------------------------------------------
     if !fit.subjects.is_empty() && fit.subjects[0].eta.len() != model_ref.n_eta {
-        return Err(crate::api::fit_input_model(format!(
+        return Err(crate::entry_refusals::fit_input_model(format!(
             "fit.subjects[0] has eta dim {} but model has n_eta = {}. \
              Subject EBEs are inconsistent with the supplied model.",
             fit.subjects[0].eta.len(),
@@ -277,7 +287,7 @@ fn run_sir_scoped(
 
     // --- Now require a covariance matrix to seed the proposal -------------
     let cov = fit.covariance_matrix.as_ref().ok_or_else(|| {
-        crate::api::fit_input_missing(
+        crate::entry_refusals::fit_input_missing(
             "run_sir requires fit.covariance_matrix; re-run the original fit \
              with the covariance step enabled (FitOptions.run_covariance_step = \
              true, or `covariance = true` in the model file's [fit_options]).",
@@ -896,6 +906,7 @@ mod tests {
                 inner_restarts: 4,
                 inner_screen: 7,
                 inner_twin_seed: false,
+                inner_kick: false,
                 mu_referencing: false,
                 n_agq: 5,
                 inner_optimizer: InnerOptimizer::Lbfgs,

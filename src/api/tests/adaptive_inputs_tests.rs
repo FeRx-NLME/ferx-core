@@ -361,6 +361,43 @@ fn supplied_eta_refusals_carry_their_code_and_text() {
         )),
         (code.clone(), "subject ID '1' appears more than once".to_string())
     );
+    // A model that dropped an `omega ETA_Z ~ 0 FIX` placeholder (#3150): η supplied for the
+    // declared shape (both names) are refused, and the refusal says which η is gone.
+    let dropped = parse_model_string(
+        &ODE_IIV
+            .replace(
+                "  omega ETA_CL ~ 0.09
+",
+                "  omega ETA_CL ~ 0.09
+  omega ETA_Z ~ 0 FIX
+",
+            )
+            .replace("exp(ETA_CL)", "exp(ETA_CL + ETA_Z)"),
+    )
+    .expect("parse");
+    assert_eq!(dropped.eta_names, ["ETA_CL"]);
+    let declared_shape = SuppliedEtas::from_table(
+        vec!["1".into()],
+        vec!["ETA_CL".into(), "ETA_Z".into()],
+        vec![vec![0.1, 0.0]],
+    )
+    .expect("table");
+    let pop1 = population(&["1"]);
+    let inputs = AdaptiveInputs::new(&dropped.default_params).with_etas(&declared_shape);
+    let (c, m) = refusal(simulate_adaptive_with_inputs(
+        &dropped,
+        &pop1,
+        &inputs,
+        1,
+        hold_all,
+        &options(1, ObserveMode::Ipred),
+    ));
+    assert_eq!(c, "E_SUPPLIED_ETAS");
+    assert!(
+        m.starts_with("the supplied η are named [ETA_CL, ETA_Z] but the model's are [ETA_CL]; ")
+            && m.contains("Note: W_ZERO_FIX_ETA_DROPPED: omega ETA_Z ~ 0 FIX is held at 0"),
+        "{m}"
+    );
     // `from_fit`'s own refusal (a fit of another model) is in
     // `tests/adaptive_supplied_etas.rs`, which has a fit to hand it.
 

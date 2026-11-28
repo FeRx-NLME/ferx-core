@@ -27,7 +27,7 @@ use crate::sens::jet::DualT;
 #[cfg(test)]
 use crate::sens::num::NonRecording;
 use crate::sens::num::{wsum3, BranchCmp, PkNum};
-use crate::stats::residual_error::{LoadingForm, ResidualCov};
+use crate::stats::residual_error::{eval_fmag, slot_fmag, LoadingForm, RBlocks, ResidualCov};
 use crate::types::{CompiledModel, ModelParameters, Subject};
 use std::borrow::Cow;
 
@@ -270,6 +270,55 @@ pub(crate) struct LikCtx<'a> {
 /// The most σ loadings one row has: the residual-error owner's bound.
 const MAX_LOADINGS: usize = crate::stats::residual_error::MAX_SIGMA_LOADINGS;
 
+/// A row's σ loadings at prediction `f`, as generic values: a constant slot's
+/// `1`, a proportional slot's `f` — raised to `sign(f)·|f|^p` under a
+/// `power(...)` exponent — and a `LogCombined` additive slot's `exp(−f)` (#2729),
+/// each times a prediction-reading magnitude `h(f)` when the row's tail carries one
+/// (#3121) and the custom magnitude multiplier `mult` (the row from
+/// `RuvMagnitude::eval_subject_obs_g`; `None` reads as all ones). The same
+/// loadings as `ErrorSpec::scaled_loadings`, built in `T` arithmetic so every order
+/// of derivative in `f`, `θ` and `η` is exact without a hand-written rule. Returned
+/// in a fixed buffer with its length (no allocation per row).
+///
+/// A free function so the likelihood kernel and the SDE recorder's Kalman `R`
+/// (`ode_adjoint::record_sde_p`, #3126) share one definition of the row. `n_shape` sizes the
+/// loading shape (the model's σ count), `n_sigma` the exponent half of `mult`.
+pub(crate) fn row_loadings_g<T: PkNum>(
+    spec: &crate::types::ErrorSpec, key: usize, n_shape: usize, n_sigma: usize, f: T,
+    mult: Option<&[T]>,
+) -> ([(usize, T); MAX_LOADINGS], usize) {
+    let mut out = [(0usize, T::from_f64(0.0)); MAX_LOADINGS];
+    let shape = spec.loading_shape(key, n_shape);
+    let len = shape.len();
+    for (o, &(idx, form)) in out.iter_mut().zip(shape.iter()) {
+        let c = if form == LoadingForm::Prop {
+            // `slot_exponent`: the exponent half of the row, when present.
+            match mult.filter(|m| m.len() >= 2 * n_sigma).map(|m| m[n_sigma + idx]) {
+                Some(pw) if pw.br_cmp_c(BranchCmp::Ne, 1.0) => {
+                    if f.br_cmp_c(BranchCmp::Eq, 0.0) {
+                        T::from_f64(0.0)
+                    } else {
+                        let sign = if f.br_cmp_c(BranchCmp::Lt, 0.0) { -1.0 } else { 1.0 };
+                        T::from_f64(sign) * f.abs().pow(pw)
+                    }
+                }
+                _ => form.coeff_g(f),
+            }
+        } else {
+            form.coeff_g(f)
+        };
+        let m = mult.and_then(|m| m.get(idx).copied()).unwrap_or(T::from_f64(1.0));
+        // A prediction-reading magnitude `h(f)` (#3121), in `T`: its `f`-, θ- and
+        // η-derivatives come from the types, as every other loading's do.
+        let c = match mult.and_then(|m| slot_fmag(m, n_sigma, idx)) {
+            Some(prog) => eval_fmag(prog, |a| a, f) * c,
+            None => c,
+        };
+        *o = (idx, m * c);
+    }
+    (out, len)
+}
+
 impl<'a> LikCtx<'a> {
     pub(crate) fn new(
         model: &'a CompiledModel, subject: &'a Subject, params: &'a ModelParameters,
@@ -339,43 +388,19 @@ impl<'a> LikCtx<'a> {
         self.model.bloq_in_force().is_censored_row(c).then_some(c)
     }
 
-    /// Row `j`'s σ loadings at prediction `f`, as generic values: a constant slot's
-    /// `1`, a proportional slot's `f` — raised to `sign(f)·|f|^p` under a
-    /// `power(...)` exponent — and a `LogCombined` additive slot's `exp(−f)` (#2729),
-    /// each times the custom magnitude multiplier. The same
-    /// loadings as `ErrorSpec::scaled_loadings`, built in `T` arithmetic so every order
-    /// of derivative in `f`, `θ` and `η` is exact without a hand-written rule. Returned
-    /// in a fixed buffer with its length (no allocation per row).
+    /// Row `j`'s σ loadings at prediction `f` ([`row_loadings_g`] on this subject's key and
+    /// magnitude row).
     fn loadings<T: PkNum>(
         &self, j: usize, f: T, p: &ParT<T>,
     ) -> ([(usize, T); MAX_LOADINGS], usize) {
-        let n_sigma = p.sigma.len();
-        let mult = p.ruv_mult.as_ref().and_then(|m| m.get(j));
-        let mut out = [(0usize, T::from_f64(0.0)); MAX_LOADINGS];
-        let shape =
-            self.model.error_spec.loading_shape(self.keys[j], self.params.sigma.values.len());
-        let len = shape.len();
-        for (o, &(idx, form)) in out.iter_mut().zip(shape.iter()) {
-            let c = if form == LoadingForm::Prop {
-                // `slot_exponent`: the exponent half of the row, when present.
-                match mult.filter(|m| m.len() == 2 * n_sigma).map(|m| m[n_sigma + idx]) {
-                    Some(pw) if pw.br_cmp_c(BranchCmp::Ne, 1.0) => {
-                        if f.br_cmp_c(BranchCmp::Eq, 0.0) {
-                            T::from_f64(0.0)
-                        } else {
-                            let sign = if f.br_cmp_c(BranchCmp::Lt, 0.0) { -1.0 } else { 1.0 };
-                            T::from_f64(sign) * f.abs().pow(pw)
-                        }
-                    }
-                    _ => form.coeff_g(f),
-                }
-            } else {
-                form.coeff_g(f)
-            };
-            let m = mult.and_then(|m| m.get(idx).copied()).unwrap_or(T::from_f64(1.0));
-            *o = (idx, m * c);
-        }
-        (out, len)
+        row_loadings_g(
+            &self.model.error_spec,
+            self.keys[j],
+            self.params.sigma.values.len(),
+            p.sigma.len(),
+            f,
+            p.ruv_mult.as_ref().and_then(|m| m.get(j)).map(Vec::as_slice),
+        )
     }
 
     /// `V` of row `j` at `f`: the loadings variance, unscaled.
@@ -421,8 +446,10 @@ impl<'a> LikCtx<'a> {
         ) + p.omega.log_det
     }
 
-    /// The residual covariance over `T` (the dense path).
-    fn r_matrix<T: PkNum>(&self, f: &[T], p: &ParT<T>) -> Vec<Vec<T>> {
+    /// The residual covariance over `T` (the dense path), with its coupling blocks: the
+    /// factorisations below work block by block ([`chol_blocks`]), never on the structural
+    /// zeros between blocks (#3060).
+    fn r_matrix<T: PkNum>(&self, f: &[T], p: &ParT<T>) -> (Vec<Vec<T>>, RBlocks) {
         crate::stats::residual_error::r_matrix_g(
             |j| {
                 let (l, n) = self.loadings(j, f[j], p);
@@ -644,7 +671,7 @@ pub(crate) fn laplace_row<T: PkNum>(ctx: &LikCtx, j: usize, f: T, p: &ParT<T>) -
 }
 
 /// Whether [`foce_f`] takes its Woodbury form at `S = LᵀGᵀD⁻¹GL` with trace `tr_s` — the
-/// form the structured FOCE kernel is (#2980): otherwise production factors `R̃` itself.
+/// form the structured FOCE kernel is (#2980): otherwise it rotates the rows into `I + S` (#2988).
 pub(crate) fn foce_woodbury_ok(tr_s: f64) -> bool {
     1.0 + tr_s <= WOODBURY_MAX_INFO_TRACE || woodbury_forced()
 }
@@ -869,7 +896,7 @@ fn assemble_grad<T: PkNum>(
 /// A diagonal `R⁰` takes Woodbury's form, `rᵀR̃⁻¹r = rᵀR⁻¹r − bᵀA⁻¹b` and
 /// `log|R̃| = log|R| + log|Ω| + log|A|` with `A = Ω⁻¹ + GᵀR⁻¹G`, `b = GᵀR⁻¹r`: `N × N`
 /// work per subject instead of the `n × n` factorisation. A covariance coupling rows
-/// factors `R̃` directly.
+/// factors `R̃` directly; past the #1498 gate the rows are rotated into `I + S` (#2988).
 pub(crate) fn foce_f<T: PkNum>(
     ctx: &LikCtx, f: &[T], g: &[Vec<T>], eta: &[T], fpop: Option<&[T]>, p: &ParT<T>,
 ) -> Option<T> {
@@ -904,7 +931,7 @@ pub(crate) fn foce_f<T: PkNum>(
         }
     };
     let dense = ctx.cov.is_dense();
-    let rm: Option<Vec<Vec<T>>> = dense.then(|| ctx.r_matrix(&r_eval, p));
+    let rm: Option<Vec<Vec<T>>> = dense.then(|| ctx.r_matrix(&r_eval, p).0);
     let mut bloq = c(0.0);
     let mut quant: Vec<usize> = Vec::with_capacity(n);
     let mut rdiag: Vec<T> = Vec::with_capacity(n);
@@ -934,10 +961,12 @@ pub(crate) fn foce_f<T: PkNum>(
     let res: Vec<T> = quant.iter().map(|&j| c(ctx.subject.observations[j]) - f0[j]).collect();
     let nq = quant.len();
     // Woodbury on a diagonal `R⁰` is a subtractive identity, accurate to `≈ eps·(1 + tr S)`
-    // with `S = LᵀGᵀD⁻¹GL` (`Ω = LLᵀ`, `GL` = `lg`). A row whose `R⁰` is on the variance
-    // floor while its `G` is O(1) (FOCE's `R⁰` is taken at η = 0, `G` at η̂) drives
-    // `1 + tr S` to ~1e11 and the correction loses every digit (#1498): above
-    // `WOODBURY_MAX_INFO_TRACE`, or when it is not finite, `R̃` is factored at observation size.
+    // with `S = LᵀGᵀD⁻¹GL` (`Ω = LLᵀ`, `GL` = `lg`). A row whose `R⁰` is tiny next to its
+    // `G` (a near-zero typical prediction under proportional error, with `G` O(1): FOCE's `R⁰`
+    // is taken at η = 0, `G` at η̂) drives `1 + tr S` to ~1e11 and the correction loses every
+    // digit (#1498): above
+    // `WOODBURY_MAX_INFO_TRACE`, or when it is not finite, the rows are rotated into
+    // `I + S` instead. A dense `R⁰` factors `R̃` at observation size.
     let woodbury = rm.is_none() && {
         let tr = quant.iter().fold(c(0.0), |acc, &j| {
             let s = (0..nn).fold(c(0.0), |a, k| a + lg[j][k] * lg[j][k]);
@@ -945,7 +974,7 @@ pub(crate) fn foce_f<T: PkNum>(
         });
         (one + tr).br_cmp_c(BranchCmp::Le, WOODBURY_MAX_INFO_TRACE) || woodbury_forced()
     };
-    if !woodbury {
+    if rm.is_some() {
         // R̃ = R⁰_q + (LᵀG)ᵀ(LᵀG), FREM rows decoupled (`apply_frem_r_matrix_overrides`).
         let rt: Vec<Vec<T>> = (0..nq)
             .map(|a| {
@@ -969,6 +998,38 @@ pub(crate) fn foce_f<T: PkNum>(
         let quad = wsum3(0.0, (0..nq).map(|i| (one, res[i], z[i])));
         return Some(c(0.5) * (quad + chol_logdet(&l) + bloq));
     }
+    let mut log_r = c(0.0);
+    for &j in &quant {
+        log_r = log_r + rdiag[j].ln();
+    }
+    if !woodbury {
+        // `min_w ‖w‖² + ‖D^-½(res − GL·w)‖²` (the same quadratic form) by Givens rotations of
+        // each row into the triangular factor `R` of `I + S`, started at `I`: no subtraction of
+        // large terms, every pivot ≥ 1, and `O(nq·nn²)` work where an `nq × nq` `R̃` costs a
+        // compiled plan `O(nq³)` instructions (#2988).
+        let mut r: Vec<Vec<T>> =
+            (0..nn).map(|k| (0..nn).map(|l| c(if k == l { 1.0 } else { 0.0 })).collect()).collect();
+        let mut z = vec![c(0.0); nn];
+        let mut quad = c(0.0);
+        for (i, &j) in quant.iter().enumerate() {
+            let w = one / rdiag[j].sqrt();
+            let mut v: Vec<T> = lg[j].iter().map(|&x| x * w).collect();
+            let mut t = res[i] * w;
+            for k in 0..nn {
+                let h = (r[k][k] * r[k][k] + v[k] * v[k]).sqrt();
+                let (cs, sn) = (r[k][k] / h, v[k] / h);
+                r[k][k] = h;
+                for l in k + 1..nn {
+                    (r[k][l], v[l]) = (cs * r[k][l] + sn * v[l], cs * v[l] - sn * r[k][l]);
+                }
+                (z[k], t) = (cs * z[k] + sn * t, cs * t - sn * z[k]);
+            }
+            quad = quad + t * t;
+        }
+        let ld = (0..nn).fold(c(0.0), |a, k| a + c(2.0) * r[k][k].ln());
+        // A non-finite `S` declines, as the dense factor it replaces did.
+        return positive_finite(one + quad + ld).then(|| c(0.5) * (quad + log_r + ld + bloq));
+    }
     // Woodbury / determinant lemma on the diagonal R⁰, Ω-normalised: with `B = D⁻¹GL`,
     // `R̃⁻¹ = D⁻¹ − B(I + S)⁻¹Bᵀ` and `|R̃| = |D|·|I + S|`. Factoring `I + S` rather than
     // `Ω⁻¹ + GᵀD⁻¹G` keeps `cond(Ω)` (a near-rail `block_omega`) out of the subtraction,
@@ -991,10 +1052,6 @@ pub(crate) fn foce_f<T: PkNum>(
     let ab = chol_solve(&la, &b);
     let quad = wsum3(0.0, (0..nq).map(|i| (iv[i], res[i], res[i])))
         - wsum3(0.0, (0..nn).map(|k| (one, b[k], ab[k])));
-    let mut log_r = c(0.0);
-    for &j in &quant {
-        log_r = log_r + rdiag[j].ln();
-    }
     Some(c(0.5) * (quad + log_r + chol_logdet(&la) + bloq))
 }
 
@@ -1042,42 +1099,38 @@ fn focei_f_dense<T: PkNum>(
     let n = ctx.n();
     let nn = eta.len();
     let ruv = ctx.ruv_scale(eta);
-    let mut rv: Vec<Vec<T>> = ctx
-        .r_matrix(f, p)
-        .into_iter()
-        .map(|row| row.into_iter().map(|x| x * ruv).collect())
-        .collect();
+    let (mut rv, blk) = ctx.r_matrix(f, p);
+    scale_blocks(&mut rv, &blk, ruv);
     for j in 0..n {
         rv[j][j] = rv[j][j] + ctx.extra(f, j);
     }
-    let l = chol(&rv)?;
+    let l = chol_blocks(&rv, &blk)?;
     let res: Vec<T> = (0..n).map(|j| c(ctx.subject.observations[j]) - f[j]).collect();
-    let z = chol_solve(&l, &res);
+    let z = chol_solve_blocks(&l, &res, &blk);
     let mut data = chol_logdet(&l);
     for j in 0..n {
         data = data + res[j] * z[j];
     }
     // R⁻¹G (n × N) and R⁻¹·∂_kR (n × n per k). `∂_kR` comes from `R` over a one-direction
     // dual per `k` ([`direction_duals`]): its tangent is exactly `Σ_m G_mk ∂R/∂f_m`, plus
-    // `∂R/∂η_r` through the `exp(2η_r)` scale.
-    let rg: Vec<Vec<T>> =
-        (0..nn).map(|k| chol_solve(&l, &(0..n).map(|j| g[j][k]).collect::<Vec<T>>())).collect();
+    // `∂R/∂η_r` through the `exp(2η_r)` scale. `∂_kR` has `R`'s block pattern, so column
+    // `col` of `Y_k` is solved over `col`'s block alone and is zero outside it.
+    let rg: Vec<Vec<T>> = (0..nn)
+        .map(|k| chol_solve_blocks(&l, &(0..n).map(|j| g[j][k]).collect::<Vec<T>>(), &blk))
+        .collect();
     let rd_k: Vec<Vec<Vec<T>>> = (0..nn)
         .map(|k| {
             let (fd, ed) = direction_duals(f, g, eta, k);
             let ruv = ctx.ruv_scale(&ed);
-            let rd = ctx.r_matrix(&fd, &p.wrap_rows::<1>());
+            let (rd, _) = ctx.r_matrix(&fd, &p.wrap_rows::<1>());
             (0..n)
                 .map(|col| {
-                    chol_solve(
-                        &l,
-                        &(0..n)
-                            .map(|i| {
-                                let x = rd[i][col] * ruv;
-                                (if i == col { x + ctx.extra(&fd, i) } else { x }).g[0]
-                            })
-                            .collect::<Vec<T>>(),
-                    )
+                    let mut b = vec![c(0.0); n];
+                    for &i in blk.rows(col) {
+                        let x = rd[i][col] * ruv;
+                        b[i] = (if i == col { x + ctx.extra(&fd, i) } else { x }).g[0];
+                    }
+                    chol_solve_within(&l, &b, blk.rows(col))
                 })
                 .collect()
         })
@@ -1089,10 +1142,11 @@ fn focei_f_dense<T: PkNum>(
             for j in 0..n {
                 hrh = hrh + g[j][a] * rg[b][j];
             }
-            // B_ab = tr(Y_a Y_b), Y_k = R⁻¹∂_kR, stored by columns: rd_k[k][col][row]
+            // B_ab = tr(Y_a Y_b), Y_k = R⁻¹∂_kR, stored by columns: rd_k[k][col][row]. `Y_k`
+            // is block diagonal, so only a block's own entries contribute.
             let mut bab = c(0.0);
             for i in 0..n {
-                for jj in 0..n {
+                for &jj in blk.rows(i) {
                     bab = bab + rd_k[a][jj][i] * rd_k[b][i][jj];
                 }
             }
@@ -1157,17 +1211,14 @@ pub(crate) fn data_l<T: PkNum>(
     let vf = frozen.unwrap_or(f);
     if ctx.dense() {
         let n = ctx.n();
-        let mut r: Vec<Vec<T>> = ctx
-            .r_matrix(vf, p)
-            .into_iter()
-            .map(|row| row.into_iter().map(|x| x * ruv).collect())
-            .collect();
+        let (mut r, blk) = ctx.r_matrix(vf, p);
+        scale_blocks(&mut r, &blk, ruv);
         for j in 0..n {
             r[j][j] = r[j][j] + ctx.extra(f, j);
         }
-        let l = chol(&r)?;
+        let l = chol_blocks(&r, &blk)?;
         let res: Vec<T> = (0..n).map(|j| c(ctx.subject.observations[j]) - f[j]).collect();
-        let z = chol_solve(&l, &res);
+        let z = chol_solve_blocks(&l, &res, &blk);
         let mut data = chol_logdet(&l);
         for j in 0..n {
             data = data + res[j] * z[j];
@@ -1182,16 +1233,16 @@ pub(crate) fn data_l<T: PkNum>(
 }
 
 /// A 1-D second-order dual: value, first and second derivative along one direction.
-type D2<T> = DualT<1, DualT<1, T>>;
+pub(crate) type D2<T> = DualT<1, DualT<1, T>>;
 
 /// `x` as a [`D2`] constant.
-fn d2_const<T: PkNum>(x: T) -> D2<T> {
+pub(crate) fn d2_const<T: PkNum>(x: T) -> D2<T> {
     let zero = T::from_f64(0.0);
     DualT { v: DualT { v: x, g: [zero] }, g: [DualT { v: zero, g: [zero] }] }
 }
 
 /// `x` as the [`D2`] variable: unit first derivative, zero second.
-fn d2_seed<T: PkNum>(x: T) -> D2<T> {
+pub(crate) fn d2_seed<T: PkNum>(x: T) -> D2<T> {
     let (zero, one) = (T::from_f64(0.0), T::from_f64(1.0));
     DualT { v: DualT { v: x, g: [one] }, g: [DualT { v: one, g: [zero] }] }
 }
@@ -1437,6 +1488,92 @@ pub(crate) fn chol_logdet<T: PkNum>(l: &[Vec<T>]) -> T {
     ld
 }
 
+/// `R·s` in place over `R`'s blocks: an entry between two blocks is a structural zero and
+/// stays one (multiplying it would record a zero-fold guard per entry on a recording).
+fn scale_blocks<T: PkNum>(r: &mut [Vec<T>], blk: &RBlocks, s: T) {
+    for (i, row) in r.iter_mut().enumerate() {
+        for &j in blk.rows(i) {
+            row[j] = row[j] * s;
+        }
+    }
+}
+
+/// [`chol`] of a matrix whose entries between two of `blk`'s blocks are structural zeros:
+/// the factor has the same pattern, and every entry inside a block is computed by the same
+/// operations in the same order as the dense factorisation, which only adds `0·0` terms to
+/// them — so the factor is the dense one's, at `Σ b³` work instead of `n³` (#3060). The
+/// positive-definiteness checks run in the dense order, row by row.
+pub(crate) fn chol_blocks<T: PkNum>(a: &[Vec<T>], blk: &RBlocks) -> Option<Vec<Vec<T>>> {
+    let n = a.len();
+    debug_assert_eq!(blk.len(), n);
+    let mut l: Vec<Vec<T>> = vec![vec![T::from_f64(0.0); n]; n];
+    for j in 0..n {
+        let rows = blk.rows(j);
+        let before = rows.partition_point(|&k| k < j);
+        let mut d = a[j][j];
+        for &k in &rows[..before] {
+            d = d - l[j][k] * l[j][k];
+        }
+        if !d.br_cmp_c(BranchCmp::Gt, 0.0) {
+            return None;
+        }
+        let ljj = d.sqrt();
+        l[j][j] = ljj;
+        for &i in &rows[before + 1..] {
+            let mut s = a[i][j];
+            for &k in &rows[..before] {
+                s = s - l[i][k] * l[j][k];
+            }
+            l[i][j] = s / ljj;
+        }
+    }
+    Some(l)
+}
+
+/// [`chol_solve`] with `l` from [`chol_blocks`]: each row's substitution reads its own block.
+pub(crate) fn chol_solve_blocks<T: PkNum>(l: &[Vec<T>], b: &[T], blk: &RBlocks) -> Vec<T> {
+    let n = l.len();
+    let mut y = b.to_vec();
+    for i in 0..n {
+        let rows = blk.rows(i);
+        let mut s = y[i];
+        for &k in &rows[..rows.partition_point(|&k| k < i)] {
+            s = s - l[i][k] * y[k];
+        }
+        y[i] = s / l[i][i];
+    }
+    for i in (0..n).rev() {
+        let rows = blk.rows(i);
+        let mut s = y[i];
+        for &k in &rows[rows.partition_point(|&k| k <= i)..] {
+            s = s - l[k][i] * y[k];
+        }
+        y[i] = s / l[i][i];
+    }
+    y
+}
+
+/// [`chol_solve_blocks`] of a `b` that is zero outside one block, `rows` (ascending): the
+/// solution is zero outside it too, so only `rows` are substituted.
+fn chol_solve_within<T: PkNum>(l: &[Vec<T>], b: &[T], rows: &[usize]) -> Vec<T> {
+    let mut y = b.to_vec();
+    for (p, &i) in rows.iter().enumerate() {
+        let mut s = y[i];
+        for &k in &rows[..p] {
+            s = s - l[i][k] * y[k];
+        }
+        y[i] = s / l[i][i];
+    }
+    for (p, &i) in rows.iter().enumerate().rev() {
+        let mut s = y[i];
+        for &k in &rows[p + 1..] {
+            s = s - l[k][i] * y[k];
+        }
+        y[i] = s / l[i][i];
+    }
+    y
+}
+
 /// `A⁻¹b` from `A = LLᵀ`.
 pub(crate) fn chol_solve<T: PkNum>(l: &[Vec<T>], b: &[T]) -> Vec<T> {
     let n = l.len();
@@ -1462,6 +1599,74 @@ pub(crate) fn chol_solve<T: PkNum>(l: &[Vec<T>], b: &[T]) -> Vec<T> {
 mod tests {
     use super::*;
     use crate::sens::dual2::Dual2;
+
+    /// A symmetric positive-definite matrix with `group`'s block pattern: every entry inside a
+    /// block nonzero, every entry between two blocks the structural `0.0`.
+    fn block_spd(group: &[usize]) -> Vec<Vec<f64>> {
+        let n = group.len();
+        (0..n)
+            .map(|i| {
+                (0..n)
+                    .map(|j| match (i == j, group[i] == group[j]) {
+                        (true, _) => 2.0 + 0.37 * i as f64,
+                        (false, true) => 0.3 + 0.11 * (i + j) as f64 / n as f64,
+                        (false, false) => 0.0,
+                    })
+                    .collect()
+            })
+            .collect()
+    }
+
+    /// The blocked factorisation and solves (#3060) give the dense ones' bits, on blocks that
+    /// are not contiguous runs (interleaved, a singleton, a block of 3) — so moving the dense
+    /// path onto them changes no objective. And a matrix that is not positive definite in its
+    /// second block is refused, as the dense factorisation refuses it. Dies on: a row's
+    /// substitution reading only its contiguous neighbours, a back substitution reading the
+    /// rows before the pivot, a block's off-diagonal factor left zero, a solve within a block
+    /// that leaves rows of another block nonzero.
+    #[test]
+    fn blocked_cholesky_is_the_dense_one_bit_for_bit() {
+        let group = [0, 1, 0, 2, 1, 3, 2, 1, 0];
+        let n = group.len();
+        let a = block_spd(&group);
+        let blk = RBlocks::from_groups(&group);
+        let dense = chol(&a).expect("positive definite");
+        let blocked = chol_blocks(&a, &blk).expect("positive definite");
+        for i in 0..n {
+            for j in 0..n {
+                assert_eq!(blocked[i][j].to_bits(), dense[i][j].to_bits(), "L[{i}][{j}]");
+            }
+        }
+        assert!(blocked[4][1] != 0.0 && blocked[8][2] != 0.0, "the blocks' factors are filled");
+        let b: Vec<f64> = (0..n).map(|j| 1.0 - 0.3 * j as f64).collect();
+        let want = chol_solve(&dense, &b);
+        let got = chol_solve_blocks(&blocked, &b, &blk);
+        for j in 0..n {
+            assert_eq!(got[j].to_bits(), want[j].to_bits(), "R⁻¹b[{j}]");
+        }
+        // A right-hand side living in one block (column 7 of a matrix with R's pattern).
+        for col in 0..n {
+            let rows = blk.rows(col);
+            let bc: Vec<f64> =
+                (0..n).map(|i| if rows.contains(&i) { a[i][col] + 0.5 } else { 0.0 }).collect();
+            let want = chol_solve(&dense, &bc);
+            let got = chol_solve_within(&blocked, &bc, rows);
+            for j in 0..n {
+                assert_eq!(got[j].to_bits(), want[j].to_bits(), "column {col}, row {j}");
+            }
+        }
+        // Not positive definite inside block 1 (rows 1, 4, 7).
+        let mut bad = a.clone();
+        bad[4][1] = 10.0;
+        bad[1][4] = 10.0;
+        assert!(chol(&bad).is_none());
+        assert!(chol_blocks(&bad, &blk).is_none());
+        // One block of every row is the dense factorisation itself.
+        let full: Vec<Vec<f64>> =
+            (0..n).map(|i| (0..n).map(|j| if i == j { 4.0 } else { 0.1 }).collect()).collect();
+        let one = RBlocks::from_groups(&[0; 9]);
+        assert_eq!(chol_blocks(&full, &one), chol(&full));
+    }
 
     /// `from_chol_cached` returns exactly `from_chol`'s `Ω⁻¹` and `log|Ω|`, and says when it
     /// computed: on a miss, on a hit, after the factor changes (a stale entry would return the

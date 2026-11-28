@@ -1,17 +1,17 @@
 //! `ferx globalsearch` — global model search, GA or exhaustive (#1185).
 //!
 //! Thin by construction (#1114 A5): parse flags, load the `.ferxsearch`
-//! file, call [`ferx_tools::globalsearch::run_globalsearch`], print the
+//! file, call [`ferx_search::globalsearch::run_globalsearch`], print the
 //! model table, pick an exit code. Every decision about the grid, the
-//! fitness and the selection lives in `ferx-tools`.
+//! fitness and the selection lives in `ferx-search`.
 
 use std::path::PathBuf;
 
-use ferx_tools::globalsearch::{
+use ferx_search::globalsearch::{
     default_dir, render_summary, run_globalsearch, GlobalsearchEvent, GlobalsearchOptions,
     GlobalsearchRun,
 };
-use ferx_tools::search::SearchConfig;
+use ferx_search::search::SearchConfig;
 
 use crate::covsearch_cmd::{flag, parse_threads, scan_args, value};
 
@@ -180,8 +180,8 @@ fn run_globalsearch_command(args: &[String]) -> Result<i32, String> {
     }
     eprintln!(
         "Model table written to {}; final model to {}",
-        ferx_tools::globalsearch::models_path(&dir).display(),
-        ferx_tools::globalsearch::final_model_path(&dir).display()
+        ferx_search::globalsearch::models_path(&dir).display(),
+        ferx_search::globalsearch::final_model_path(&dir).display()
     );
     Ok(if result.cancelled { 130 } else { 0 })
 }

@@ -20,15 +20,15 @@ fn replicate(index: usize, estimates: Vec<f64>) -> ReplicateResult {
 
 #[test]
 fn percentile_matches_the_hand_computed_weighted_average() {
-    // The guide's formula, worked by hand on [1,2,3,4]:
-    //   n = 4+1 = 5
-    //   p = 0.50 -> n*p = 2.5 -> i=2, f=0.5 -> 0.5*x_2 + 0.5*x_3 = 2.5
-    //   p = 0.25 -> n*p = 1.25 -> i=1, f=0.25 -> 0.75*x_1 + 0.25*x_2 = 1.25
+    // The type-6 quantile, worked by hand on [1,2,3,4] (m = 4, h = (m+1)*p):
+    //   m+1 = 5
+    //   p = 0.50 -> h = 2.5 -> i=2, f=0.5 -> 0.5*x_2 + 0.5*x_3 = 2.5
+    //   p = 0.25 -> h = 1.25 -> i=1, f=0.25 -> 0.75*x_1 + 0.25*x_2 = 1.25
     let x = [1.0, 2.0, 3.0, 4.0];
     assert_eq!(percentile(&x, 50.0), Some(2.5));
     assert_eq!(percentile(&x, 25.0), Some(1.25));
     assert_eq!(percentile(&x, 75.0), Some(3.75));
-    // Landing exactly on an order statistic: n*p = 5*0.2 = 1.0, f = 0.
+    // Landing exactly on an order statistic: h = 5*0.2 = 1.0, f = 0.
     assert_eq!(percentile(&x, 20.0), Some(1.0));
     assert_eq!(percentile(&x, 80.0), Some(4.0));
 }
@@ -39,9 +39,9 @@ fn percentile_is_none_on_an_empty_sample() {
 }
 
 #[test]
-fn minimum_sample_sizes_are_exactly_the_ones_psn_documents() {
-    // The guide tabulates four thresholds. They are not four rules — they all
-    // fall out of "(n+1)p >= 1", i.e. there must be an order statistic at or
+fn minimum_sample_sizes_follow_the_type6_boundary() {
+    // Four thresholds, one rule: they all fall out of "(m+1)p >= 1" for a
+    // sample of size m, i.e. there must be an order statistic at or
     // below the requested quantile rather than an extrapolation past the
     // smallest observation. Pin all four, from both sides.
     for (interval, n_min) in
@@ -75,7 +75,7 @@ fn minimum_sample_sizes_are_exactly_the_ones_psn_documents() {
 
 #[test]
 fn at_the_threshold_the_interval_is_the_extreme_order_statistics() {
-    // n = 19, p = 0.05: n*p = 20*0.05 = 1 exactly, so the 5th percentile is the
+    // m = 19, p = 0.05: h = 20*0.05 = 1 exactly, so the 5th percentile is the
     // minimum and the 95th is the maximum — the widest the data can support.
     let x: Vec<f64> = (1..=19).map(|i| i as f64).collect();
     assert_eq!(percentile(&x, 5.0), Some(1.0));

@@ -15,8 +15,8 @@ anything**, and walks the task graph:
   which is how `reduced_stepwise` joins a group.
 
 The output is committed at
-crates/ferx-tools/tests/data/modelsearch_pharmpy_anchor.json and read by
-crates/ferx-tools/src/modelsearch/pharmpy_anchor.rs.
+crates/ferx-search/tests/data/modelsearch_pharmpy_anchor.json and read by
+crates/ferx-search/src/modelsearch/pharmpy_anchor.rs.
 """
 
 import json

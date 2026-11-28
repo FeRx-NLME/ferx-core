@@ -1,0 +1,55 @@
+{
+ "nonmem_version": "7.6.0",
+ "data_file": "unbound_reader.csv",
+ "data_records": 14,
+ "observations": 12,
+ "individuals": 2,
+ "nmtran_warnings": [2, 46],
+ "markers": [],
+ "steps": [
+  {
+   "method": "First Order Conditional Estimation with Interaction (Evaluation)",
+   "objv": 494.81,
+   "final": {
+    "theta": [5.0, 50.0, 1.5, 1.0],
+    "omega": {
+     "ETA1": [0.0]
+    },
+    "sigma": {
+     "EPS1": [0.01]
+    }
+   },
+   "markers": []
+  }
+ ],
+ "control_stream_as_run": [
+  "$PROBLEM ferx #1898 anchor B -- scale S2 = V*SCF, SCF an ordinary $PK variable no PK role uses",
+  "$INPUT ID TIME DV MDV EVID AMT CMT WT",
+  "$DATA unbound_reader.csv IGNORE=@",
+  "",
+  "$SUBROUTINE ADVAN2 TRANS2",
+  "",
+  "$PK",
+  "  CL = THETA(1)",
+  "  V  = THETA(2)",
+  "  KA = THETA(3)",
+  "  SCF = THETA(4)*WT/70 ; 0.857 (WT 60) / 1.143 (WT 80): read only by the scale",
+  "  S2 = V*SCF",
+  "",
+  "$ERROR",
+  "  IPRED = F",
+  "  Y = IPRED + EPS(1)   ; additive: IPRED(0) = 0 here (no init)",
+  "",
+  "$THETA",
+  "  (5.0 FIX)   ; CL",
+  "  (50.0 FIX)  ; V",
+  "  (1.5 FIX)   ; KA",
+  "  (1.0 FIX)   ; SCF at 70 kg",
+  "",
+  "$OMEGA 0 FIX",
+  "$SIGMA 0.01 FIX",
+  "",
+  "$ESTIMATION MAXEVAL=0 METHOD=1 INTER",
+  "$TABLE ID TIME WT IPRED NOPRINT ONEHEADER FILE=unbound_reader_scale.tab"
+ ]
+}

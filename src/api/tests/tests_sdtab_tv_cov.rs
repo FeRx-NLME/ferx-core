@@ -141,6 +141,7 @@ fn test_sdtab_ipred_honours_tv_covariates() {
         &kappas,
         true,
         None,
+        None,
         false,
     )
     .0;
@@ -251,6 +252,7 @@ fn test_sdtab_iwres_uses_block_sigma_correlation() {
         &h_matrices,
         &kappas,
         false,
+        None,
         None,
         false,
     )

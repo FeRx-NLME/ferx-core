@@ -6,6 +6,7 @@ use crate::sim::adaptive::{
     AdaptiveRoute, AdaptiveRule, Comparison, DecisionCovariates, DoseKnowledge, DoseStep,
     DoseValue, IntervalStep,
 };
+use crate::stats::residual_error::FOp;
 use crate::types::*;
 use regex::Regex;
 use std::collections::HashMap;
@@ -3999,7 +4000,7 @@ pub fn parse_full_model(content: &str) -> Result<ParsedModel, String> {
 /// NAME[COL, ...]` block supplied (#1064).
 ///
 /// A level block's level count is a property of the *data*, which the first
-/// parse has not seen — so `api::levels::bind` reads the population, discovers
+/// parse has not seen — so `levels::bind` reads the population, discovers
 /// the observed combinations, and calls this. Re-parsing (milliseconds) is what
 /// lets the compiled closures be built once, with the real θ count, instead of
 /// being rebuilt in place after the fact.
@@ -4085,7 +4086,9 @@ pub fn parse_full_model_with(
     let mut extracted = extract_blocks(content)?;
     // A deprecated block (`[initial_values]`) is a warning, not an error (#2913):
     // taken out here so it seeds `parse_warnings` when the model is built.
-    let deprecated_block_warnings = std::mem::take(&mut extracted.warnings);
+    let mut deprecated_block_warnings = std::mem::take(&mut extracted.warnings);
+    // `omega NAME ~ 0 FIX` placeholders are held at 0 and taken out of the model (#3150).
+    deprecated_block_warnings.extend(apply_zero_fix_etas(&mut extracted, level_bindings));
     // `ode_template NAME(...)` desugaring (#322 Phase 0b): if [structural_model]
     // uses `ode_template`, rewrite it (and the [odes]/[scaling] blocks) into the
     // hand-written `ode(...)` form *before* anything else looks at the blocks, so
@@ -5103,27 +5106,26 @@ pub fn parse_full_model_with(
     // `__ferx_ro_*` variables (#486/#1636), which would hide the block.
     // #1065: per θ block, the one plain column every read indexes it by.
     let mut read_index: Vec<(String, Option<String>)> = Vec::new();
+    let readout = match blocks.get("scaling") {
+        Some(lines) => readout_y_exprs(lines, &theta_names, &eta_names, &indiv_var_names)
+            .map_err(|e| retarget_scaling_diag(is_algebraic, e))?,
+        None => Vec::new(),
+    };
+    // #1649/#1650: the per-η couplings also follow the random effects into the
+    // states, which the share above does not.
+    let state_lines: Vec<&String> =
+        ["odes", "initial_conditions"].iter().filter_map(|b| blocks.get(*b)).flatten().collect();
+    let states = StateInputs::new(
+        &state_lines,
+        is_algebraic,
+        ode_spec.as_ref().map(|s| s.state_names.as_slice()),
+        pk_model,
+        &pk_param_map,
+        &indiv_var_names,
+    );
+    // #3210: turns the inner stall escape on by default.
+    let prediction_has_kink = prediction_has_kink(&indiv_stmts, &readout, &states);
     if !level_block_decls.is_empty() || vector_theta_decls.iter().any(|d| d.profiled) {
-        let readout = match blocks.get("scaling") {
-            Some(lines) => readout_y_exprs(lines, &theta_names, &eta_names, &indiv_var_names)
-                .map_err(|e| retarget_scaling_diag(is_algebraic, e))?,
-            None => Vec::new(),
-        };
-        // #1649/#1650: the per-η couplings also follow the random effects into the
-        // states, which the share above does not.
-        let state_lines: Vec<&String> = ["odes", "initial_conditions"]
-            .iter()
-            .filter_map(|b| blocks.get(*b))
-            .flatten()
-            .collect();
-        let states = StateInputs::new(
-            &state_lines,
-            is_algebraic,
-            ode_spec.as_ref().map(|s| s.state_names.as_slice()),
-            pk_model,
-            &pk_param_map,
-            &indiv_var_names,
-        );
         let mut readout_with_states = states.readout(&readout, blocks.contains_key("scaling"));
         // #2562: a `[binary_model]` predictor is a prediction too. It reads no state,
         // so it joins both readout lists as written.
@@ -5382,11 +5384,15 @@ pub fn parse_full_model_with(
     // validate the magnitude expressions).
     let single_error_args: Option<(ErrorModel, Vec<String>, Option<String>)> =
         match &parsed_error_model {
-            ParsedErrorModel::Single(em, args, exponent) => {
+            ParsedErrorModel::Single(em, args, exponent, _) => {
                 Some((*em, args.clone(), exponent.clone()))
             }
             ParsedErrorModel::PerCmt(_) | ParsedErrorModel::Selected { .. } => None,
         };
+    let error_weight: Option<String> = match &parsed_error_model {
+        ParsedErrorModel::Single(.., w) => w.clone(),
+        _ => None,
+    };
     let endpoint_error_args = endpoint_magnitude_args(&parsed_error_model);
     // Covariates the #658 error selector references become required data columns
     // (validated as E_MISSING_COVARIATE at fit setup). Capture before
@@ -5850,6 +5856,7 @@ pub fn parse_full_model_with(
         gradient_method: GradientMethod::default(),
         parse_warnings: deprecated_block_warnings, // more pushed below
         has_conditional_eta_params: false,
+        prediction_has_kink,
         eta_param_info,
         kappa_param_types,
         theta_transform,
@@ -6198,7 +6205,7 @@ pub fn parse_full_model_with(
     }
 
     // #1064: the columns a level block indexes on are read from the data
-    // by `api::levels::bind_theta_levels`, so they must be in the CSV read set
+    // by `levels::bind_theta_levels`, so they must be in the CSV read set
     // for the same reason as the mixing covariates above — otherwise a
     // `[covariates]`-declared model never loads `STUDY` and every row lands in
     // one level. `TIME` is the record time, not a covariate.
@@ -6766,6 +6773,9 @@ pub fn parse_full_model_with(
             &ruv_eta_names,
             &covariate_decls,
             &indiv_stmts,
+            error_weight.as_deref(),
+            ltbs_flags.log_transform,
+            &prediction_side_names(&blocks),
         )?;
         model.ruv_magnitude = rm;
         // A covariate that appears *only* in a magnitude / `weight =` expression
@@ -11021,7 +11031,7 @@ fn parse_adaptive_dosing_block(
                 start_interval = Some(d);
             }
             "target_window" => {
-                // Therapeutic band `[low, high]` for the `pct_time_in_window` metric
+                // Therapeutic band `[low, high]` for the `pct_readings_in_window` metric
                 // only — it does not affect dosing. `low` must be finite; `high` may
                 // be `inf` for a one-sided "at or above low" target. The same check
                 // runs in `AdaptiveDosingSpec::validate`.
@@ -11099,6 +11109,9 @@ fn parse_adaptive_dosing_block(
         auc_target,
         rules,
     };
+    if spec.rules.is_empty() {
+        return Err(crate::sim::adaptive::NO_RULES.to_string());
+    }
     spec.validate()?;
     if let (Some(step), Some(ladder)) = (at_step, &spec.intervals) {
         check_intervals_on_every_grid(ladder, step)?;
@@ -12009,6 +12022,7 @@ pub fn apply_fit_option(opts: &mut FitOptions, key: &str, value: &str) -> Result
         "inner_maxiter" => opts.inner_maxiter = parse_usize("inner_maxiter")?,
         "inner_tol" => opts.inner_tol = parse_f64("inner_tol")?,
         "inner_restarts" => opts.inner_restarts = parse_usize("inner_restarts")?,
+        "inner_kick" => opts.inner_kick = parse_bool("inner_kick")?,
         "inner_screen" => opts.inner_screen = parse_usize("inner_screen")?,
         "inner_twin_seed" => opts.inner_twin_seed = parse_bool("inner_twin_seed")?,
         // Validated like its covariance-step sibling `fd_hessian_step`, not like
@@ -12040,6 +12054,7 @@ pub fn apply_fit_option(opts: &mut FitOptions, key: &str, value: &str) -> Result
             };
         }
         "ode_auto_switch" => opts.ode_auto_switch = parse_bool("ode_auto_switch")?,
+        "ode_ofv_check" => opts.ode_ofv_check = parse_bool("ode_ofv_check")?,
         "ode_method" => {
             opts.ode_method = crate::ode::OdeMethod::parse(value).ok_or_else(|| {
                 format!(
@@ -18436,6 +18451,137 @@ pub(crate) fn mixing_logp_grad(
     out
 }
 
+#[cfg(test)]
+thread_local! {
+    static KEEP_ZERO_FIX_ETAS: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Test-only: while alive on this thread, [`apply_zero_fix_etas`] drops nothing, so a test of
+/// the machinery that carries a `0 FIX` η through Ω (simulation's exact zero, the packed
+/// layout) still has one to carry. Such an η survives in a model when it is read by
+/// `iiv_on_ruv` or an endpoint block, and in every Ω built from a bare matrix.
+#[cfg(test)]
+pub(crate) struct KeepZeroFixEtas(bool);
+
+#[cfg(test)]
+impl KeepZeroFixEtas {
+    pub(crate) fn on() -> Self {
+        Self(KEEP_ZERO_FIX_ETAS.with(|k| k.replace(true)))
+    }
+    fn is_on() -> bool {
+        KEEP_ZERO_FIX_ETAS.with(std::cell::Cell::get)
+    }
+}
+
+#[cfg(test)]
+impl Drop for KeepZeroFixEtas {
+    fn drop(&mut self) {
+        KEEP_ZERO_FIX_ETAS.with(|k| k.set(self.0));
+    }
+}
+
+/// Blocks whose lines are expressions an η may appear in as a plain value. A placeholder η that
+/// is mentioned anywhere else (`iiv_on_ruv = NAME` in `[error_model]`, a `[mixture]` override, an
+/// endpoint block, `frem_predictions`) keeps its declaration: those read the η by name or by
+/// position, which dropping it would move.
+const ZERO_ETA_EXPRESSION_BLOCKS: [&str; 4] =
+    ["individual_parameters", "odes", "scaling", "derived"];
+
+/// Design A2 of #3150: an `omega NAME ~ 0 FIX` η (or every name of an all-zero `FIX`
+/// `block_omega`) is held at 0, as NONMEM holds `$OMEGA 0 FIX`, so it is taken out of the model
+/// instead of being carried through every subject's inner problem at variance `1e-8`.
+///
+/// A text pass on the extracted blocks, run before anything reads them: the declaration is
+/// removed, a term `+ NAME`, `- NAME`, `NAME +` or `-NAME +` is deleted from the sum it is in,
+/// and a `NAME` left anywhere else reads as `0` (`NAME * k`, `exp(NAME)`: the same value, though
+/// a pattern the fit reads from the text, such as mu-referencing, can then differ). For the
+/// deleted spellings the model that results is the one written without the placeholder.
+///
+/// A placeholder goes only if its declaration is its single mention in `[parameters]` and its
+/// other mentions all sit in [`ZERO_ETA_EXPRESSION_BLOCKS`]; a block goes whole or not at all.
+/// A `kappa NAME ~ 0 FIX` is not an `omega` and stays. Nothing goes when it would leave no η
+/// (SAEM, IMP, IMPMAP and Bayes refuse a model with none). Returns the one
+/// `W_ZERO_FIX_ETA_DROPPED` note, or nothing.
+fn apply_zero_fix_etas(
+    extracted: &mut ExtractedBlocks, level_bindings: &LevelBindings,
+) -> Vec<String> {
+    #[cfg(test)]
+    if KeepZeroFixEtas::is_on() {
+        return Vec::new();
+    }
+    let Some(lines) = extracted.unnamed.get("parameters") else { return Vec::new() };
+    // The common model has no fixed omega: no second parse, no regex.
+    let fixed_omega = |l: &String| {
+        let l = l.to_ascii_lowercase();
+        l.contains("omega") && l.contains("fix")
+    };
+    if !lines.iter().any(fixed_omega) {
+        return Vec::new();
+    }
+    let Ok((_, omegas, blocks, ..)) = parse_parameters(lines, level_bindings) else {
+        return Vec::new();
+    };
+    // A mention in any case keeps the placeholder. η names bind case-sensitively, so a differently
+    // cased mention reads as a covariate; matching it anyway only ever keeps more, never drops.
+    let word = |n: &str| Regex::new(&format!(r"(?i)\b{}\b", regex::escape(n))).unwrap();
+    let decl = Regex::new(r"(?i)^\s*(omega|block_omega)\b").unwrap();
+    let goes = |name: &String| {
+        let w = word(name);
+        let mut own = lines.iter().filter(|l| w.is_match(l));
+        let declared_once = own.next().is_some_and(|l| decl.is_match(l)) && own.next().is_none();
+        let elsewhere = |(ty, ls): (&String, &Vec<String>)| {
+            ZERO_ETA_EXPRESSION_BLOCKS.contains(&ty.as_str()) || !ls.iter().any(|l| w.is_match(l))
+        };
+        declared_once
+            && extracted.unnamed.iter().filter(|(ty, _)| *ty != "parameters").all(elsewhere)
+            && !extracted.named.values().flat_map(|m| m.values().flatten()).any(|l| w.is_match(l))
+    };
+    // Groups that go together: each zero diagonal alone, each all-zero `FIX` block whole.
+    let groups =
+        omegas.iter().filter(|o| o.fixed && o.variance == 0.0).map(|o| vec![o.name.clone()]).chain(
+            blocks
+                .iter()
+                .filter(|b| b.fixed && b.lower_triangle.iter().all(|&v| v == 0.0))
+                .map(|b| b.names.clone()),
+        );
+    let dropped: Vec<String> = groups.filter(|g| g.iter().all(goes)).flatten().collect();
+    let declared = omegas.len() + blocks.iter().map(|b| b.names.len()).sum::<usize>();
+    if dropped.is_empty() || dropped.len() >= declared {
+        return Vec::new();
+    }
+    let alt = dropped.iter().map(|n| regex::escape(n)).collect::<Vec<_>>().join("|");
+    let any_name = Regex::new(&format!(r"\b({alt})\b")).unwrap();
+    if let Some(ls) = extracted.unnamed.get_mut("parameters") {
+        ls.retain(|l| !(decl.is_match(l) && any_name.is_match(l)));
+    }
+    // A whole additive term goes: `x + NAME` and `x - NAME` before a closing `)`, `,`, `+`, `-`
+    // or the line's end (never `x + NAME * y`), and `NAME +` as the first term of a sum. What
+    // is left of the name (`NAME * y`, `exp(-NAME)`) reads as 0.
+    let trailing = Regex::new(&format!(r"([\w)])\s*[+-]\s*\b({alt})\b(\s*[)+,-]|\s*$)")).unwrap();
+    let leading = Regex::new(&format!(r"(^|[(,=])\s*-?\s*\b({alt})\b\s*\+\s*")).unwrap();
+    for ty in ZERO_ETA_EXPRESSION_BLOCKS {
+        for l in extracted.unnamed.get_mut(ty).into_iter().flatten() {
+            let mut text = l.clone();
+            loop {
+                let next = trailing.replace_all(&text, "$1$3").into_owned();
+                let next = leading.replace_all(&next, "$1").into_owned();
+                if next == text {
+                    break;
+                }
+                text = next;
+            }
+            *l = any_name.replace_all(&text, "0").into_owned();
+        }
+    }
+    vec![format!(
+        "{ZERO_FIX_ETA_TOKEN}: omega {} ~ 0 FIX {} held at 0 and removed from the model, as \
+         NONMEM holds `$OMEGA 0 FIX`: no row in Ω, the EBEs or the shrinkage tables, and a \
+         supplied Ω or per-subject η sized for the declared shape is refused (#3150).",
+        dropped.join(", "),
+        if dropped.len() == 1 { "is" } else { "are" },
+    )]
+}
+
 fn parse_parameters(
     lines: &[String], level_bindings: &LevelBindings,
 ) -> Result<
@@ -20038,8 +20184,9 @@ enum ParsedErrorModel {
     /// positionally from the global sigma vector). The third field is the
     /// exponent expression of a `power(SIGMA, P)` statement (#1182) — `None`
     /// for every other form — which `build_ruv_magnitude` compiles onto the
-    /// proportional slot.
-    Single(ErrorModel, Vec<String>, Option<String>),
+    /// proportional slot. The fourth is the `weight =` text (#1029), already folded into
+    /// its slot's argument and kept so a refusal can name what the user wrote.
+    Single(ErrorModel, Vec<String>, Option<String>, Option<String>),
     /// Per-CMT error models (every line prefixed `CMT=N:`). One entry per line,
     /// in source order; duplicates are rejected here.
     PerCmt(Vec<(usize, ErrorModel, Vec<String>)>),
@@ -20946,7 +21093,9 @@ fn parse_error_model_inner(
 
     // singles carry the per-line LTBS flags so the chosen single can stamp them,
     // and the `power(...)` exponent expression when the line is that form.
-    let mut singles: Vec<(ErrorModel, Vec<String>, LtbsFlags, Option<String>)> = Vec::new();
+    #[allow(clippy::type_complexity)]
+    let mut singles: Vec<(ErrorModel, Vec<String>, LtbsFlags, Option<String>, Option<String>)> =
+        Vec::new();
     let mut per_cmt: Vec<(usize, ErrorModel, Vec<String>)> = Vec::new();
     // Each per-CMT line's LTBS flags (#2729): the log transform is model-wide, so the
     // lines must agree, which is checked once they are all read.
@@ -21169,7 +21318,7 @@ fn parse_error_model_inner(
                 per_cmt.push((cmt, error_model, sigma_names));
                 per_cmt_flags.push((cmt, flags));
             }
-            None => singles.push((error_model, sigma_names, flags, exponent)),
+            None => singles.push((error_model, sigma_names, flags, exponent, weight_expr)),
         }
     }
 
@@ -21234,8 +21383,8 @@ fn parse_error_model_inner(
     }
 
     match singles.into_iter().next() {
-        Some((model, names, flags, exponent)) => {
-            Ok((ParsedErrorModel::Single(model, names, exponent), flags, iiv_on_ruv))
+        Some((model, names, flags, exponent, weight)) => {
+            Ok((ParsedErrorModel::Single(model, names, exponent, weight), flags, iiv_on_ruv))
         }
         None => Err("No error model found in [error_model] block".to_string()),
     }
@@ -21255,7 +21404,7 @@ fn build_error_spec(
     is_algebraic: bool,
 ) -> Result<(ErrorModel, ErrorSpec), String> {
     match parsed {
-        ParsedErrorModel::Single(model, args, _exponent) => {
+        ParsedErrorModel::Single(model, args, _exponent, _) => {
             // Single-endpoint sigmas are consumed positionally from the global sigma vector:
             // `ErrorSpec::Single` carries no indices, so every consumer (`sigma_loadings`,
             // `residual_variance`, `sigma_types`, the #484 magnitude multipliers, …) reads the *leading*
@@ -21704,11 +21853,15 @@ fn resolve_ruv_indiv_names(
 /// `sigma_name` is `None` for a `power(...)` exponent (#1182), which scales no
 /// sigma and may name none — the variance must stay a quadratic form in σ so
 /// the σ-gradient's `2·R` shortcut and the `(sd)` reporting stay exact.
+///
+/// `what` names the construct as the user wrote it (`residual-magnitude expression`,
+/// `` `weight =` expression ``, `power exponent`). `prediction_names` are the names the
+/// prediction side assigns (`[structural_model]`, `[odes]`, `[scaling]`), refused with
+/// their own message rather than called undeclared covariates (#3121).
 fn validate_ruv_expr(
     expr: &Expression, sigma_name: Option<&str>, allowed_covs: Option<&[String]>,
+    prediction_names: &[String], what: &str,
 ) -> Result<(), String> {
-    let what =
-        if sigma_name.is_some() { "residual-magnitude expression" } else { "power exponent" };
     let mut err: Option<String> = None;
     visit_expr_nodes(expr, &mut |e: &Expression| {
         if err.is_some() {
@@ -21769,10 +21922,36 @@ fn validate_ruv_expr(
             Expression::Covariate(name) => {
                 let upper = name.to_uppercase();
                 if RUV_FORBIDDEN_NAMES.contains(&upper.as_str()) {
+                    // `IPRED` is readable in a residual-magnitude expression (#3121); it
+                    // reaches here only from a `weight =` or a power exponent.
+                    let hint = match (upper.as_str(), what.contains("weight")) {
+                        ("IPRED", true) => {
+                            ". A weight is a property of the datum; to make the residual SD a \
+                             function of the prediction, write it in the magnitude: \
+                             `additive(SIGMA * h(IPRED))`"
+                        }
+                        ("IPRED", false) => {
+                            ". `IPRED` may be read in a residual-magnitude expression: \
+                             `additive(SIGMA * h(IPRED))`"
+                        }
+                        _ => "",
+                    };
+                    // The list is what *this* construct may read: `IPRED` only in a
+                    // magnitude, the sigma only where one is scaled (#3125 review 4).
+                    let ipred = if what == RUV_MAG_LABEL { "IPRED, " } else { "" };
+                    let sigma = if sigma_name.is_some() { " and the sigma" } else { "" };
                     err = Some(format!(
-                        "{what} may not reference `{}` (only TIME, TAD, covariates, thetas, and \
-                         the sigma are allowed)",
-                        name
+                        "{what} may not reference `{name}` (only TIME, TAD, {ipred}covariates, \
+                         thetas{}η-free [individual_parameters] names{sigma} are allowed){hint}",
+                        if sigma.is_empty() { " and " } else { ", " }
+                    ));
+                } else if prediction_names.iter().any(|p| p == name) {
+                    err = Some(format!(
+                        "{what} references `{name}`, which the model computes on the prediction \
+                         side ([structural_model] / [scaling] / [odes]), so it cannot be read \
+                         here. A residual-magnitude expression reads the model's prediction as \
+                         `IPRED`; an intermediate or a state other than the prediction is not \
+                         readable"
                     ));
                 } else if !name.eq_ignore_ascii_case("TIME")
                     && !is_declared_level_index_column(name)
@@ -21901,6 +22080,127 @@ fn at_error_endpoint(label: &str, err: String) -> String {
     err.replacen("[error_model]", &format!("[error_model] {label}"), 1)
 }
 
+/// The names the prediction side assigns — `NAME = …` in `[structural_model]` and
+/// `[scaling]` (also an indexed readout `NAME[CMT=1] = …`), `d/dt(NAME)` in `[odes]` — so a
+/// residual magnitude reading one is told it is a prediction-side name rather than an
+/// undeclared covariate (#3121).
+fn prediction_side_names(blocks: &HashMap<String, Vec<String>>) -> Vec<String> {
+    static ASSIGN_RE: LazyLock<Regex> = LazyLock::new(|| {
+        Regex::new(r"^\s*(?:d/dt\(\s*)?([A-Za-z_]\w*)\s*(?:\[[^\]]*\]\s*)?\)?\s*=").unwrap()
+    });
+    ["structural_model", "scaling", "odes"]
+        .iter()
+        .filter_map(|b| blocks.get(*b))
+        .flatten()
+        .filter_map(|l| ASSIGN_RE.captures(l).map(|c| c[1].to_string()))
+        .collect()
+}
+
+/// How a scope error names a residual-magnitude expression.
+const RUV_MAG_LABEL: &str = "residual-magnitude expression";
+
+/// What `build_ruv_magnitude`'s compiler returns: the postfix program over `f` when the
+/// magnitude reads `IPRED` (#3121), and the lowered parts (its `Push` operands in order, or
+/// the one whole expression).
+type RuvParts = (Option<Vec<FOp>>, Vec<(RuvMagFn, RuvMagDerivProgram)>);
+
+/// Place a compiled slot: a plain magnitude as the slot's `(multiplier, θ-program)`, or a
+/// prediction-reading one into `preds[slot]` (grown to fit), its multiplier then `1`.
+fn place_ruv_parts(
+    (ops, parts): RuvParts, slot: usize, preds: &mut Vec<Option<PredMagnitude>>,
+) -> (Option<RuvMagFn>, Option<RuvMagDerivProgram>) {
+    match ops {
+        None => {
+            let (f, d) = parts.into_iter().next().expect("a plain magnitude is one part");
+            (Some(f), Some(d))
+        }
+        Some(ops) => {
+            if preds.len() <= slot {
+                preds.resize_with(slot + 1, || None);
+            }
+            let (leaves, leaf_derivs) = parts.into_iter().unzip();
+            preds[slot] = Some(PredMagnitude { ops, leaves, leaf_derivs });
+            (None, None)
+        }
+    }
+}
+
+/// Whether `e` reads the prediction `IPRED`.
+fn reads_ipred(e: &Expression) -> bool {
+    let mut hit = false;
+    visit_expr_nodes(e, &mut |n| {
+        hit |= matches!(n, Expression::Covariate(c) if c.eq_ignore_ascii_case("IPRED"));
+    });
+    hit
+}
+
+/// Lower a magnitude that reads `IPRED` (#3121) to a postfix program over `f` (`ops`) and
+/// its maximal prediction-free subtrees (`leaves`, one per `Push`, in order). `IPRED` is
+/// the natural-scale prediction, so under LTBS (`f` its log) it reads `exp(f)`.
+fn split_ipred(
+    e: &Expression, ltbs: bool, ops: &mut Vec<FOp>, leaves: &mut Vec<Expression>,
+) -> Result<(), String> {
+    split_ipred_node(e, ltbs, ops, leaves)?;
+    let mut depth = 0i32;
+    for op in ops.iter() {
+        depth += op.stack_effect();
+        if depth as usize > crate::stats::residual_error::FMAG_MAX_STACK {
+            return Err("the expression around `IPRED` nests too deeply".to_string());
+        }
+    }
+    Ok(())
+}
+
+fn split_ipred_node(
+    e: &Expression, ltbs: bool, ops: &mut Vec<FOp>, leaves: &mut Vec<Expression>,
+) -> Result<(), String> {
+    if !reads_ipred(e) {
+        ops.push(FOp::Push);
+        leaves.push(e.clone());
+        return Ok(());
+    }
+    let (args, op): (Vec<&Expression>, FOp) = match e {
+        Expression::Covariate(_) => (vec![], if ltbs { FOp::ExpF } else { FOp::F }),
+        Expression::BinOp(l, op, r) => (
+            vec![l, r],
+            match op {
+                BinOp::Add => FOp::Add,
+                BinOp::Sub => FOp::Sub,
+                BinOp::Mul => FOp::Mul,
+                BinOp::Div => FOp::Div,
+                BinOp::Mod => return Err(ipred_unsupported("`%`")),
+            },
+        ),
+        Expression::Power(b, x) => (vec![b, x], FOp::Pow),
+        Expression::UnaryFn(name, a) => (
+            vec![a],
+            match name.as_str() {
+                "exp" => FOp::Exp,
+                "log" | "ln" => FOp::Ln,
+                "sqrt" => FOp::Sqrt,
+                "abs" => FOp::Abs,
+                "inv_logit" | "expit" => FOp::InvLogit,
+                _ => return Err(ipred_unsupported(&format!("`{name}(...)`"))),
+            },
+        ),
+        // `min` / `max` desugar to a conditional, so name all three (#3125 review 3).
+        Expression::Conditional(..) => return Err(ipred_unsupported("an `if`, `min` or `max`")),
+        _ => return Err(ipred_unsupported("this construct")),
+    };
+    for a in args {
+        split_ipred_node(a, ltbs, ops, leaves)?;
+    }
+    ops.push(op);
+    Ok(())
+}
+
+fn ipred_unsupported(what: &str) -> String {
+    format!(
+        "{what} cannot take `IPRED`: a residual magnitude combines the prediction with \
+         `+ - * / ^`, `exp`, `log`, `sqrt`, `abs` and `inv_logit` only"
+    )
+}
+
 /// Build the custom residual-error magnitude (#484) from the `[error_model]`
 /// arguments, once covariate names are known: `single_error_args` for a plain
 /// statement, `endpoint_args` for a `CMT=N:` or `if/else` block (#2731). Returns
@@ -21918,6 +22218,7 @@ fn build_ruv_magnitude(
     single_error_args: &Option<(ErrorModel, Vec<String>, Option<String>)>,
     endpoint_args: &[EndpointMagnitudeArgs], sigma_names: &[String], theta_names: &[String],
     eta_names: &[String], covariate_decls: &Option<Vec<CovariateDecl>>, indiv_stmts: &[Statement],
+    weight: Option<&str>, ltbs: bool, prediction_names: &[String],
 ) -> Result<(Option<RuvMagnitude>, std::collections::HashSet<usize>, Vec<String>), String> {
     let mut used_thetas = std::collections::HashSet::new();
     let mut used_covs: std::collections::HashSet<String> = std::collections::HashSet::new();
@@ -21936,10 +22237,16 @@ fn build_ruv_magnitude(
     // `MACHEPS`. Returns the AST, its `Dual2` θ-program and the runtime closure.
     // Indexes the block only; a name is judged and expanded when a magnitude reads it.
     let indiv_scope = RuvIndivScope::new(indiv_stmts);
+    // `what` prefixes a parse error, `label` names the construct in a scope error, and
+    // `allow_ipred` admits the prediction (#3121): the magnitude then splits into a
+    // postfix program over `f` (`Some(ops)`) and its prediction-free parts, each lowered
+    // like any magnitude; otherwise the one part is the whole expression.
     let mut compile = |src: &str,
                        sigma_name: Option<&str>,
-                       what: &str|
-     -> Result<(RuvMagFn, RuvMagDerivProgram), String> {
+                       what: &str,
+                       label: &str,
+                       allow_ipred: bool|
+     -> Result<RuvParts, String> {
         // The scaled sigma resolves to a `Variable` (bound to 1.0 at eval);
         // unknown identifiers fall back to model covariates. TIME/time parse
         // as event-time built-ins. `MACHEPS`/`macheps`/`TAD`/`tad` must resolve
@@ -21968,9 +22275,7 @@ fn build_ruv_magnitude(
         // A name assigned in [individual_parameters] reads its value, as in every
         // other block (#2915). Substituted before validation, so the definition
         // is held to the same θ / covariate / TIME / TAD rule as inline text.
-        let what_long =
-            if sigma_name.is_some() { "residual-magnitude expression" } else { "power exponent" };
-        let inlined = resolve_ruv_indiv_names(&mut expr, &indiv_scope, theta_names, what_long)?;
+        let inlined = resolve_ruv_indiv_names(&mut expr, &indiv_scope, theta_names, label)?;
         if !inlined.is_empty() {
             // The parse recorded gather sites against the names as written; the
             // substituted tree may read other columns, or a literal (review 2).
@@ -21978,48 +22283,83 @@ fn build_ruv_magnitude(
             renormalize_rewritten_gathers(&mut expr)
                 .map_err(|e| format!("[error_model] {what} `{}`: {}", src, e))?;
         }
-        validate_ruv_expr(&expr, sigma_name, allowed_covs.as_deref()).map_err(|e| {
-            if inlined.is_empty() {
-                e
-            } else {
-                let names: Vec<String> = inlined.iter().map(|n| format!("`{n}`")).collect();
-                format!(
-                    "{e} (after substituting the [individual_parameters] definition of {})",
-                    names.join(", ")
-                )
-            }
-        })?;
-        // `note_theta_eta` counts a gather as every θ of its block (#1638): a
-        // magnitude reading `ERRSCALE[STUDY]` is θ-dependent, so GN must take its
-        // magnitude-aware fallback, and the levels are not "unreferenced". η is
-        // already refused by `validate_ruv_expr`, so `etas` stays empty.
-        let mut etas = std::collections::HashSet::new();
-        visit_expr_nodes(&expr, &mut |e: &Expression| {
-            note_theta_eta(e, &mut used_thetas, &mut etas);
-            if matches!(e, Expression::Variable(name) if name.eq_ignore_ascii_case("TAD")) {
-                uses_tad = true;
-            }
-        });
-        collect_covariates(&expr, &mut used_covs);
-        let deriv = compile_ruv_mag_deriv_program(&expr, sigma_name, theta_names.len());
-        let sig = sigma_name.map(|s| s.to_string());
-        let f: RuvMagFn = Box::new(move |theta, obs_cov, time, tad| {
-            let mut vars: HashMap<String, f64> = HashMap::new();
-            if let Some(s) = &sig {
-                vars.insert(s.clone(), 1.0);
-            }
-            vars.insert("TAD".to_string(), tad);
-            vars.insert("tad".to_string(), tad);
-            // Preserve the legacy covariate-map injection for any pre-built
-            // expression that still treats TIME as a covariate; parsed models
-            // now use the event-time built-in via `with_model_time`.
-            let mut cov = obs_cov.clone();
-            cov.insert("TIME".to_string(), time);
-            cov.insert("time".to_string(), time);
-            with_model_time(time, || eval_expression(&expr, theta, &[], &cov, &vars, &[]))
-        });
-        Ok((f, deriv))
+        let reads_pred = allow_ipred && reads_ipred(&expr);
+        // A declared `IPRED` column would be read as the prediction here and as the
+        // column everywhere else: two meanings with no message, refused as `TAD` is
+        // (#3125 review 1).
+        let declared = allowed_covs.iter().flatten().find(|c| c.eq_ignore_ascii_case("IPRED"));
+        if let Some(col) = declared.filter(|_| reads_pred) {
+            return Err(format!(
+                "[error_model] {label} `{src}` references `IPRED`, which here is the model's \
+                 individual prediction, but a covariate named `{col}` is also declared in \
+                 [covariates] and the rest of the model reads that column. To read the column, \
+                 rename it (in the data and in [covariates]); to read the prediction, drop \
+                 `{col}` from [covariates]"
+            ));
+        }
+        let (ops, parts) = if reads_pred {
+            let (mut ops, mut leaves) = (Vec::new(), Vec::new());
+            split_ipred(&expr, ltbs, &mut ops, &mut leaves)
+                .map_err(|e| format!("[error_model] {label} `{src}`: {e}"))?;
+            (Some(ops), leaves)
+        } else {
+            (None, vec![expr])
+        };
+        let mut lowered = Vec::with_capacity(parts.len());
+        for expr in parts {
+            validate_ruv_expr(&expr, sigma_name, allowed_covs.as_deref(), prediction_names, label)
+                .map_err(|e| {
+                    if inlined.is_empty() {
+                        e
+                    } else {
+                        let names: Vec<String> = inlined.iter().map(|n| format!("`{n}`")).collect();
+                        format!(
+                            "{e} (after substituting the [individual_parameters] definition of {})",
+                            names.join(", ")
+                        )
+                    }
+                })?;
+            // `note_theta_eta` counts a gather as every θ of its block (#1638): a
+            // magnitude reading `ERRSCALE[STUDY]` is θ-dependent, so GN must take its
+            // magnitude-aware fallback, and the levels are not "unreferenced". η is
+            // already refused by `validate_ruv_expr`, so `etas` stays empty.
+            let mut etas = std::collections::HashSet::new();
+            visit_expr_nodes(&expr, &mut |e: &Expression| {
+                note_theta_eta(e, &mut used_thetas, &mut etas);
+                if matches!(e, Expression::Variable(name) if name.eq_ignore_ascii_case("TAD")) {
+                    uses_tad = true;
+                }
+            });
+            collect_covariates(&expr, &mut used_covs);
+            let deriv = compile_ruv_mag_deriv_program(&expr, sigma_name, theta_names.len());
+            let sig = sigma_name.map(|s| s.to_string());
+            let f: RuvMagFn = Box::new(move |theta, obs_cov, time, tad| {
+                let mut vars: HashMap<String, f64> = HashMap::new();
+                if let Some(s) = &sig {
+                    vars.insert(s.clone(), 1.0);
+                }
+                vars.insert("TAD".to_string(), tad);
+                vars.insert("tad".to_string(), tad);
+                // Preserve the legacy covariate-map injection for any pre-built
+                // expression that still treats TIME as a covariate; parsed models
+                // now use the event-time built-in via `with_model_time`.
+                let mut cov = obs_cov.clone();
+                cov.insert("TIME".to_string(), time);
+                cov.insert("time".to_string(), time);
+                with_model_time(time, || eval_expression(&expr, theta, &[], &cov, &vars, &[]))
+            });
+            lowered.push((f, deriv));
+        }
+        Ok((ops, lowered))
     };
+    // `weight =` is a property of the datum (#1029): validated on its own text first, so
+    // a refusal names what the user wrote rather than the magnitude it desugars into.
+    if let (Some(w), Some((em, args, _))) = (weight, single_error_args) {
+        let slot = usize::from(!matches!(em, ErrorModel::Additive));
+        let sigma = args.get(slot).and_then(|a| arg_sigma_name(a, sigma_names).ok());
+        compile(w, sigma.as_deref(), "`weight =`", "`weight =` expression", false)?;
+    }
+    let mut per_sigma_pred: Vec<Option<PredMagnitude>> = Vec::new();
 
     let mut per_sigma: Vec<Option<RuvMagFn>> = Vec::with_capacity(args.len());
     let mut per_sigma_deriv: Vec<Option<RuvMagDerivProgram>> = Vec::with_capacity(args.len());
@@ -22033,9 +22373,11 @@ fn build_ruv_magnitude(
             continue;
         }
         any = true;
-        let (f, deriv) = compile(trimmed, Some(&sigma_name), "magnitude")?;
-        per_sigma.push(Some(f));
-        per_sigma_deriv.push(Some(deriv));
+        let k = per_sigma.len();
+        let parts = compile(trimmed, Some(&sigma_name), "magnitude", RUV_MAG_LABEL, true)?;
+        let (f, deriv) = place_ruv_parts(parts, k, &mut per_sigma_pred);
+        per_sigma.push(f);
+        per_sigma_deriv.push(deriv);
     }
     // A `CMT=N:` or `if/else` block: each endpoint gets its own table over the flat
     // sigma vector, so one sigma can carry a factor on one endpoint and none on
@@ -22045,6 +22387,7 @@ fn build_ruv_magnitude(
         let mut table = EndpointMagnitude {
             per_sigma: std::iter::repeat_with(|| None).take(sigma_names.len()).collect(),
             per_sigma_deriv: vec![None; sigma_names.len()],
+            per_sigma_pred: Vec::new(),
         };
         let mut claimed: Vec<usize> = Vec::with_capacity(ep.args.len());
         let mut has_expr = false;
@@ -22070,10 +22413,11 @@ fn build_ruv_magnitude(
                 continue;
             }
             has_expr = true;
-            let (f, deriv) = compile(trimmed, Some(sigma_name), "magnitude")
+            let parts = compile(trimmed, Some(sigma_name), "magnitude", RUV_MAG_LABEL, true)
                 .map_err(|e| at_error_endpoint(&ep.label, e))?;
-            table.per_sigma[slot] = Some(f);
-            table.per_sigma_deriv[slot] = Some(deriv);
+            let (f, deriv) = place_ruv_parts(parts, slot, &mut table.per_sigma_pred);
+            table.per_sigma[slot] = f;
+            table.per_sigma_deriv[slot] = deriv;
         }
         if has_expr {
             per_endpoint.insert(ep.key, table);
@@ -22103,7 +22447,8 @@ fn build_ruv_magnitude(
             ));
         }
         any = true;
-        let (f, deriv) = compile(trimmed, None, "power exponent")?;
+        let (_, mut parts) = compile(trimmed, None, "power exponent", "power exponent", false)?;
+        let (f, deriv) = parts.pop().expect("a power exponent lowers to one part");
         per_sigma_exponent =
             std::iter::repeat_with(|| None).take(sigma_names.len().max(1)).collect();
         per_sigma_exponent_deriv =
@@ -22124,6 +22469,7 @@ fn build_ruv_magnitude(
         rm.per_sigma_exponent_deriv = per_sigma_exponent_deriv;
         rm.uses_tad = uses_tad;
         rm.per_endpoint = per_endpoint;
+        rm.per_sigma_pred = per_sigma_pred;
         Some(rm)
     } else {
         None
@@ -23389,7 +23735,7 @@ impl LevelContrast {
 /// A `theta NAME[COL, ...]` declaration, before its levels are known.
 ///
 /// The level count is a property of the *data*, so this is what the first parse
-/// produces; `api::levels::bind` discovers the observed combinations and
+/// produces; `levels::bind` discovers the observed combinations and
 /// re-parses with a [`LevelBinding`] in hand.
 #[derive(Debug, Clone)]
 pub struct LevelBlockDecl {
@@ -23573,7 +23919,7 @@ pub struct ThetaBlocks {
     /// Per θ block (#1065, #2108 follow-up B): the plain data column every read of it is
     /// indexed by, or `None` when some read indexes it by anything else
     /// (`PLACEBO[4 - STUDY]`, a second column, an individual parameter). Read by
-    /// `api::levels::levels_read`: the profile solve's per-subject levels and the
+    /// `levels::levels_read`: the profile solve's per-subject levels and the
     /// `W_COV_RSR_ONE_SUBJECT_LEVELS` count.
     pub(crate) read_index: Vec<(String, Option<String>)>,
 }
@@ -24066,42 +24412,24 @@ fn map_condition_operands<'a>(
 ///
 /// The readout is read from its source text, where a block lifted into `__ferx_ro_g{n}` by the #1636
 /// desugaring is still the gather it is; the statements that desugaring appends to `stmts` only
-/// re-state a readout read, so they add no share. The propagation is a fixpoint over assignment
-/// order, so a forward reference cannot be missed by a single pass. `only_eta` restricts the η
-/// taint to one slot of the extended η vector (#1649): each [`EtaCoupling::share`] is this question
-/// asked of one random effect.
+/// re-state a readout read, so they add no share. Both propagations are fixpoints over assignment
+/// order ([`eta_tainted_names`] for the η one). `only_eta` restricts the η taint to one slot of the
+/// extended η vector (#1649): each [`EtaCoupling::share`] is this question asked of one random
+/// effect.
 fn block_shares_scale_with_eta(
     stmts: &[Statement], readout: &[Expression], endpoint_labels: &[&'static str], block: &str,
     only_eta: Option<usize>,
 ) -> Option<ScaleShare> {
-    /// Every `(lhs, rhs)` assignment in source order, `if`-branches included.
-    fn assignments<'a>(stmts: &'a [Statement], out: &mut Vec<(Option<&'a str>, &'a Expression)>) {
-        for s in stmts {
-            match s {
-                Statement::Assign(n, e) => out.push((Some(n.as_str()), e)),
-                Statement::If { branches, else_body } => {
-                    for (_, body) in branches {
-                        assignments(body, out);
-                    }
-                    if let Some(eb) = else_body {
-                        assignments(eb, out);
-                    }
-                }
-                _ => {}
-            }
-        }
-    }
-
     let mut assigns = Vec::new();
     assignments(stmts, &mut assigns);
     let n_y = readout.len() - endpoint_labels.len();
     // `None` is the readout: it is read, never assigned to.
     assigns.extend(readout.iter().map(|e| (None, e)));
     let first_readout = assigns.len() - readout.len();
+    let eta_tainted = eta_tainted_names(&assigns, only_eta);
     let mut block_tainted: Vec<&str> = Vec::new();
-    let mut eta_tainted: Vec<&str> = Vec::new();
     loop {
-        let before = (block_tainted.len(), eta_tainted.len());
+        let before = block_tainted.len();
         for (at, (lhs, rhs)) in assigns.iter().enumerate() {
             let mut reads_block = false;
             let mut reads_eta = false;
@@ -24133,15 +24461,122 @@ fn block_shares_scale_with_eta(
                 if reads_block && !block_tainted.contains(&lhs) {
                     block_tainted.push(lhs);
                 }
-                if (reads_eta || eta_via.is_some()) && !eta_tainted.contains(&lhs) {
-                    eta_tainted.push(lhs);
-                }
             }
         }
-        if (block_tainted.len(), eta_tainted.len()) == before {
+        if block_tainted.len() == before {
             return None;
         }
     }
+}
+
+/// Every `(lhs, rhs)` assignment of `stmts` in source order, `if`-branches included.
+fn assignments<'a>(stmts: &'a [Statement], out: &mut Vec<(Option<&'a str>, &'a Expression)>) {
+    for s in stmts {
+        match s {
+            Statement::Assign(n, e) => out.push((Some(n.as_str()), e)),
+            Statement::If { branches, else_body } => {
+                for (_, body) in branches {
+                    assignments(body, out);
+                }
+                if let Some(eb) = else_body {
+                    assignments(eb, out);
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
+/// Whether `expr` reads a random effect: an `Eta` node (only slot `only_eta`, when given) or a
+/// name in `tainted`.
+fn expr_reads_eta(expr: &Expression, tainted: &[&str], only_eta: Option<usize>) -> bool {
+    let mut reads = false;
+    visit_expr_nodes(expr, &mut |n| match n {
+        Expression::Eta(i) => reads |= only_eta.is_none_or(|k| k == *i),
+        Expression::Variable(v) => reads |= tainted.contains(&v.as_str()),
+        _ => {}
+    });
+    reads
+}
+
+/// The assigned names whose value depends on a random effect through any chain of assignments
+/// (`assigns` as [`assignments`] lists them; a `None` left-hand side is read, never assigned). A
+/// fixpoint over assignment order, so a forward reference or a reassignment cannot be missed by a
+/// single pass. `only_eta` restricts the taint to one slot of the extended η vector (#1649).
+fn eta_tainted_names<'a>(
+    assigns: &[(Option<&'a str>, &'a Expression)], only_eta: Option<usize>,
+) -> Vec<&'a str> {
+    let mut tainted: Vec<&str> = Vec::new();
+    loop {
+        let before = tainted.len();
+        for (lhs, rhs) in assigns {
+            if let Some(lhs) = *lhs {
+                if !tainted.contains(&lhs) && expr_reads_eta(rhs, &tainted, only_eta) {
+                    tainted.push(lhs);
+                }
+            }
+        }
+        if tainted.len() == before {
+            return tainted;
+        }
+    }
+}
+
+/// Whether the prediction has a kink an inner search can stall at (#3210): an `if`, `min`, `max` or
+/// `clamp` (each a `Conditional` once desugared), `abs`, `floor`, `ceil` or `round` whose
+/// condition or operand depends on a random effect or a state, in an `[individual_parameters]`
+/// statement (block `if` conditions included) or a `y` readout (`readout`, as [`readout_y_exprs`]
+/// gives it). A branch on time or a covariate alone is smooth in η and does not count. Not read:
+/// `[odes]` right-hand sides, `[derived]`, and event times, so an η-moved switch or dose end that
+/// crosses an observation is a kink this misses (the gain measured on #3210 was 7.8e-7).
+fn prediction_has_kink(stmts: &[Statement], readout: &[Expression], states: &StateInputs) -> bool {
+    let mut assigns = Vec::new();
+    assignments(stmts, &mut assigns);
+    let eta = eta_tainted_names(&assigns, None);
+    let tainted = |e: &Expression| {
+        let mut state = false;
+        visit_expr_nodes(e, &mut |n| {
+            if let Expression::Variable(v) | Expression::Covariate(v) = n {
+                state |= states.is_state(v);
+            }
+        });
+        state || expr_reads_eta(e, &eta, None)
+    };
+    let cond_tainted = |c: &Condition| {
+        let mut t = false;
+        visit_condition_nodes(c, &mut |n| t |= tainted(n));
+        t
+    };
+    let kinked = |e: &Expression| {
+        let mut k = false;
+        visit_expr_nodes(e, &mut |n| {
+            k |= match n {
+                Expression::Conditional(c, _, _) => cond_tainted(c),
+                Expression::UnaryFn(f, a) => {
+                    matches!(f.as_str(), "abs" | "floor" | "ceil" | "round") && tainted(a)
+                }
+                _ => false,
+            }
+        });
+        k
+    };
+    fn conditions<'a>(stmts: &'a [Statement], out: &mut Vec<&'a Condition>) {
+        for s in stmts {
+            if let Statement::If { branches, else_body } = s {
+                for (c, body) in branches {
+                    out.push(c);
+                    conditions(body, out);
+                }
+                if let Some(eb) = else_body {
+                    conditions(eb, out);
+                }
+            }
+        }
+    }
+    let mut conds = Vec::new();
+    conditions(stmts, &mut conds);
+    conds.into_iter().any(cond_tainted)
+        || assigns.iter().map(|(_, e)| *e).chain(readout).any(kinked)
 }
 
 /// The name a readout leaf takes for "some state" when `y` is a state by
@@ -26827,7 +27262,7 @@ fn used_sigma_names(
         }
     };
     match parsed {
-        ParsedErrorModel::Single(_, args, _) => {
+        ParsedErrorModel::Single(_, args, ..) => {
             for a in args {
                 scan(a, &mut out);
             }
@@ -27930,7 +28365,7 @@ const IP_CACHE_WAYS: usize = 64;
 /// One memoized evaluation of a model's η-independent prefix.
 ///
 /// `model_id` distinguishes the closures of different `CompiledModel`s sharing a
-/// worker thread (a joint PK-TTE fit, a `ferx-tools` search, a test binary), so
+/// worker thread (a joint PK-TTE fit, a `ferx-search` run, a test binary), so
 /// a stale entry from another model can never be served: it is compared, not
 /// assumed.
 #[derive(Debug, Default)]
@@ -28701,24 +29136,7 @@ fn apply_unary<T: crate::sens::num::vm::VmNum>(op: Op, v: T) -> T {
     match op {
         Op::Exp => v.exp(),
         Op::Ln => v.guard_floor(1e-30).ln(),
-        // A positive argument is the type's own `sqrt`. Anything else is a constant, so the
-        // derivative there is zero (`PkNum::sqrt`'s convention, #2892): `inf · 0` would otherwise put
-        // a `NaN` in the jets, whose bits optimised code does not reproduce from one route to
-        // the next (#2844). The value is the `f64` lane VM's (`eval_bytecode`): `±0` passes
-        // through as `sqrt(±0) = ±0`, and a negative or `NaN` argument floors to `+0`. The
-        // `v >= 0` test, not `f64::max`, whose signed-zero result is not specified.
-        // The tests are recordable branches (`val` would fail a recording, #2786); the
-        // `±0` case is the value as a constant, so a zero keeps its sign.
-        Op::Sqrt => {
-            use crate::sens::num::BranchCmp::{Ge, Gt};
-            if v.br_cmp_c(Gt, 0.0) {
-                v.sqrt()
-            } else if v.br_cmp_c(Ge, 0.0) {
-                v.value_only()
-            } else {
-                T::from_f64(0.0)
-            }
-        }
+        Op::Sqrt => v.sqrt_vm(),
         Op::Abs => v.abs(),
         // Constants of the value (no derivative), recorded as primitives by a recording type.
         Op::Floor => v.floor_c(),
