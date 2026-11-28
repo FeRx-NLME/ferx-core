@@ -1775,20 +1775,25 @@ mod tests {
 
         // #1721 review r3, row 1: under `fit_init` the auto-declared λ warm-starts from the
         // fit like every other θ, instead of restarting at its default 0.01. Dies under: the
-        // `pin_auto_theta` pass dropped (λ back at 0.01).
+        // `pin_auto_theta` pass dropped (λ back at 0.01). Review r4, row A: FREM hands the
+        // helper raw lines, so the commented line must pin too. Dies under: the comment not
+        // stripped in `pin_auto_theta` (the commented case falls back to 0.01).
         let fit_init = FremFitInit {
             theta: vec![("TVCL".into(), 0.3), ("LAMBDA_ETA_CL".into(), -0.42)],
             eta_names: vec![],
             omega: DMatrix::zeros(0, 0),
         };
-        let warm =
-            generate_frem_model(base_text, &model, &info, Path::new("test.csv"), Some(&fit_init))
-                .unwrap();
-        assert!(warm.contains("ETA_CL ~ boxcox(LAMBDA_ETA_CL)"), "{warm}");
-        let warm = crate::parser::model_parser::parse_model_string(&warm)
-            .expect("the warm-started FREM model parses");
-        let k = warm.theta_names.iter().position(|n| n == "LAMBDA_ETA_CL").expect("λ declared");
-        assert_eq!(warm.default_params.theta[k], -0.42);
+        let commented = base_text.replace("ETA_CL ~ boxcox()", "ETA_CL ~ boxcox()  # heavy tail");
+        for text in [base_text, commented.as_str()] {
+            let warm =
+                generate_frem_model(text, &model, &info, Path::new("test.csv"), Some(&fit_init))
+                    .unwrap();
+            assert!(warm.contains("ETA_CL ~ boxcox(LAMBDA_ETA_CL)"), "{warm}");
+            let warm = crate::parser::model_parser::parse_model_string(&warm)
+                .expect("the warm-started FREM model parses");
+            let k = warm.theta_names.iter().position(|n| n == "LAMBDA_ETA_CL").expect("λ declared");
+            assert_eq!(warm.default_params.theta[k], -0.42, "{text}");
+        }
     }
 
     /// FREM-converts `base_text` (covariates WT, AGE) and parses the result.

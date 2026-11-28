@@ -223,11 +223,13 @@ fn parse_shape_line(line: &str) -> Result<ShapeLine, String> {
 /// name that θ, with the `theta` declaration replacing the auto one at `init_of(name)`
 /// (the caller's formatted value). `None` for any other line, or when `init_of` has
 /// none. Used by every model rewrite that warm-starts from a fit (`SeedInits`, FREM),
-/// so the fitted λ/ν is not restarted at [`ShapeKind::default_theta`].
+/// so the fitted λ/ν is not restarted at [`ShapeKind::default_theta`]. A trailing
+/// comment is dropped first: FREM passes raw lines (#1721 review r4, row A).
 pub(crate) fn pin_auto_theta(
     line: &str, init_of: impl Fn(&str) -> Option<String>,
 ) -> Option<(String, String)> {
-    let l = parse_shape_line(line.trim()).ok().filter(|l| l.shape.is_empty())?;
+    let code = crate::parser::model_parser::strip_line_comment(line).trim();
+    let l = parse_shape_line(code).ok().filter(|l| l.shape.is_empty())?;
     let name = l.kind.auto_theta_name(&l.eta);
     let init = init_of(&name)?;
     let (_, lo, hi) = l.kind.default_theta();
