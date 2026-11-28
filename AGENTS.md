@@ -62,7 +62,7 @@ ferx-core/                       # repo root = ferx-core package + workspace roo
 - **Widening the public API is a design step.** Any new `pub` item fails the `Public API baseline` CI job until the baseline is regenerated in the same PR (`tools/update-public-api.sh`, `--check` is what CI runs; #1114). Say in the PR description which tool needs each added item and why the existing surface does not suffice.
   - **No `#[doc(hidden)] pub`.** `cargo public-api` omits such items, so it bypasses the gate; `tests/public_api_boundary.rs` bans it. An item is either public API or `pub(crate)`.
   - Anything `ferx-tools` or `ferx-search` needs must also make sense from ferx-r, which consumes `ferx-core` as an ordinary external crate.
-- **Feature flags belong to `ferx-core`**, so workspace-wide or member-scoped commands must package-qualify them: `--features ferx-core/ci`, not `--features ci` (which fails with `none of the selected packages contains this feature`).
+- **Feature flags belong to `ferx-core`**, so workspace-wide or member-scoped commands must package-qualify them: `--features ferx-core/ci`, not `--features ci` (which fails with `none of the selected packages contains this feature`). The one member feature is `ferx-cli/search` (model search, default-on, #3187): a `--no-default-features` command covering `ferx-cli` must name it, or the search subcommands drop out (`tests/preflight_owns_the_fast_gates.rs` enforces it).
 
 ## First-time setup
 

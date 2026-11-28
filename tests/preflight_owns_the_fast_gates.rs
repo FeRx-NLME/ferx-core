@@ -212,6 +212,12 @@ fn expand_features(listed: &[String]) -> Vec<String> {
 ///
 /// No `-p` at all means the workspace root package, which IS ferx-core.
 fn selects_ferx_core(cmd: &str) -> bool {
+    let packages = selected_packages(cmd);
+    packages.is_empty() || packages.contains(&"ferx-core")
+}
+
+/// The `-p` / `--package` names a cargo command selects, in order.
+fn selected_packages(cmd: &str) -> Vec<&str> {
     let mut parts = cmd.split_whitespace();
     let mut packages = Vec::new();
     while let Some(p) = parts.next() {
@@ -221,7 +227,37 @@ fn selects_ferx_core(cmd: &str) -> bool {
             }
         }
     }
-    packages.is_empty() || packages.contains(&"ferx-core")
+    packages
+}
+
+/// The feature lists of `cmd` that switch `ferx-cli`'s `search` feature off (#3187).
+///
+/// Empty unless `cmd` builds `ferx-cli` (`-p ferx-cli` or `--workspace`) with
+/// `--no-default-features`, which turns the default-on `search` off along with
+/// everything else. Then every feature list carrying `ferx-core/ci` that lacks
+/// `ferx-cli/search` is returned. Lists are split on whitespace and quotes, so each
+/// arm of a workflow's `${{ cond && 'a' || 'b' }}` is checked on its own.
+///
+/// The exception is a command whose ONLY package is `ferx-cli`: that is the deliberate
+/// no-search build, and the caller asserts it exists separately.
+fn feature_lists_dropping_search(cmd: &str) -> Vec<&str> {
+    let builds_cli = cmd.contains("--workspace") || selected_packages(cmd).contains(&"ferx-cli");
+    if !builds_cli || !cmd.contains("--no-default-features") || is_no_search_build(cmd) {
+        return Vec::new();
+    }
+    cmd.split(|c: char| c.is_whitespace() || c == '\'')
+        .filter(|list| list.split(',').any(|f| f == "ferx-core/ci"))
+        .filter(|list| !list.split(',').any(|f| f == "ferx-cli/search"))
+        .collect()
+}
+
+/// A command that builds `ferx-cli` alone with its default features off: the binary
+/// without model search (#3187).
+fn is_no_search_build(cmd: &str) -> bool {
+    !cmd.contains("--workspace")
+        && selected_packages(cmd) == ["ferx-cli"]
+        && cmd.contains("--no-default-features")
+        && !cmd.contains("ferx-cli/search")
 }
 
 fn ci_yml() -> String {
@@ -430,6 +466,9 @@ fn a_failing_gate_fails_the_script_from_every_position() {
         "patterns",
         "debug-assertions",
         "release-semantics",
+        // #3187. Its first command is a script, but the script runs `cargo tree` through
+        // `PATH` under `set -e`, so the fake below fails it at the same position.
+        "no-search",
     ] {
         let listed = listed_commands(group);
         assert!(!listed.is_empty(), "group `{group}` lists no commands — nothing to fail");
@@ -1115,11 +1154,15 @@ fn preflight_is_executable_and_lists_every_group() {
     // commands are actually *enforced* is
     // `a_failing_gate_fails_the_script_from_every_position`; `--list` executes nothing and
     // can never show it.
-    let expected: [(&str, usize); 10] = [
-        ("changelog", 1),  // tools/changelog.sh check (#1545)
-        ("fmt", 1),        // cargo fmt --all -- --check
-        ("check", 5),      // ci · ci,survival,slow-tests · ci,markov · ci,nn,slow-tests · members
-        ("clippy", 3),     // ferx-core ci,markov,nn · ferx-core ci --lib (#2075) · members
+    let expected: [(&str, usize); 11] = [
+        ("changelog", 1), // tools/changelog.sh check (#1545)
+        ("fmt", 1),       // cargo fmt --all -- --check
+        // ci · ci,survival,slow-tests · ci,markov · ci,nn,slow-tests · members · ferx-cli
+        // without search (#3187)
+        ("check", 6),
+        // ferx-core ci,markov,nn · ferx-core ci --lib (#2075) · members · ferx-cli without
+        // search (#3187)
+        ("clippy", 4),
         ("rustdoc", 2),    // ferx-core rustdoc · members
         ("docs", 2),       // cargo test -p docs-lint · cargo clippy -p docs-lint
         ("patterns", 2),   // cargo test -p patterns-lint · cargo clippy -p patterns-lint (#2634)
@@ -1136,6 +1179,8 @@ fn preflight_is_executable_and_lists_every_group() {
         // that, where the twin needs both sets because it is chasing guards that
         // live inside feature-gated modules.
         ("release-semantics", 1),
+        // #3187: tools/no-search-tree.sh · cargo test -p ferx-cli without search.
+        ("no-search", 2),
     ];
 
     // Every group `--list` actually walks must have an entry above. The loop below
@@ -1384,6 +1429,99 @@ fn preflight_help_lists_every_group_and_works_from_any_cwd() {
              know to run it:\n{stdout}"
         );
     }
+}
+
+/// #3187: `ferx-cli`'s `search` feature is default-on, and every command that covers the
+/// CLI passes `--no-default-features`, which turns it off. Each of those commands must
+/// name `ferx-cli/search` again, or the eight search subcommands and their tests drop out
+/// of it with the job still green. Checked over every preflight group and over the two
+/// workflows that build the workspace themselves (coverage shards, slow tests).
+///
+/// The deliberate no-search build (`-p ferx-cli` alone) is the exception, and it has to
+/// exist where #3187 put it: compiled in `check`, linted in `clippy`, tested in
+/// `no-search` beside the dependency-graph assertion.
+#[test]
+fn ferx_cli_search_is_named_wherever_default_features_are_off() {
+    for group in all_groups() {
+        for cmd in listed_commands(&group) {
+            let dropped = feature_lists_dropping_search(&cmd);
+            assert!(
+                dropped.is_empty(),
+                "a `{group}` command builds `ferx-cli` with `--no-default-features` and the \
+                 feature list(s) {dropped:?} do not name `ferx-cli/search`, so the search \
+                 subcommands and their tests are not built by it (#3187):\n  {cmd}"
+            );
+        }
+    }
+
+    for file in ["ci.yml", "slow-tests.yml"] {
+        let path = repo_root().join(".github").join("workflows").join(file);
+        let yml = std::fs::read_to_string(&path).expect("read workflow");
+        // A shell command continued with `\` is one command.
+        let joined = yml.replace("\\\n", " ");
+        let builds_cli: Vec<&str> = joined
+            .lines()
+            .filter(|l| !l.trim_start().starts_with('#'))
+            .filter(|l| l.contains("--no-default-features") && l.contains("--workspace"))
+            .collect();
+        assert!(
+            !builds_cli.is_empty(),
+            "no `--workspace --no-default-features` command found in {file}; this \
+             assertion would be vacuous — did the command's shape change?"
+        );
+        for cmd in builds_cli {
+            let dropped = feature_lists_dropping_search(cmd);
+            assert!(
+                dropped.is_empty(),
+                "{file} builds the workspace with `--no-default-features` and the feature \
+                 list(s) {dropped:?} do not name `ferx-cli/search` (#3187):\n  {}",
+                cmd.trim()
+            );
+        }
+    }
+
+    for (group, verb) in
+        [("check", "cargo check "), ("clippy", "cargo clippy "), ("no-search", "cargo test ")]
+    {
+        let cmds = listed_commands(group);
+        assert!(
+            cmds.iter().any(|c| c.starts_with(verb) && is_no_search_build(c)),
+            "no `{group}` command is `{verb}-p ferx-cli` without `search`, so the binary \
+             built without model search is {} by nothing (#3187).\n  {}",
+            verb.trim_start_matches("cargo ").trim(),
+            cmds.join("\n  ")
+        );
+    }
+    assert!(
+        listed_commands("no-search").iter().any(|c| c == "tools/no-search-tree.sh"),
+        "the `no-search` group no longer asserts that the no-search build does not depend \
+         on `ferx-search` (#3187)"
+    );
+}
+
+#[test]
+fn the_search_feature_detector_tells_the_two_builds_apart() {
+    let members = "cargo check -p ferx-tools -p ferx-cli --tests --no-default-features";
+    assert!(
+        feature_lists_dropping_search(&format!("{members} --features ferx-core/ci"))
+            == ["ferx-core/ci"]
+    );
+    assert!(feature_lists_dropping_search(&format!(
+        "{members} --features ferx-core/ci,ferx-cli/search"
+    ))
+    .is_empty());
+    // One arm of a workflow ternary missing it is still caught.
+    let ternary = "--workspace --no-default-features --features ${{ x && \
+                   'ferx-core/ci,ferx-cli/search' || 'ferx-core/ci,ferx-core/nn' }}";
+    assert_eq!(feature_lists_dropping_search(ternary), ["ferx-core/ci,ferx-core/nn"]);
+    // The deliberate no-search build is exempt, and only it.
+    let alone = "cargo test -p ferx-cli --no-default-features --features ferx-core/ci";
+    assert!(is_no_search_build(alone) && feature_lists_dropping_search(alone).is_empty());
+    assert!(!is_no_search_build(&format!("{members} --features ferx-core/ci")));
+    // Default features on: `search` is on, nothing to name.
+    assert!(
+        feature_lists_dropping_search("cargo build -p ferx-cli --features ferx-core/ci").is_empty()
+    );
 }
 
 /// A crate-level `#![allow(rustdoc::...)]` is a neutered gate the command list cannot see.
