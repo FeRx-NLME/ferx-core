@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: LGPL-3.0-or-later
 //! The per-candidate progress event every search tool emits (#2512).
 //!
 //! The step/layer/batch events each tool already has say when a group of fits

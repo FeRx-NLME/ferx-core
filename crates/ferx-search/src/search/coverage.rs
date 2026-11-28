@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: LGPL-3.0-or-later
 //! What ferx can build out of a parsed MFL space — and the hard error for what
 //! it cannot (#1179).
 //!

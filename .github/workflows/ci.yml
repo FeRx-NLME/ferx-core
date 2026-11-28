@@ -424,6 +424,22 @@ jobs:
       - name: Validate changelog.d fragments (via tools/preflight.sh)
         run: tools/preflight.sh changelog
 
+  licenses:
+    name: Licenses
+    runs-on: ubuntu-latest
+    # #3183: license fields, SPDX headers on ferx-search, the license files in
+    # each crate's `cargo package --list`, and the generated third-party notices
+    # behind `ferx --licenses`. Compiles nothing; `cargo metadata` downloads the
+    # dependency sources whose license files the notices copy.
+    env:
+      RUSTUP_TOOLCHAIN: stable
+    steps:
+      - uses: actions/checkout@v7
+      - name: Install stable toolchain
+        run: rustup toolchain install stable --profile minimal
+      - name: Check licenses (via tools/preflight.sh)
+        run: tools/preflight.sh licenses
+
   docs-lint:
     name: Docs lint
     runs-on: ubuntu-latest

@@ -60,7 +60,7 @@ export RUSTUP_TOOLCHAIN="${RUSTUP_TOOLCHAIN:-nightly}"
 # current user's numeric group IDs, and it wins. The first draft used it and
 # every group name silently became a GID — `unknown group 'check' — expected one
 # of: 20 12 61 ...`.
-ALL_GROUPS=(changelog fmt check clippy rustdoc docs patterns public-api debug-assertions release-semantics no-search)
+ALL_GROUPS=(changelog licenses fmt check clippy rustdoc docs patterns public-api debug-assertions release-semantics no-search)
 
 # Groups that are NOT in the default selection.
 #
@@ -263,6 +263,17 @@ group_changelog() {
   # the tree; that is `tools/changelog.sh require`, run by
   # `.github/workflows/changelog.yml` because it needs the PR's labels.
   run tools/changelog.sh check
+}
+
+group_licenses() {
+  CI_JOB="Licenses"
+  # #3183: ferx-search is LGPL-3.0-or-later, the rest MIT, and every crate
+  # tarball must carry its own texts (the 0.4.0 ferx-tools and ferx-cli
+  # tarballs had none). Checks the `license` fields, the SPDX headers, the
+  # license files in `cargo package --list`, and that
+  # crates/ferx-cli/THIRD-PARTY-NOTICES.txt (`ferx --licenses`) matches
+  # Cargo.lock. No compile.
+  run tools/check-licenses.sh
 }
 
 group_fmt() {

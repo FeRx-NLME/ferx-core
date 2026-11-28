@@ -59,6 +59,7 @@ ferx-core/                       # repo root = ferx-core package + workspace roo
 
 - **The root package must stay `ferx-core`, and `ferx-tools` and `ferx-search` must stay at `crates/ferx-tools` and `crates/ferx-search`.** ferx-r's Makevars looks for all three there; moving any of them breaks its local builds.
 - **Boundary rule.** `ferx-core` = one model, one dataset, one fit. `ferx-tools` = many fits of a given model (bootstrap, GAM screening, the `run_in_lanes` fit queue). `ferx-search` = many fits over a space of models (the `.ferxsearch` layer and the search tools). If it calls `fit()` more than once, it is not core. Statistical kernels (npde, CWRES, shrinkage, covariance/SE, SIR, FREM, VPC statistics) stay in core. `ferx-cli` is thin: argument parsing, printing, exit codes. The dependency is strictly one-way, `ferx-search` → `ferx-tools` → `ferx-core`: neither `ferx-tools` nor `ferx-core` ever depends on `ferx-search`, not even as a dev-dependency or through a re-export (#3185), and `ferx-core` never depends on a member (both pinned by `tests/public_api_boundary.rs`). `docs-lint` and `patterns-lint` (source-pattern lints over test code, #2634; rules and baseline in `tools/lint-rules/`) depend on no workspace crate and nothing depends on them, which keeps their CI jobs fast (#969).
+- **Licenses follow the boundary** (#3183). `ferx-search` is LGPL-3.0-or-later (it follows Pharmpy's behaviour; see its `NOTICE`); `ferx-core`, `ferx-tools` and the `ferx-cli` source are MIT. This is the second reason the arrow points one way: MIT crates must never depend on `ferx-search`, and code moved from `ferx-search` into an MIT crate needs its authors' agreement. Every `.rs` file under `crates/ferx-search` starts with `// SPDX-License-Identifier: LGPL-3.0-or-later`. A `Cargo.lock` change that adds or bumps a dependency of `ferx-cli` means regenerating `crates/ferx-cli/THIRD-PARTY-NOTICES.txt` with `tools/third-party-notices.py` (`ferx --licenses` prints it). `tools/preflight.sh licenses` checks all of this.
 - **Widening the public API is a design step.** Any new `pub` item fails the `Public API baseline` CI job until the baseline is regenerated in the same PR (`tools/update-public-api.sh`, `--check` is what CI runs; #1114). Say in the PR description which tool needs each added item and why the existing surface does not suffice.
   - **No `#[doc(hidden)] pub`.** `cargo public-api` omits such items, so it bypasses the gate; `tests/public_api_boundary.rs` bans it. An item is either public API or `pub(crate)`.
   - Anything `ferx-tools` or `ferx-search` needs must also make sense from ferx-r, which consumes `ferx-core` as an ordinary external crate.
@@ -75,14 +76,14 @@ git config core.hooksPath .githooks   # pre-commit hook: blocks commits that fai
 **A green test suite is not a green build.** CI feature sets are not nested — `cargo test --features ci,survival` compiles neither the `nn`- nor the `slow-tests`-gated source — so run the fast gates before pushing (#1133, #1157):
 
 ```bash
-tools/preflight.sh            # fmt, the cargo check feature matrix, clippy, rustdoc, docs, patterns, public-API, changelog
+tools/preflight.sh            # fmt, the cargo check feature matrix, clippy, rustdoc, docs, patterns, public-API, changelog, licenses
 tools/preflight.sh check      # just the check matrix, for a tight edit loop
 tools/preflight.sh --list     # show the commands without running them
 ```
 
 The default run leaves out two opt-in groups that run the unit suite: `tools/preflight.sh debug-assertions` (no CI job of its own; the coverage jobs' `ci-cov` profile covers it, #1248) and `release-semantics` (#1293).
 
-CI's `Check`, `Clippy`, `Format`, `Rustdoc`, `Changelog`, `Docs lint`, `Patterns lint` and `Tests (release semantics)` jobs and the pre-commit hook call this same script, so they cannot drift. **Add a new gate to the script (`ALL_GROUPS`), not to the workflow.** The default run gates compilation and lint, not behaviour (except `docs` and `patterns`, which run their lint crate's tests) — the test jobs can still go red after a green preflight. `tests/preflight_owns_the_fast_gates.rs` pins the arrangement; when editing the script, keep `run` **exiting** (not returning) on failure, since bash suspends `errexit` inside AND-OR lists.
+CI's `Check`, `Clippy`, `Format`, `Rustdoc`, `Changelog`, `Licenses`, `Docs lint`, `Patterns lint` and `Tests (release semantics)` jobs and the pre-commit hook call this same script, so they cannot drift. **Add a new gate to the script (`ALL_GROUPS`), not to the workflow.** The default run gates compilation and lint, not behaviour (except `docs` and `patterns`, which run their lint crate's tests) — the test jobs can still go red after a green preflight. `tests/preflight_owns_the_fast_gates.rs` pins the arrangement; when editing the script, keep `run` **exiting** (not returning) on failure, since bash suspends `errexit` inside AND-OR lists.
 
 Things to know:
 

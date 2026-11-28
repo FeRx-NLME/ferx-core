@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: LGPL-3.0-or-later
 //! From a resolved MFL covariate effect to the `[covariate_model]` line a
 //! candidate carries (#1180).
 //!

@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: LGPL-3.0-or-later
 //! Tier-2 end-to-end checks for covsearch and allometry (#1180), on a real
 //! model and dataset but never to convergence: every fit is an evaluation
 //! (`maxiter = 0`, ferx's `MAXEVAL=0`).

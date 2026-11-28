@@ -1487,3 +1487,16 @@ fn summary_json_with_help_prints_usage() {
     let stdout = String::from_utf8(out.stdout).unwrap();
     assert!(stdout.contains("Usage: ferx summary") && stdout.contains("--json"), "{stdout}");
 }
+
+/// #3183: `ferx --licenses` is how the binary carries the LGPL texts and the
+/// third-party notices it links, so it must exit 0 and print them, not be read
+/// as a model path or an unknown flag.
+#[test]
+fn licenses_flag_prints_the_notices() {
+    let out = ferx().arg("--licenses").output().expect("run ferx --licenses");
+    assert!(out.status.success(), "--licenses should exit 0: {out:?}");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    for needle in ["ferx-search", "LESSER GENERAL PUBLIC LICENSE", "Third-party notices", "nlopt"] {
+        assert!(stdout.contains(needle), "`ferx --licenses` lacks {needle:?}");
+    }
+}

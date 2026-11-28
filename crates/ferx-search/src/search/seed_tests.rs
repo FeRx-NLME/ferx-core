@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: LGPL-3.0-or-later
 //! Unit tests for [`seed_from`](super::seed_from).
 
 use ferx_core::edit::{ModelEdit, ModelText};

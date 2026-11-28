@@ -697,10 +697,9 @@ Trunk-based, so a release is a **tag on `main`**:
    cargo publish --workspace --exclude docs-lint --dry-run   # then without --dry-run
    ```
 
-   Cargo publishes `ferx-core` → `ferx-tools` → `ferx-cli` in dependency order.
-   `ferx-search` is `publish = false` until its license is settled (#3183). Until
-   then `ferx-cli`, which depends on it, cannot be published either: add
-   `--exclude ferx-cli --exclude ferx-search` to the command above.
+   Cargo publishes `ferx-core` → `ferx-tools` → `ferx-search` → `ferx-cli` in
+   dependency order. `ferx-search` is LGPL-3.0-or-later, the others MIT (#3183);
+   `tools/preflight.sh licenses` checks that each tarball carries its texts.
    A published version can be yanked but never replaced, so check the dry-run's
    file list (`cargo package -p <crate> --list`) first.
 
@@ -725,8 +724,8 @@ form. User-facing breaking changes also carry **migration notes** (PR template).
 
 **Distribution.** Releases are **GitHub releases** built by `release.yml` on
 each `vX.Y.Z` tag. Since `0.4.0`, `ferx-core`, `ferx-tools` and `ferx-cli` are
-also published to **crates.io** (step 5 above); `docs-lint` and, until #3183,
-`ferx-search` are `publish = false`, which also holds back `ferx-cli`. ferx-r is installed from source / GitHub (`R CMD INSTALL`, e.g.
+also published to **crates.io** (step 5 above), joined by `ferx-search` after
+0.4.0; `docs-lint` and `patterns-lint` are `publish = false`. ferx-r is installed from source / GitHub (`R CMD INSTALL`, e.g.
 `remotes::install_github`). If we later publish to a CRAN-style channel, add
 that step here.
 

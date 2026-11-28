@@ -2,6 +2,7 @@ mod bootstrap_cmd;
 mod bootstrap_progress;
 mod export_dcm_cmd;
 mod gam_cmd;
+mod licenses;
 mod summary_json;
 
 // The model-search subcommands, behind the default-on `search` feature (#3187).
@@ -105,6 +106,7 @@ Data must be in NONMEM format (ID, TIME, DV, EVID, AMT, CMT, ...)
                Disable checkpointing entirely with [fit_options] checkpoint = false.
 
 -h, --help     print this help and exit
+--licenses     print the licenses and third-party notices of this binary
 ";
 
 /// True for either spelling of the help flag.
@@ -323,6 +325,10 @@ fn main() {
 
     if is_help_flag(args.get(1)) {
         print!("{}", main_usage());
+        std::process::exit(0);
+    }
+    if args.get(1).map(String::as_str) == Some("--licenses") {
+        print!("{}", licenses::text());
         std::process::exit(0);
     }
 

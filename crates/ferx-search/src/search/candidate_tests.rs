@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: LGPL-3.0-or-later
 //! Candidate identity, feature vectors and ranking criteria (#1178).
 
 use ferx_core::{bic, BicType, StrictnessVerdict};

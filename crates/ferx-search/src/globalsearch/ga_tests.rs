@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: LGPL-3.0-or-later
 //! The GA against exhaustive enumeration on known landscapes (#1185): the
 //! acceptance criterion "on a space small enough to enumerate, the GA finds
 //! the same optimum as exhaustive enumeration", plus the mechanics — a

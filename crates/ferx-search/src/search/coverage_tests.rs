@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: LGPL-3.0-or-later
 use super::*;
 
 fn gaps(src: &str) -> Vec<String> {

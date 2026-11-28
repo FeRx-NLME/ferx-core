@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: LGPL-3.0-or-later
 //! The candidate journal — what makes an interrupted search resumable (#1178).
 //!
 //! A model-space search is hours of `fit()` calls, and a search that has to

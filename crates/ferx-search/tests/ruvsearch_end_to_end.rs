@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: LGPL-3.0-or-later
 //! Tier-2 end-to-end checks for ruvsearch (#1182), on a real model and
 //! dataset but never to a convergence run: every fit on the data is an
 //! evaluation (`maxiter = 0`, ferx's `MAXEVAL=0`). The CWRES pre-screen's

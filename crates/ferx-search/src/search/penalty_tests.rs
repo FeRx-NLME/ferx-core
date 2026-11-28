@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: LGPL-3.0-or-later
 //! Hand-computed penalized fitness (#1185): one fixture per penalty term,
 //! the score checked against the arithmetic written out beside it, and the
 //! two schedule-level guarantees — a partial `[rank.penalties]` table

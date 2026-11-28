@@ -38,9 +38,8 @@ search = ["dep:ferx-search"]
 # `default = []`; `survival` is slated to become default-on).
 ferx-core = { path = "../..", version = "0.4.0", default-features = false }
 ferx-tools = { path = "../ferx-tools", version = "0.4.0" }
-# Optional behind the default-on `search` feature (#3187). Making it optional does
-# not make `ferx-cli` publishable while `ferx-search` is `publish = false`: cargo
-# resolves optional dependencies from the registry too.
+# Optional behind the default-on `search` feature (#3187). LGPL-3.0-or-later
+# (#3183): a build with it links LGPL code, which `ferx --licenses` covers.
 ferx-search = { path = "../ferx-search", version = "0.4.0", optional = true }
 indicatif = "0.18.4"
 # The binary's global allocator (`src/main.rs`): an estimation allocates many small,
