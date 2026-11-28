@@ -24,9 +24,6 @@ use crate::types::{DoseAttr, FitResult, PkModel};
 // find a declaration and splice its initial value, never enough to be a second
 // parser. Anything these do not match is left alone and reported, not guessed.
 
-/// An `[eta_shape]` line with an auto-declared shape θ: `ETA ~ kind()`.
-static AUTO_SHAPE_RE: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r"^\s*(\w+)\s*~\s*(\w+)\s*\(\s*\)\s*$").unwrap());
 /// `theta NAME(init …` — group 1 is everything up to the init, group 2 the
 /// name, group 3 the init, group 4 the rest (bounds, `FIX`, `)`).
 static THETA_RE: LazyLock<Regex> =
@@ -1390,20 +1387,13 @@ fn seed_inits(text: &mut ModelText, fit: &FitResult) -> Result<(), String> {
     // `theta` line to rewrite: name it on the `[eta_shape]` line and declare it with its
     // fitted value, so the edited model starts where the fit ended rather than at λ = 0.01.
     for (span, code) in text.logical_lines("eta_shape") {
-        let Some(caps) = AUTO_SHAPE_RE.captures(&code) else { continue };
-        let Some(kind) = crate::parser::eta_shape::ShapeKind::from_name(&caps[2]) else {
+        let init_of = |n: &str| theta.get(n).copied().filter(|v| v.is_finite()).map(num);
+        let Some((line, decl)) = crate::parser::eta_shape::pin_auto_theta(&code, init_of) else {
             continue;
         };
-        let prefix =
-            if kind == crate::parser::eta_shape::ShapeKind::TDist { "NU" } else { "LAMBDA" };
-        let name = format!("{prefix}_{}", &caps[1]);
-        let Some(v) = theta.get(name.as_str()).copied().filter(|v| v.is_finite()) else {
-            continue;
-        };
-        let (_, lo, hi) = kind.default_theta();
-        let stale = text.set_span(&span, &format!("{} ~ {}({name})", &caps[1], &caps[2]));
+        let stale = text.set_span(&span, &line);
         text.delete_lines(stale);
-        text.append_to_block("parameters", &format!("theta {name}({}, {lo}, {hi})", num(v)));
+        text.append_to_block("parameters", &decl);
     }
     let eta_index: HashMap<&str, usize> =
         fit.eta_names.iter().enumerate().map(|(i, n)| (n.as_str(), i)).collect();

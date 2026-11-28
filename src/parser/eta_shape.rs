@@ -56,6 +56,13 @@ impl ShapeKind {
             ShapeKind::JohnDraper => (1.0, -3.0, 3.0),
         }
     }
+
+    /// The name of the θ an empty `ETA ~ kind()` line auto-declares:
+    /// `NU_{ETA}` for t-dist, `LAMBDA_{ETA}` otherwise.
+    pub(crate) fn auto_theta_name(self, eta: &str) -> String {
+        let prefix = if self == ShapeKind::TDist { "NU" } else { "LAMBDA" };
+        format!("{prefix}_{eta}")
+    }
 }
 
 /// What a shape node evaluates to: the transform, or one of its first partials
@@ -212,6 +219,24 @@ fn parse_shape_line(line: &str) -> Result<ShapeLine, String> {
     Ok(ShapeLine { eta: eta.to_string(), kind, shape: shape.to_string() })
 }
 
+/// An `[eta_shape]` line that auto-declares its shape θ (`ETA ~ kind()`), rewritten to
+/// name that θ, with the `theta` declaration replacing the auto one at `init_of(name)`
+/// (the caller's formatted value). `None` for any other line, or when `init_of` has
+/// none. Used by every model rewrite that warm-starts from a fit (`SeedInits`, FREM),
+/// so the fitted λ/ν is not restarted at [`ShapeKind::default_theta`].
+pub(crate) fn pin_auto_theta(
+    line: &str, init_of: impl Fn(&str) -> Option<String>,
+) -> Option<(String, String)> {
+    let l = parse_shape_line(line.trim()).ok().filter(|l| l.shape.is_empty())?;
+    let name = l.kind.auto_theta_name(&l.eta);
+    let init = init_of(&name)?;
+    let (_, lo, hi) = l.kind.default_theta();
+    Some((
+        format!("{} ~ {}({name})", l.eta, l.kind.name()),
+        format!("theta {name}({init}, {lo}, {hi})"),
+    ))
+}
+
 /// Desugar `[eta_shape]` into the inline form (#1716): every whole-word read of
 /// a shaped ETA in `[individual_parameters]` becomes `kind(ETA, SHAPE)`, and a
 /// line with empty parentheses appends `theta {LAMBDA|NU}_{ETA}` to
@@ -252,11 +277,7 @@ pub(crate) fn apply_eta_shape(
         }
         seen.push(l.eta.clone());
         let shape = if l.shape.is_empty() {
-            let prefix = match l.kind {
-                ShapeKind::TDist => "NU",
-                ShapeKind::BoxCox | ShapeKind::JohnDraper => "LAMBDA",
-            };
-            let name = format!("{prefix}_{}", l.eta);
+            let name = l.kind.auto_theta_name(&l.eta);
             if cx.theta_names.contains(&name) {
                 return Err(format!(
                     "[eta_shape]: `{}` would declare θ `{name}`, which [parameters] already \

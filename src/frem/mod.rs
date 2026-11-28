@@ -466,6 +466,22 @@ pub fn generate_frem_model(
         }
     }
 
+    // An auto-declared shape θ (`ETA_CL ~ boxcox()`, #1716) has no `theta` line to
+    // override: under `fit_init`, name it on its `[eta_shape]` line and declare it at the
+    // fit's value, as every other θ is warm-started.
+    let mut eta_shape_lines = blocks.get("eta_shape").cloned().unwrap_or_default();
+    let init_of = |n: &str| {
+        let fi = fit_init?;
+        let (_, v) = fi.theta.iter().find(|(m, _)| m.eq_ignore_ascii_case(n))?;
+        v.is_finite().then(|| v.to_string())
+    };
+    for line in &mut eta_shape_lines {
+        if let Some((named, decl)) = crate::parser::eta_shape::pin_auto_theta(line, init_of) {
+            *line = named;
+            model.push_str(&format!("  {decl}\n"));
+        }
+    }
+
     // Add fixed covariate thetas.
     for (k, cov_name) in frem_info.covariate_names.iter().enumerate() {
         let mean = frem_info.covariate_means[k];
@@ -628,7 +644,12 @@ pub fn generate_frem_model(
     // model, and an auto-declared shape θ (`boxcox()` → `LAMBDA_ETA_CL`) exists only
     // through this block, so it is carried verbatim too.
     for block_name in ["scaling", "odes", "eta_shape"] {
-        if let Some(block_lines) = blocks.get(block_name) {
+        let block_lines = if block_name == "eta_shape" {
+            Some(&eta_shape_lines).filter(|l| !l.is_empty())
+        } else {
+            blocks.get(block_name)
+        };
+        if let Some(block_lines) = block_lines {
             if block_lines.iter().any(|l| !l.trim().is_empty() && !l.trim().starts_with('#')) {
                 model.push_str(&format!("[{}]\n", block_name));
                 for line in block_lines {
@@ -1751,6 +1772,23 @@ mod tests {
             format!("{:?}", (m.pk_param_fn)(&th, &eta, &std::collections::HashMap::new(), 0.0))
         };
         assert_ne!(at(&frem), at(&unshaped), "the FREM model reads ETA_CL unshaped");
+
+        // #1721 review r3, row 1: under `fit_init` the auto-declared λ warm-starts from the
+        // fit like every other θ, instead of restarting at its default 0.01. Dies under: the
+        // `pin_auto_theta` pass dropped (λ back at 0.01).
+        let fit_init = FremFitInit {
+            theta: vec![("TVCL".into(), 0.3), ("LAMBDA_ETA_CL".into(), -0.42)],
+            eta_names: vec![],
+            omega: DMatrix::zeros(0, 0),
+        };
+        let warm =
+            generate_frem_model(base_text, &model, &info, Path::new("test.csv"), Some(&fit_init))
+                .unwrap();
+        assert!(warm.contains("ETA_CL ~ boxcox(LAMBDA_ETA_CL)"), "{warm}");
+        let warm = crate::parser::model_parser::parse_model_string(&warm)
+            .expect("the warm-started FREM model parses");
+        let k = warm.theta_names.iter().position(|n| n == "LAMBDA_ETA_CL").expect("λ declared");
+        assert_eq!(warm.default_params.theta[k], -0.42);
     }
 
     /// FREM-converts `base_text` (covariates WT, AGE) and parses the result.
