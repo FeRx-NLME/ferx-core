@@ -2801,6 +2801,10 @@ fn classify_indiv_params(
 ) -> (Vec<crate::types::EtaParamInfo>, Vec<crate::types::ThetaTransform>) {
     use crate::types::{EtaParamInfo, ThetaTransform};
 
+    // `eta_names` is the BSV ηs, so its length is `classify_expr`'s `n_bsv`. Here that
+    // bound cannot change the result: the κ class it can let through has
+    // `eta_idx >= eta_names.len()`, which `apply_class` drops, leaving the same entries as
+    // no class (#1721 review r4, row B: `usize::MAX` survives every parser test).
     let n_theta = theta_names.len();
     let mut theta_transform = vec![ThetaTransform::Identity; n_theta];
     let mut eta_infos: Vec<EtaParamInfo> = Vec::new();
