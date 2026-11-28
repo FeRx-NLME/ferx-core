@@ -68,7 +68,7 @@ fn mul_anchors_of<'a, V: RhsView<'a>>(v: V) -> Vec<MuRefAnchor> {
 /// returning the eta index. For the two-eta case (IIV+IOV combined pattern)
 /// returns the **minimum** index; BSV etas are numbered `0..n_eta` and kappa etas
 /// `n_eta..`, so min always selects the BSV eta regardless of expression order.
-fn find_exp_eta_in_mul<'a, V: RhsView<'a>>(v: V) -> Option<usize> {
+fn find_exp_eta_in_mul<'a, V: RhsView<'a>>(v: V, n_bsv: usize) -> Option<usize> {
     if v.is_definition() {
         return None; // eta-free (`InlineScope::record`)
     }
@@ -82,38 +82,31 @@ fn find_exp_eta_in_mul<'a, V: RhsView<'a>>(v: V) -> Option<usize> {
             if let Expression::BinOp(l, BinOp::Add, r) = arg.expr() {
                 let li = if let Expression::Eta(j) = arg.child(l).expr() { Some(*j) } else { None };
                 let ri = if let Expression::Eta(j) = arg.child(r).expr() { Some(*j) } else { None };
-                // The lowest η index the other operand reads, if any (BSV ηs are numbered
-                // before κs).
-                let lowest = |e: &Expression| {
-                    let mut m: Option<usize> = None;
+                // A bare κ (index ≥ `n_bsv`) beside an operand that reads a BSV η is no
+                // reference: in `exp(boxcox(ETA_CL, λ) + KAPPA_CL)` the BSV η is shaped, and
+                // the bare κ was registered as a κ mu-ref, which `method = bayes` refuses
+                // (#1721 review). Every other bare operand is the reference, as before.
+                let reads_bsv = |e: &Expression| {
+                    let mut found = false;
                     visit_expr_nodes(e, &mut |n| {
-                        if let Expression::Eta(j) = n {
-                            m = Some(m.map_or(*j, |m| m.min(*j)));
-                        }
+                        found |= matches!(n, Expression::Eta(j) if *j < n_bsv);
                     });
-                    m
+                    found
+                };
+                let bare_reference = |bare: usize, other: &Expression| {
+                    (bare < n_bsv || !reads_bsv(other)).then_some(bare)
                 };
                 return match (li, ri) {
                     (Some(a), Some(b)) => Some(a.min(b)),
-                    // One operand is not a bare Eta (e.g. exp(ETA + constant)): the bare one
-                    // is the reference unless the other reads a lower-indexed η, e.g.
-                    // `exp(boxcox(ETA_CL, λ) + KAPPA_CL)`, whose bare κ is no BSV
-                    // mu-reference (#1721 review: it was registered as a κ mu-ref, which
-                    // `method = bayes` refuses).
-                    (Some(a), None) => {
-                        lowest(arg.child(r).expr()).is_none_or(|m| m > a).then_some(a)
-                    }
-                    (None, Some(b)) => {
-                        lowest(arg.child(l).expr()).is_none_or(|m| m > b).then_some(b)
-                    }
+                    (Some(a), None) => bare_reference(a, arg.child(r).expr()),
+                    (None, Some(b)) => bare_reference(b, arg.child(l).expr()),
                     (None, None) => None,
                 };
             }
             None
         }
-        Expression::BinOp(l, BinOp::Mul, r) => {
-            find_exp_eta_in_mul(v.child(l)).or_else(|| find_exp_eta_in_mul(v.child(r)))
-        }
+        Expression::BinOp(l, BinOp::Mul, r) => find_exp_eta_in_mul(v.child(l), n_bsv)
+            .or_else(|| find_exp_eta_in_mul(v.child(r), n_bsv)),
         _ => None,
     }
 }
@@ -431,7 +424,7 @@ fn extract_eta_indices_for_var(stmts: &[Statement], var_name: &str) -> Vec<usize
 /// - 2: `exp(log(THETA) + ETA)` → lognormal
 /// - 3: `THETA + ETA` or `ETA + THETA` → additive
 /// - 4: `THETA * exp(ETA) * <const>` → lognormal (`mul_anchors_of` walks the chain)
-fn detect_pattern<'a, V: RhsView<'a>>(v: V) -> Option<(usize, MuRefAnchor, bool)> {
+fn detect_pattern<'a, V: RhsView<'a>>(v: V, n_bsv: usize) -> Option<(usize, MuRefAnchor, bool)> {
     match v.expr() {
         // Pattern 2: exp(log(THETA) + ETA)
         Expression::UnaryFn(name, inner) if name == "exp" => {
@@ -474,7 +467,7 @@ fn detect_pattern<'a, V: RhsView<'a>>(v: V) -> Option<(usize, MuRefAnchor, bool)
         _ => {
             let anchors = v.mul_anchors();
             if anchors.len() == 1 {
-                if let Some(ei) = find_exp_eta_in_mul(v) {
+                if let Some(ei) = find_exp_eta_in_mul(v, n_bsv) {
                     return Some((ei, anchors[0], true));
                 }
             }
@@ -558,21 +551,21 @@ impl MuRefScan<'_> {
             return None;
         };
         let (theta_names, eta_names, nn) = (self.theta_names, self.eta_names, self.nn_specs);
-        let (eta_idx, mu_ref) =
-            classify_mu_ref(raw_expr, theta_names, eta_names, nn).or_else(|| {
-                let inlined = scope.view(at, raw_expr);
-                (!scope.is_empty())
-                    .then(|| classify_mu_ref(inlined, theta_names, eta_names, nn))
-                    .flatten()
-                    .or_else(|| {
-                        let (e, t) = additive_sum_anchor(inlined, self.n_bsv)?;
-                        let mu_ref = MuRef {
-                            theta_name: theta_names.get(t)?.clone(),
-                            transform: MuTransform::Identity,
-                        };
-                        (e < eta_names.len()).then_some((e, mu_ref))
-                    })
-            })?;
+        let (eta_idx, mu_ref) = classify_mu_ref(raw_expr, theta_names, eta_names, self.n_bsv, nn)
+            .or_else(|| {
+            let inlined = scope.view(at, raw_expr);
+            (!scope.is_empty())
+                .then(|| classify_mu_ref(inlined, theta_names, eta_names, self.n_bsv, nn))
+                .flatten()
+                .or_else(|| {
+                    let (e, t) = additive_sum_anchor(inlined, self.n_bsv)?;
+                    let mu_ref = MuRef {
+                        theta_name: theta_names.get(t)?.clone(),
+                        transform: MuTransform::Identity,
+                    };
+                    (e < eta_names.len()).then_some((e, mu_ref))
+                })
+        })?;
         if mu_ref.transform != MuTransform::Identity || eta_idx >= self.n_bsv {
             return Some((eta_idx, mu_ref));
         }
@@ -674,7 +667,7 @@ fn mixnum_eq_class(cond: &Condition) -> Option<usize> {
 /// The trailing `else` fills every class not named; a class named twice keeps the
 /// first arm. `None` (numerical M-step) for anything else, NN anchors included.
 fn detect_mixture_pattern(
-    expr: &Expression, n_classes: usize,
+    expr: &Expression, n_classes: usize, n_bsv: usize,
 ) -> Option<(usize, Vec<usize>, bool)> {
     // The expression must actually be a conditional — a plain `THETA*exp(ETA)`
     // is the classical (class-shared) mu-ref and is handled by `detect_mu_refs`.
@@ -688,9 +681,9 @@ fn detect_mixture_pattern(
     // Validate one arm and fold its (eta, log_transformed) into the running
     // consistency check. Returns the arm's anchor theta index.
     fn check_arm(
-        arm: &Expression, eta: &mut Option<usize>, log_t: &mut Option<bool>,
+        arm: &Expression, eta: &mut Option<usize>, log_t: &mut Option<bool>, n_bsv: usize,
     ) -> Option<usize> {
-        let (ei, anchor, lt) = detect_pattern(arm)?;
+        let (ei, anchor, lt) = detect_pattern(arm, n_bsv)?;
         let MuRefAnchor::Theta(ti) = anchor else {
             // An NN-anchored class arm has no theta to shift.
             return None;
@@ -712,7 +705,7 @@ fn detect_mixture_pattern(
                 if k > n_classes {
                     return None;
                 }
-                let ti = check_arm(then_e.as_ref(), &mut eta, &mut log_t)?;
+                let ti = check_arm(then_e.as_ref(), &mut eta, &mut log_t, n_bsv)?;
                 // First arm naming a class wins, as at eval time.
                 if by_class[k - 1].is_none() {
                     by_class[k - 1] = Some(ti);
@@ -720,7 +713,7 @@ fn detect_mixture_pattern(
                 cur = else_e.as_ref();
             }
             terminal => {
-                let ti = check_arm(terminal, &mut eta, &mut log_t)?;
+                let ti = check_arm(terminal, &mut eta, &mut log_t, n_bsv)?;
                 // The trailing `else` serves every class the chain never named.
                 for slot in by_class.iter_mut() {
                     if slot.is_none() {
@@ -758,7 +751,7 @@ fn detect_mixture_mu_refs(
         let Statement::Assign(name, expr) = s else {
             continue;
         };
-        let class_aware = detect_mixture_pattern(expr, n_classes);
+        let class_aware = detect_mixture_pattern(expr, n_classes, scan.n_bsv);
         let ordinary = match class_aware {
             None => scan.classify_assignment(stmts, &scope, at),
             Some(_) => None,
@@ -823,7 +816,8 @@ fn expr_uses_mixnum(expr: &Expression) -> bool {
 /// `(eta_idx, MuRef)`. Logit forms go first: `detect_pattern` cannot see
 /// `inv_logit(THETA + ETA)` (#918).
 fn classify_mu_ref<'a, V: RhsView<'a>>(
-    expr: V, theta_names: &[String], eta_names: &[String], nn_specs: &[(String, Vec<String>)],
+    expr: V, theta_names: &[String], eta_names: &[String], n_bsv: usize,
+    nn_specs: &[(String, Vec<String>)],
 ) -> Option<(usize, MuRef)> {
     if let Some((eta_idx, theta_idx, prob_scale)) = detect_logit_pattern(expr) {
         if eta_idx < eta_names.len() && theta_idx < theta_names.len() {
@@ -841,7 +835,7 @@ fn classify_mu_ref<'a, V: RhsView<'a>>(
         }
     }
 
-    let (eta_idx, anchor, log_transformed) = detect_pattern(expr)?;
+    let (eta_idx, anchor, log_transformed) = detect_pattern(expr, n_bsv)?;
     if eta_idx >= eta_names.len() {
         return None;
     }
@@ -2389,7 +2383,7 @@ struct ExprClass {
 
 /// Classify a single expression into an `ExprClass`, or return `None` if no ETA
 /// is present / no pattern recognised (caller handles `Custom` fallback).
-fn classify_expr(expr: &Expression, n_theta: usize) -> Option<ExprClass> {
+fn classify_expr(expr: &Expression, n_theta: usize, n_bsv: usize) -> Option<ExprClass> {
     use crate::types::{EtaParamType, ThetaTransform};
 
     // inv_logit(THETA + ETA) or inv_logit(logit(THETA) + ETA)
@@ -2432,7 +2426,7 @@ fn classify_expr(expr: &Expression, n_theta: usize) -> Option<ExprClass> {
     // TVCL * exp(ETA), exp(log(THETA) + ETA), TVCL + ETA, TYPICAL_PK.CL * exp(ETA).
     // NN-anchored variants are still classified as Lognormal/Additive — the
     // eta's *statistical* shape is the same; only the anchor differs.
-    if let Some((ei, anchor, log_transformed)) = detect_pattern(expr) {
+    if let Some((ei, anchor, log_transformed)) = detect_pattern(expr, n_bsv) {
         let valid = match anchor {
             MuRefAnchor::Theta(ti) => ti < n_theta,
             MuRefAnchor::NnOutput { .. } => true,
@@ -2464,7 +2458,7 @@ fn classify_expr(expr: &Expression, n_theta: usize) -> Option<ExprClass> {
     // detect_pattern already handles the Theta-anchored case, so this
     // only fires when anchors.len() != 1 but the expression is still
     // structurally log-normal.
-    if let Some(ei) = find_exp_eta_in_mul(expr) {
+    if let Some(ei) = find_exp_eta_in_mul(expr, n_bsv) {
         if !has_bare_eta(expr) {
             return Some(ExprClass {
                 eta_idx: ei,
@@ -2833,7 +2827,7 @@ fn classify_indiv_params(
                 emit_eta_infos(
                     param_name,
                     &[expr],
-                    classify_expr(expr, n_theta),
+                    classify_expr(expr, n_theta, eta_names.len()),
                     &cx,
                     &mut theta_transform,
                     &mut eta_infos,
@@ -2847,8 +2841,10 @@ fn classify_indiv_params(
                 let candidate_names = collect_assigned_names_in_if(s);
                 for param_name in &candidate_names {
                     if let Some(exprs) = if_branch_exprs(s, param_name) {
-                        let classes: Vec<Option<ExprClass>> =
-                            exprs.iter().map(|e| classify_expr(e, n_theta)).collect();
+                        let classes: Vec<Option<ExprClass>> = exprs
+                            .iter()
+                            .map(|e| classify_expr(e, n_theta, eta_names.len()))
+                            .collect();
                         let unanimous = match classes.split_first() {
                             Some((Some(first), rest)) => rest.iter().all(|c| {
                                 c.as_ref().is_some_and(|c| {
@@ -6068,7 +6064,9 @@ pub fn parse_full_model_with(
                 }
                 _ => None,
             })
-            .filter(|(_, expr)| detect_mixture_pattern(expr, mix.n_classes).is_none())
+            .filter(|(_, expr)| {
+                detect_mixture_pattern(expr, mix.n_classes, model.eta_names.len()).is_none()
+            })
             .map(|(name, _)| name.clone())
             .collect();
         if !unmatched.is_empty() {

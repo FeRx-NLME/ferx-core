@@ -677,3 +677,22 @@ fn a_shaped_eta_beside_a_kappa_is_no_kappa_mu_reference() {
         assert!(m.kappa_mu_refs.is_empty(), "{cl}: {:?}", m.kappa_mu_refs);
     }
 }
+
+/// #1721 review r3, row 4: the guard above is keyed on the bare operand being a κ, not on
+/// index order, so a bare BSV η beside another BSV η stays the reference in either order, as
+/// on `main`. Dies under: the guard keyed on "the other operand reads a lower-indexed η"
+/// (`exp(ETA_V + 0.1 * ETA_CL)` loses its `ETA_V` mu-reference).
+#[test]
+fn a_bare_bsv_eta_beside_another_bsv_eta_stays_the_reference() {
+    for v in ["TVV * exp(ETA_V + 0.1 * ETA_CL)", "TVV * exp(0.1 * ETA_CL + ETA_V)"] {
+        let m = parse_model_string(&format!(
+            "[parameters]\n  theta TVCL(1.0, 0.001, 100.0)\n  theta TVV(10.0, 0.1, 1000.0)\n  \
+             omega ETA_CL ~ 0.09\n  omega ETA_V ~ 0.04\n  sigma EPS ~ 0.01\n\n\
+             [individual_parameters]\n  CL = TVCL * exp(ETA_CL)\n  V = {v}\n\n\
+             [structural_model]\n  pk one_cpt_iv(cl=CL, v=V)\n\n\
+             [error_model]\n  DV ~ proportional(EPS)\n"
+        ))
+        .unwrap();
+        assert!(m.mu_refs.contains_key("ETA_V"), "{v}: {:?}", m.mu_refs);
+    }
+}

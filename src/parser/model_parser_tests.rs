@@ -27950,11 +27950,11 @@ fn the_pattern_three_pair_straddles_the_old_gate() {
         Expression::BinOp(Box::new(Expression::Theta(1)), BinOp::Add, Box::new(Expression::Eta(1)));
     let three = Expression::BinOp(Box::new(two.clone()), BinOp::Add, Box::new(Expression::Eta(2)));
     assert_eq!(
-        classify_expr(&two, 4).map(|c| c.param_type),
+        classify_expr(&two, 4, 4).map(|c| c.param_type),
         Some(Additive),
         "twin 1 must be the old Pattern 3"
     );
-    assert_eq!(classify_expr(&three, 4), None, "twin 2 must miss every pattern");
+    assert_eq!(classify_expr(&three, 4, 4), None, "twin 2 must miss every pattern");
 
     let base = "  CL = TVCL * exp(ETA_CL)\n";
     let m1 = eta_scale_model(&format!("{base}  V = TVV + ETA_V"), "");
@@ -29585,8 +29585,8 @@ fn assert_inliner_matches_eager(
         n += 1;
         changed += usize::from(format!("{raw:?}") != format!("{want:?}"));
         assert_eq!(
-            format!("{:?}", classify_mu_ref(view, tn, en, &[])),
-            format!("{:?}", classify_mu_ref(want, tn, en, &[])),
+            format!("{:?}", classify_mu_ref(view, tn, en, en.len(), &[])),
+            format!("{:?}", classify_mu_ref(want, tn, en, en.len(), &[])),
             "{label}: `{name}` mu-ref"
         );
         // A group's typical value compares by value: the program keeps each
@@ -34866,7 +34866,7 @@ fn a_log_normal_pattern_is_resolved_by_use() {
     );
     for e in [&mul, &sum] {
         assert_eq!(
-            classify_expr(e, 4).map(|c| c.param_type),
+            classify_expr(e, 4, 4).map(|c| c.param_type),
             Some(LogNormal),
             "{e:?} must be a log-normal pattern"
         );
