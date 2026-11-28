@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: LGPL-3.0-or-later
 //! The shared candidate runner (#1178): fit N candidates in parallel,
 //! deduplicate, cache, journal, and report every one of them.
 //!

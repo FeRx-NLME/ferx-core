@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: LGPL-3.0-or-later
 //! What an AMD run leaves behind: `steps.csv`, `candidates.csv`,
 //! `final.ferx`, and the summary the CLI prints (#1184).
 //!

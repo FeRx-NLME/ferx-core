@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: LGPL-3.0-or-later
 //! The Pharmpy anchor for the pipeline's sequencing and its space split
 //! (#1184).
 //!

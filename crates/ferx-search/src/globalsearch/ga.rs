@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: LGPL-3.0-or-later
 //! The genetic algorithm (#1185), written over an abstract fitness oracle.
 //!
 //! Nothing here knows what a gene *is*: a genome is one allele index per

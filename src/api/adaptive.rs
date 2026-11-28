@@ -213,6 +213,10 @@ pub struct AdaptiveSimulationResult {
     /// Ω, σ and Ω_IOV every row tagged with that `draw` was simulated under. Empty for a
     /// run without uncertainty, whose every row is `draw = 1` at the inputs' parameters.
     pub parameters: Vec<DrawnParameters>,
+    /// The run's inputs that fix its random numbers (#946): the seed, the point parameters
+    /// and the decision grid. [`super::decompose_contrast`] and
+    /// [`super::summarize_contrast`] read it to refuse two arms that do not share them.
+    pub manifest: AdaptiveRunManifest,
     /// The shared non-fit diagnostics bundle (#1280 / #1304): parse warnings, data-reader
     /// warnings, the model/data checks, experimental-feature notices, and this run's
     /// ODE-solver diagnostics — the same list [`crate::SimulationOutput::warnings`] carries,
@@ -228,6 +232,25 @@ pub struct AdaptiveSimulationResult {
     /// state — the note [`crate::SimulationOutput::warnings`] carries on the same input
     /// (#867, #1652). Empty for a clean run on a well-formed model.
     pub warnings: Vec<String>,
+}
+
+/// The inputs of an adaptive run that fix its random numbers (#946): see
+/// [`AdaptiveSimulationResult::manifest`]. With the same seed, parameters and grid, two runs
+/// of one model and population draw the same η, κ, assay ε, mixture classes and parameter
+/// draws, whatever their controllers do: η is drawn once per `(draw, sim, subject)` before
+/// the controller runs, and κ and ε are keyed by the grid index, never by how many doses or
+/// decisions came before.
+#[derive(Debug, Clone)]
+#[non_exhaustive]
+pub struct AdaptiveRunManifest {
+    /// [`AdaptiveSimulateOptions::seed`]. `None` drew from entropy.
+    pub seed: Option<u64>,
+    /// The parameters the run was given ([`AdaptiveInputs`]'s `params`); under parameter
+    /// uncertainty the point estimate the draws centre on.
+    pub point_parameters: ModelParameters,
+    /// The decision grid the controller was consulted on, which keys the κ occasions and
+    /// the assay draws.
+    pub decision_times: Vec<f64>,
 }
 
 /// One parameter draw of an adaptive run with parameter uncertainty (#946): see
@@ -1686,7 +1709,20 @@ where
         .enumerate()
         .map(|(k, parameters)| DrawnParameters { draw: k + 1, parameters })
         .collect();
-    Ok(AdaptiveSimulationResult { trajectories, ledger, decisions, metrics, parameters, warnings })
+    let manifest = AdaptiveRunManifest {
+        seed: opts.seed,
+        point_parameters: params.clone(),
+        decision_times: decision_times.to_vec(),
+    };
+    Ok(AdaptiveSimulationResult {
+        trajectories,
+        ledger,
+        decisions,
+        metrics,
+        parameters,
+        manifest,
+        warnings,
+    })
 }
 
 /// Put the adaptive driver's bare readout rows on the scale `simulate()` reports: the

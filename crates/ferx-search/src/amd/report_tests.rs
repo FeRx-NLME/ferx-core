@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: LGPL-3.0-or-later
 use super::super::{AmdOptions, AmdResult, CandidateRow, Retries, Step, StepOutcome, Strategy};
 use super::*;
 use crate::search::test_support::{converged_fit, model_text};

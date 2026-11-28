@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: LGPL-3.0-or-later
 //! What a search hands the runner, and what it gets back (#1178).
 //!
 //! A [`Candidate`] is a rendered model plus its provenance: the id the search

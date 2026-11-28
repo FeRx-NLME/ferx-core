@@ -3353,9 +3353,9 @@ fn find_ebe_solve(
             stop_precond,
             &stall_at,
             short_line_search,
-            // The stall escape rides on `inner_kick` (#3159 land): on by default it fired 390
-            // times in a smooth transit fit, and the EBEs it moved broke BOBYQA's convergence.
-            use_analytic && policy.kick,
+            // Not on every model (#3159 land): on by default it fired 390 times in a smooth
+            // transit fit, and the EBEs it moved broke BOBYQA's convergence.
+            kink::kink_escape_allowed(model, use_analytic, policy.kick),
         )
     };
 
@@ -4507,8 +4507,7 @@ fn find_ebe_iov_seeded(
         None,
         &stall_at,
         false,
-        // The stall escape rides on `inner_kick`, as in `find_ebe_solve` (#3159 land).
-        analytic_iov_inner && kick,
+        kink::kink_escape_allowed(model, analytic_iov_inner, kick),
     );
     // On BFGS failure, recover exactly as the non-IOV `find_ebe` does (cold seed = prior
     // mode `bsv_psi = μ`, κ = 0): keep the lower-objective of {BFGS partial, NM restart}

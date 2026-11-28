@@ -175,6 +175,8 @@ website:
           - api/model-editing.qmd
       - text: "FAQ"
         href: faq.qmd
+      - text: "License"
+        href: license.qmd
       - text: "Development"
         href: development/index.qmd
         contents:
@@ -187,7 +189,7 @@ website:
   page-footer:
     background: light
     border: true
-    left: "© 2026 FeRx-NLME · MIT licensed"
+    left: "© 2026 FeRx-NLME · MIT and LGPL-3.0 licensed"
     right: "Fe · 26 · Rx · 2026"
 
 format:

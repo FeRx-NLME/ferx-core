@@ -1,11 +1,13 @@
 """Generates clipped.csv: python3 make_data.py clipped.csv 41 150 0.15 (plain Python 3, written
-against 3.12). It draws the 40 subjects of #3159 and writes IDs 1, 2, 14, 17, 20 and 27."""
+against 3.12). It draws the 40 subjects of #3159 and writes IDs 1, 2, 14, 17, 20 and 27, or the IDs
+given after the noise SD: stall_iiv.csv is python3 make_data.py stall_iiv.csv 45 150 0.15 40 (#3210)."""
 import csv
 import math
 import random
 import sys
 
 out, seed, nobs, sd = sys.argv[1], int(sys.argv[2]), int(sys.argv[3]), float(sys.argv[4])
+ids = [int(a) for a in sys.argv[5:]] or [1, 2, 14, 17, 20, 27]
 rnd = random.Random(seed)
 rows = []
 for i in range(1, 41):
@@ -22,4 +24,4 @@ for i in range(1, 41):
 with open(out, 'w', newline='') as f:
     w = csv.DictWriter(f, fieldnames=list(rows[0]))
     w.writeheader()
-    w.writerows(r for r in rows if r['ID'] in (1, 2, 14, 17, 20, 27))
+    w.writerows(r for r in rows if r['ID'] in ids)

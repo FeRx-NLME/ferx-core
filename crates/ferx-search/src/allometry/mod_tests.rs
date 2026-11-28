@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: LGPL-3.0-or-later
 //! Tier-1 tests for the allometry tool (#1180): what the edit writes, and
 //! how the options are read. No fits — `run_allometry` is exercised
 //! end-to-end in `tests/covsearch_end_to_end.rs`.

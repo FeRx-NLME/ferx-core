@@ -20,7 +20,7 @@ use AdaptiveVarianceScope as Sc;
 
 // ── hand-built rows ────────────────────────────────────────────────────────────────────
 
-fn metrics_row(
+pub(super) fn metrics_row(
     id: &str, (draw, sim, rep): (usize, usize, usize), y: f64,
 ) -> AdaptiveSubjectMetrics {
     AdaptiveSubjectMetrics {
@@ -48,7 +48,9 @@ fn metrics_row(
 
 /// The balanced rows of `cubes` (`(id, y[d][s][r])`), with `n_draws` parameter sets when
 /// `uncertain` (their values are not read by the kernel).
-fn result_of(cubes: &[(&str, &[[[f64; 2]; 2]])], uncertain: bool) -> AdaptiveSimulationResult {
+pub(super) fn result_of(
+    cubes: &[(&str, &[[[f64; 2]; 2]])], uncertain: bool,
+) -> AdaptiveSimulationResult {
     let mut metrics = Vec::new();
     for (id, y) in cubes {
         for (d, sims) in y.iter().enumerate() {
@@ -72,6 +74,11 @@ fn result_of(cubes: &[(&str, &[[[f64; 2]; 2]])], uncertain: bool) -> AdaptiveSim
         decisions: vec![],
         metrics,
         parameters,
+        manifest: AdaptiveRunManifest {
+            seed: Some(946),
+            point_parameters: template,
+            decision_times: DECISIONS.to_vec(),
+        },
         warnings: vec![],
     }
 }
@@ -104,19 +111,19 @@ fn cell<'a>(
         .unwrap_or_else(|| panic!("no {metric:?} {scope:?} {layer:?}"))
 }
 
-fn est(d: &AdaptiveDecomposition, scope: &Sc, layer: L) -> (f64, Option<f64>) {
+pub(super) fn est(d: &AdaptiveDecomposition, scope: &Sc, layer: L) -> (f64, Option<f64>) {
     match cell(d, &M::SignalMean, scope, layer).status {
         St::Estimated { value, mc_se } => (value, mc_se),
         other => panic!("{scope:?} {layer:?} is {other:?}"),
     }
 }
 
-fn subject(id: &str) -> Sc {
+pub(super) fn subject(id: &str) -> Sc {
     Sc::Subject(id.into())
 }
 
 /// draw 1: sim 1 [1, 3], sim 2 [4, 8]; draw 2: sim 1 [2, 2], sim 2 [9, 5].
-const CUBE: [[[f64; 2]; 2]; 2] = [[[1.0, 3.0], [4.0, 8.0]], [[2.0, 2.0], [9.0, 5.0]]];
+pub(super) const CUBE: [[[f64; 2]; 2]; 2] = [[[1.0, 3.0], [4.0, 8.0]], [[2.0, 2.0], [9.0, 5.0]]];
 
 // ── the kernel on hand-computed arrays ─────────────────────────────────────────────────
 
@@ -327,7 +334,7 @@ fn rows_that_are_not_a_balanced_set_are_refused() {
 
 /// A 1-cpt IV ODE, CL = TVCL·exp(η [+ κ]), V fixed; the cmt-1 monitor reads the central
 /// **amount**. `kappa` is an extra `[parameters]` line (an IOV κ on CL) or empty.
-fn model(omega: &str, kappa: &str) -> CompiledModel {
+pub(super) fn model(omega: &str, kappa: &str) -> CompiledModel {
     let cl = if kappa.is_empty() { "TVCL * exp(ETA_CL)" } else { "TVCL * exp(ETA_CL + KAPPA_CL)" };
     parse_model_string(&format!(
         r#"
@@ -353,13 +360,13 @@ fn model(omega: &str, kappa: &str) -> CompiledModel {
     .expect("parse")
 }
 
-const DECISIONS: [f64; 3] = [0.0, 24.0, 48.0];
+pub(super) const DECISIONS: [f64; 3] = [0.0, 24.0, 48.0];
 
-fn pop(n: usize) -> Population {
+pub(super) fn pop(n: usize) -> Population {
     population((1..=n).map(|i| subj(&i.to_string(), vec![6.0, 30.0, 54.0], vec![])).collect())
 }
 
-fn opts(mode: ObserveMode, n_reps: usize) -> AdaptiveSimulateOptions {
+pub(super) fn opts(mode: ObserveMode, n_reps: usize) -> AdaptiveSimulateOptions {
     AdaptiveSimulateOptions {
         seed: Some(946),
         decision_times: DECISIONS.to_vec(),
@@ -505,7 +512,7 @@ fn zero_reps_are_refused() {
 // ── the analytic conditional oracle ────────────────────────────────────────────────────
 
 /// Probabilists' Gauss–Hermite nodes and normalised weights (Golub–Welsch).
-fn gauss_hermite(n: usize) -> (Vec<f64>, Vec<f64>) {
+pub(super) fn gauss_hermite(n: usize) -> (Vec<f64>, Vec<f64>) {
     let mut j = nalgebra::DMatrix::<f64>::zeros(n, n);
     for k in 1..n {
         j[(k - 1, k)] = (k as f64).sqrt();
@@ -558,7 +565,7 @@ fn conditional_moments(tvcl: f64, v: f64, omega2: f64, iov2: f64) -> [f64; 3] {
 /// The fixture's fit: packed variance 0.04 on ln TVCL only (log-normal θ); every other
 /// coordinate gets the sampler's floor, and the oracle reads each draw's θ, ω and ω_IOV
 /// back from `result.parameters`, so the floor's movements are accounted for.
-fn iov_fit(m: &CompiledModel) -> FitResult {
+pub(super) fn iov_fit(m: &CompiledModel) -> FitResult {
     let mut fit = super::simulate_with_uncertainty_tests::synthetic_fit(&m.default_params);
     fit.omega_iov = m.default_params.omega_iov.as_ref().map(|o| o.matrix.clone());
     fit.kappa_names = m.default_params.omega_iov.as_ref().map_or(vec![], |o| o.eta_names.clone());
@@ -725,5 +732,36 @@ fn absorbed_step_warning_names_the_rep_of_the_first_replicate() {
             "From the start dose on: '1' in 2 of 4 replicate(s), first in sim 1, rep 2 at 500."
         ),
         "{w}"
+    );
+}
+
+/// The labels are ferx-r's tokens, one per variant, unique per enum (ferx-r#779 review
+/// finding 4). The `match`es without a wildcard stop compiling when a variant is added.
+///
+/// Mutation: any label changed or duplicated.
+#[test]
+fn every_scope_layer_and_status_has_a_unique_stable_label() {
+    let _exhaustive = |s: &Sc| match s {
+        Sc::Population | Sc::Subject(_) => (),
+    };
+    assert_eq!(
+        [Sc::Population, Sc::Subject("1".into())].map(|s| s.label()),
+        ["population", "subject"]
+    );
+
+    let _exhaustive = |l: &L| match l {
+        L::Parameter | L::Bsv | L::Within | L::BetweenRow | L::Total => (),
+    };
+    assert_eq!(
+        [L::Parameter, L::Bsv, L::Within, L::BetweenRow, L::Total].map(|l| l.label()),
+        ["parameter", "bsv", "within", "between_subject", "total"]
+    );
+
+    let _exhaustive = |s: &St| match s {
+        St::Estimated { .. } | St::Supplied | St::NotDrawn => (),
+    };
+    assert_eq!(
+        [St::Estimated { value: 1.0, mc_se: None }, St::Supplied, St::NotDrawn].map(|s| s.label()),
+        ["estimated", "supplied", "not_drawn"]
     );
 }

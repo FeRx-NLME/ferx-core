@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: LGPL-3.0-or-later
 //! The `.ferxsearch` file: what to search over, and how to fit and judge each
 //! candidate (#1179).
 //!

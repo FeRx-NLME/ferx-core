@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: LGPL-3.0-or-later
 //! Fixtures shared by the `search` unit tests.
 //!
 //! The one thing these tests cannot fake is a [`FitResult`]: it has 130-odd

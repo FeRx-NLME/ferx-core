@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: LGPL-3.0-or-later
 //! Stepwise covariate modelling — PsN `scm` forward / forward-then-backward,
 //! Pharmpy `covsearch` (#1180).
 //!

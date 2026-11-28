@@ -3,7 +3,7 @@ Plain Python 3 (no dependencies; written against 3.12): python3 oracle.py clippe
 obj = sum (DV - max(0, BASE*exp(-K*tad) - TH_occ))^2/sigma^2 + eta' Omega^-1 eta + sum kappa^2/omega_kappa,
 BASE = TVBASE*exp(eta_1), TH_occ = TVTH*exp(eta_2 + kappa_occ), at clipped.ferx's initial estimates,
 minimised by Nelder-Mead from 0 with three simplex sizes, polished three times. occ1: occasion 1
-only, without kappa (the no-IOV variant of without_iov_the_kicks_reach_a_second_mode)."""
+only, without kappa (the no-IOV variants of the tests)."""
 import csv
 import math
 import sys

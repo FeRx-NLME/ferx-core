@@ -36770,3 +36770,123 @@ fn a_zero_fix_block_goes_whole_and_a_zero_fix_kappa_stays() {
     assert_eq!(kappa.kappa_names, ["KAPPA_CL"], "a κ placeholder is left as declared");
     assert!(dropped_note(&kappa).is_some_and(|n| n.contains("omega ETA_Z1 ~ 0 FIX is held")));
 }
+
+/// The kink flag that turns the inner stall escape on by default (#3210). A branch counts when
+/// its condition or operand reads a random effect or a state, in `[individual_parameters]` or a
+/// `y` readout; a branch on time, a covariate or θ alone, one in `[derived]`, and an `[odes]`
+/// switch do not. Each mutation reddens its own rows: the predicate stuck at `true` reddens every
+/// negative, stuck at `false` every positive; dropping the dependence test reddens the TIME, WT
+/// and θ rows only; skipping block `if` conditions reddens the block-`if` row only, and not
+/// recursing into an `if` body or an `else` body reddens its nested row only; a taint blind to
+/// κ slots reddens the κ row only.
+#[test]
+fn prediction_has_kink_flags_an_eta_or_state_branch_on_the_prediction_path() {
+    let model = |indiv: &str, odes: &str, scaling: &str| {
+        format!(
+            "[parameters]\n  theta TVBASE(10.0, 0.1, 100.0)\n  theta K(0.15, 0.001, 5.0)\n  \
+             theta TVTH(4.0, 0.01, 50.0)\n  omega ETA_BASE ~ 0.04\n  omega ETA_TH ~ 0.09\n  \
+             sigma ADD_ERR ~ 0.15 (sd)\n[individual_parameters]\n  BASE = TVBASE * exp(ETA_BASE)\n  \
+             TH = TVTH * exp(ETA_TH)\n  F1 = BASE\n{indiv}\n[structural_model]\n  \
+             ode(obs_cmt=eff, states=[eff])\n[odes]\n  d/dt(eff) = {odes}\n[scaling]\n  \
+             y = {scaling}\n[error_model]\n  DV ~ additive(ADD_ERR)\n"
+        )
+    };
+    let decay = "-KI * eff";
+    let mut rows: Vec<(String, String, bool)> = ["abs", "floor", "ceil", "round"]
+        .iter()
+        .map(|f| {
+            let indiv = format!("  KI = K * exp({f}(ETA_BASE))");
+            (format!("{f}(η) in an individual parameter"), model(&indiv, decay, "eff"), true)
+        })
+        .collect();
+    rows.extend(
+        [
+            (
+                "clipped readout (state and η)",
+                model("  KI = K", decay, "if (eff - TH < 0) 0 else eff - TH"),
+                true,
+            ),
+            ("max readout, η in TH", model("  KI = K", decay, "max(eff - TH, 0)"), true),
+            (
+                "a readout branch on the state alone",
+                model("  KI = K", decay, "if (eff > 5) eff else 2 * eff"),
+                true,
+            ),
+            (
+                "an η reached through TH only",
+                model("  KI = if (TH > 5) K else 2 * K", decay, "eff"),
+                true,
+            ),
+            (
+                "block if on η",
+                model(
+                    "  if (ETA_BASE > 0) {\n    KI = K\n  } else {\n    KI = 2 * K\n  }",
+                    decay,
+                    "eff",
+                ),
+                true,
+            ),
+            (
+            "nested block if on η",
+            model(
+                "  if (K > 1) {\n    if (ETA_BASE > 0) {\n      KI = K\n    } else {\n      KI = 2 * K\n    \
+                 }\n  } else {\n    KI = 3 * K\n  }",
+                decay,
+                "eff",
+            ),
+            true,
+        ),
+        (
+            "block if on η inside an else body",
+            model(
+                "  if (K > 1) {\n    KI = K\n  } else {\n    KI = 2 * K\n    if (ETA_BASE > 0) {\n      \
+                 KI = 3 * K\n    }\n  }",
+                decay,
+                "eff",
+            ),
+            true,
+        ),
+        (
+            "a branch on a κ alone",
+            model("  KI = if (KAPPA_TH > 0) K else 2 * K", decay, "eff")
+                .replace("  sigma ADD_ERR", "  kappa KAPPA_TH ~ 0.04\n  sigma ADD_ERR"),
+            true,
+        ),
+        ("if on TIME", model("  KI = K", decay, "if (TIME > 6) eff else 2 * eff"), false),
+            ("if on WT", model("  KI = if (WT > 70) K else 2 * K", decay, "eff"), false),
+            ("a branch on θ alone", model("  KI = if (K > 1) K else 2 * K", decay, "eff"), false),
+            (
+                "an [odes] switch on the observed state",
+                model("  KI = K", "if (eff > 5) -KI * eff else -2 * KI * eff", "eff"),
+                false,
+            ),
+            ("a smooth readout", model("  KI = K", decay, "eff - TH"), false),
+        ]
+        .map(|(what, src, want)| (what.to_string(), src, want)),
+    );
+    let mut wrong = Vec::new();
+    for (what, src, want) in &rows {
+        let got = parse_full_model(src).unwrap_or_else(|e| panic!("{what}: {e}")).model;
+        if got.prediction_has_kink != *want {
+            wrong.push(format!("{what}: {}", got.prediction_has_kink));
+        }
+    }
+    // `warfarin_ode_time` has a branch on an unobserved state and on TAD in `[odes]`, and
+    // `max(IPRED)` in `[derived]`; the six done-5 ODE examples have no branch (#3210 m1).
+    let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("examples");
+    for name in [
+        "warfarin_ode_time",
+        "mm_iv",
+        "mm_oral",
+        "emax_pkpd",
+        "one_cpt_iv_ode",
+        "pkpd_nonmem",
+        "transit_2cpt",
+    ] {
+        let parsed = parse_full_model_file(&dir.join(format!("{name}.ferx"))).expect(name);
+        if parsed.model.prediction_has_kink {
+            wrong.push(format!("{name}: true"));
+        }
+    }
+    assert!(wrong.is_empty(), "rows the flag got wrong: {wrong:#?}");
+}

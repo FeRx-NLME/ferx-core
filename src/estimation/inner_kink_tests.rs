@@ -1,7 +1,7 @@
 //! Tier 1 for the non-smooth individual objective (#3159), on a V-shaped valley with a closed
 //! form, where the end-to-end fixture (`tests/inner_kink_nonsmooth.rs`) has none.
 
-use super::kink::{kick_restarts, min_norm_hull, stall_escape, STALL_GNORM};
+use super::kink::{kick_restarts, kink_escape_allowed, min_norm_hull, stall_escape, STALL_GNORM};
 
 /// `f = 10|x| + ½(y − 3)²`: a kink along `x = 0` whose floor falls toward `y = 3`. The gradient
 /// on the floor is `(±10, y − 3)`, across the valley, and every gradient step crosses the kink.
@@ -110,4 +110,28 @@ fn a_kick_restart_visits_at_most_sixteen_coordinates_the_widest_first() {
     assert!(r.is_none());
     assert_eq!(visited.len(), 32, "{visited:?}");
     assert!(visited.iter().all(|&j| j >= 24), "{visited:?}");
+}
+
+/// The escape's gate (#3210), all eight cells of analytic × `inner_kick` × kink flag: it runs on
+/// an analytic gradient where the model has a kink or `inner_kick` asks for it, and never on an
+/// FD gradient. Swapping either `&&`/`||`, or dropping any one term, flips at least one cell.
+#[test]
+fn the_stall_escape_runs_on_an_analytic_gradient_with_a_kink_or_inner_kick() {
+    let mut model = crate::types::test_helpers::ode_model(crate::types::GradientMethod::Auto);
+    // (analytic, inner_kick, kink) → runs.
+    let table = [
+        ((false, false, false), false),
+        ((false, false, true), false),
+        ((false, true, false), false),
+        ((false, true, true), false),
+        ((true, false, false), false),
+        ((true, false, true), true),
+        ((true, true, false), true),
+        ((true, true, true), true),
+    ];
+    for ((analytic, kick, kink), want) in table {
+        model.prediction_has_kink = kink;
+        let got = kink_escape_allowed(&model, analytic, kick);
+        assert_eq!(got, want, "analytic {analytic}, inner_kick {kick}, kink {kink}");
+    }
 }

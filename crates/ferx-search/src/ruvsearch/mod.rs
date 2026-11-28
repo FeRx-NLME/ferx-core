@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: LGPL-3.0-or-later
 //! Residual-error model search — Pharmpy `ruvsearch` (#1182).
 //!
 //! The third search tool of the #1175 epic, over the block the other two

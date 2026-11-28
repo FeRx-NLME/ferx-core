@@ -5,7 +5,7 @@
 [![Docs](https://github.com/FeRx-NLME/ferx-core/actions/workflows/docs.yml/badge.svg)](https://github.com/FeRx-NLME/ferx-core/actions/workflows/docs.yml)
 [![codecov](https://codecov.io/gh/FeRx-NLME/ferx-core/branch/main/graph/badge.svg)](https://codecov.io/gh/FeRx-NLME/ferx-core)
 [![CodeFactor](https://www.codefactor.io/repository/github/ferx-nlme/ferx-core/badge)](https://www.codefactor.io/repository/github/ferx-nlme/ferx-core)
-[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
+[![License: MIT + LGPL-3.0](https://img.shields.io/badge/License-MIT%20%2B%20LGPL--3.0-yellow.svg)](LICENSE)
 
 [Website](https://ferx-nlme.org/) · [Documentation](https://ferx-nlme.org/ferx-core/) · [R package](https://github.com/FeRx-NLME/ferx-r) · [Examples](https://ferx-nlme.org/ferx-core/examples/)
 
@@ -186,9 +186,18 @@ preds <- ferx_predict("warfarin.ferx", "warfarin.csv")
 
 ## License
 
-MIT — see [LICENSE](LICENSE).
+MIT, except the model-search crate — see [LICENSE](LICENSE) and the
+[License](https://ferx-nlme.org/ferx-core/license.html) page.
 
-One exception: the test fixture `data/mbma_naproxen.csv` is derived from a
+- `ferx-core`, `ferx-tools` and the `ferx-cli` source are MIT.
+- `crates/ferx-search` (the search tools) is **LGPL-3.0-or-later**: it follows
+  the behaviour of [Pharmpy](https://github.com/pharmpy/pharmpy). Releases of
+  that code inside `ferx-tools`, up to and including 0.4.0, remain MIT.
+- The `ferx` binary links `ferx-search` and third-party code, including
+  NLopt's LGPL-2.1 Luksan routines; `ferx --licenses` prints every license and
+  notice it carries and how to rebuild it with a modified `ferx-search`.
+
+One more exception: the test fixture `data/mbma_naproxen.csv` is derived from a
 CC BY-NC 4.0 publication and carries that licence instead, so **commercial use
 of that file is not granted**. It is test data only — never linked into the
 `ferx` binary, and excluded from the packaged crate along with its README and

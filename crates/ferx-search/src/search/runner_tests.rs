@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: LGPL-3.0-or-later
 //! Orchestration tests for [`Runner`] (#1178).
 //!
 //! Every test here drives [`Runner::run_with_fitter`] rather than `run`, so the

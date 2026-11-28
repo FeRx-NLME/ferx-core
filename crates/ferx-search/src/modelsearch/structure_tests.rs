@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: LGPL-3.0-or-later
 //! Tier-1 tests for the structural coordinates, Pharmpy's move rules and
 //! the structure → `pk` line derivation (#1181).
 
