@@ -2521,3 +2521,57 @@ fn dropping_a_random_effect_off_a_modeled_duration_keeps_the_duration() {
     let indiv = text.block_lines("individual_parameters");
     assert!(indiv.contains(&"D1 = TVX".to_string()), "{indiv:?}");
 }
+
+// ── [eta_shape] (#1721 review) ─────────────────────────────────────────────
+
+const SHAPED: &str = "[parameters]
+  theta TVCL(0.2, 0.001, 10.0)
+  theta TVV(10.0, 0.1, 500.0)
+  omega ETA_CL ~ 0.09
+  omega ETA_V  ~ 0.04
+  sigma PROP_ERR ~ 0.02
+
+[individual_parameters]
+  CL = TVCL * exp(ETA_CL)
+  V  = TVV  * exp(ETA_V)
+
+[eta_shape]
+  ETA_CL ~ boxcox()
+
+[structural_model]
+  pk one_cpt_iv(cl=CL, v=V)
+
+[error_model]
+  DV ~ proportional(PROP_ERR)
+";
+
+/// Dropping a shaped ETA removes its `[eta_shape]` line with its omega, and the edited
+/// model parses. Dies under: the shape line left behind ("not a declared ETA"), or kept
+/// alive as a reader so the omega stays.
+#[test]
+fn drop_iiv_takes_the_eta_shape_line_with_it() {
+    let mut text = ModelText::parse(SHAPED).unwrap();
+    apply(&mut text, ModelEdit::DropIiv { param: "CL".into() });
+    let out = text.render();
+    assert!(!out.contains("ETA_CL"), "{out}");
+    crate::parser::model_parser::parse_model_string(&out).unwrap_or_else(|e| panic!("{e}\n{out}"));
+}
+
+/// `SeedInits` carries an auto-declared shape θ over: the `[eta_shape]` line names it and
+/// `[parameters]` declares it at the fitted value, so a warm start does not restart λ at
+/// 0.01. Dies under: the auto-declared θ skipped.
+#[test]
+fn seed_inits_carries_an_auto_declared_shape_theta() {
+    let fit = fit_with(&["TVCL", "LAMBDA_ETA_CL"], &[0.3, -0.42], &["ETA_CL"], &[0.1], &[], &[]);
+    let mut text = ModelText::parse(SHAPED).unwrap();
+    apply(&mut text, ModelEdit::SeedInits(&fit));
+    assert!(text.block_lines("eta_shape").contains(&"ETA_CL ~ boxcox(LAMBDA_ETA_CL)".to_string()));
+    assert!(
+        text.block_lines("parameters").contains(&"theta LAMBDA_ETA_CL(-0.42, -3, 3)".to_string()),
+        "{:?}",
+        text.block_lines("parameters")
+    );
+    let m = crate::parser::model_parser::parse_model_string(&text.render()).unwrap();
+    let k = m.theta_names.iter().position(|n| n == "LAMBDA_ETA_CL").unwrap();
+    assert_eq!(m.default_params.theta[k], -0.42);
+}

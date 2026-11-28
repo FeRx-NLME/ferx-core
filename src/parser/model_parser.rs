@@ -68,7 +68,7 @@ fn mul_anchors_of<'a, V: RhsView<'a>>(v: V) -> Vec<MuRefAnchor> {
 /// returning the eta index. For the two-eta case (IIV+IOV combined pattern)
 /// returns the **minimum** index; BSV etas are numbered `0..n_eta` and kappa etas
 /// `n_eta..`, so min always selects the BSV eta regardless of expression order.
-fn find_exp_eta_in_mul<'a, V: RhsView<'a>>(v: V) -> Option<usize> {
+fn find_exp_eta_in_mul<'a, V: RhsView<'a>>(v: V, n_bsv: usize) -> Option<usize> {
     if v.is_definition() {
         return None; // eta-free (`InlineScope::record`)
     }
@@ -82,18 +82,31 @@ fn find_exp_eta_in_mul<'a, V: RhsView<'a>>(v: V) -> Option<usize> {
             if let Expression::BinOp(l, BinOp::Add, r) = arg.expr() {
                 let li = if let Expression::Eta(j) = arg.child(l).expr() { Some(*j) } else { None };
                 let ri = if let Expression::Eta(j) = arg.child(r).expr() { Some(*j) } else { None };
+                // A bare κ (index ≥ `n_bsv`) beside an operand that reads a BSV η is no
+                // reference: in `exp(boxcox(ETA_CL, λ) + KAPPA_CL)` the BSV η is shaped, and
+                // the bare κ was registered as a κ mu-ref, which `method = bayes` refuses
+                // (#1721 review). Every other bare operand is the reference, as before.
+                let reads_bsv = |e: &Expression| {
+                    let mut found = false;
+                    visit_expr_nodes(e, &mut |n| {
+                        found |= matches!(n, Expression::Eta(j) if *j < n_bsv);
+                    });
+                    found
+                };
+                let bare_reference = |bare: usize, other: &Expression| {
+                    (bare < n_bsv || !reads_bsv(other)).then_some(bare)
+                };
                 return match (li, ri) {
                     (Some(a), Some(b)) => Some(a.min(b)),
-                    // One operand is not a bare Eta (e.g. exp(ETA + constant));
-                    // return whichever index was found.
-                    (a, b) => a.or(b),
+                    (Some(a), None) => bare_reference(a, arg.child(r).expr()),
+                    (None, Some(b)) => bare_reference(b, arg.child(l).expr()),
+                    (None, None) => None,
                 };
             }
             None
         }
-        Expression::BinOp(l, BinOp::Mul, r) => {
-            find_exp_eta_in_mul(v.child(l)).or_else(|| find_exp_eta_in_mul(v.child(r)))
-        }
+        Expression::BinOp(l, BinOp::Mul, r) => find_exp_eta_in_mul(v.child(l), n_bsv)
+            .or_else(|| find_exp_eta_in_mul(v.child(r), n_bsv)),
         _ => None,
     }
 }
@@ -411,7 +424,7 @@ fn extract_eta_indices_for_var(stmts: &[Statement], var_name: &str) -> Vec<usize
 /// - 2: `exp(log(THETA) + ETA)` → lognormal
 /// - 3: `THETA + ETA` or `ETA + THETA` → additive
 /// - 4: `THETA * exp(ETA) * <const>` → lognormal (`mul_anchors_of` walks the chain)
-fn detect_pattern<'a, V: RhsView<'a>>(v: V) -> Option<(usize, MuRefAnchor, bool)> {
+fn detect_pattern<'a, V: RhsView<'a>>(v: V, n_bsv: usize) -> Option<(usize, MuRefAnchor, bool)> {
     match v.expr() {
         // Pattern 2: exp(log(THETA) + ETA)
         Expression::UnaryFn(name, inner) if name == "exp" => {
@@ -454,7 +467,7 @@ fn detect_pattern<'a, V: RhsView<'a>>(v: V) -> Option<(usize, MuRefAnchor, bool)
         _ => {
             let anchors = v.mul_anchors();
             if anchors.len() == 1 {
-                if let Some(ei) = find_exp_eta_in_mul(v) {
+                if let Some(ei) = find_exp_eta_in_mul(v, n_bsv) {
                     return Some((ei, anchors[0], true));
                 }
             }
@@ -538,21 +551,21 @@ impl MuRefScan<'_> {
             return None;
         };
         let (theta_names, eta_names, nn) = (self.theta_names, self.eta_names, self.nn_specs);
-        let (eta_idx, mu_ref) =
-            classify_mu_ref(raw_expr, theta_names, eta_names, nn).or_else(|| {
-                let inlined = scope.view(at, raw_expr);
-                (!scope.is_empty())
-                    .then(|| classify_mu_ref(inlined, theta_names, eta_names, nn))
-                    .flatten()
-                    .or_else(|| {
-                        let (e, t) = additive_sum_anchor(inlined, self.n_bsv)?;
-                        let mu_ref = MuRef {
-                            theta_name: theta_names.get(t)?.clone(),
-                            transform: MuTransform::Identity,
-                        };
-                        (e < eta_names.len()).then_some((e, mu_ref))
-                    })
-            })?;
+        let (eta_idx, mu_ref) = classify_mu_ref(raw_expr, theta_names, eta_names, self.n_bsv, nn)
+            .or_else(|| {
+            let inlined = scope.view(at, raw_expr);
+            (!scope.is_empty())
+                .then(|| classify_mu_ref(inlined, theta_names, eta_names, self.n_bsv, nn))
+                .flatten()
+                .or_else(|| {
+                    let (e, t) = additive_sum_anchor(inlined, self.n_bsv)?;
+                    let mu_ref = MuRef {
+                        theta_name: theta_names.get(t)?.clone(),
+                        transform: MuTransform::Identity,
+                    };
+                    (e < eta_names.len()).then_some((e, mu_ref))
+                })
+        })?;
         if mu_ref.transform != MuTransform::Identity || eta_idx >= self.n_bsv {
             return Some((eta_idx, mu_ref));
         }
@@ -654,7 +667,7 @@ fn mixnum_eq_class(cond: &Condition) -> Option<usize> {
 /// The trailing `else` fills every class not named; a class named twice keeps the
 /// first arm. `None` (numerical M-step) for anything else, NN anchors included.
 fn detect_mixture_pattern(
-    expr: &Expression, n_classes: usize,
+    expr: &Expression, n_classes: usize, n_bsv: usize,
 ) -> Option<(usize, Vec<usize>, bool)> {
     // The expression must actually be a conditional — a plain `THETA*exp(ETA)`
     // is the classical (class-shared) mu-ref and is handled by `detect_mu_refs`.
@@ -668,9 +681,9 @@ fn detect_mixture_pattern(
     // Validate one arm and fold its (eta, log_transformed) into the running
     // consistency check. Returns the arm's anchor theta index.
     fn check_arm(
-        arm: &Expression, eta: &mut Option<usize>, log_t: &mut Option<bool>,
+        arm: &Expression, eta: &mut Option<usize>, log_t: &mut Option<bool>, n_bsv: usize,
     ) -> Option<usize> {
-        let (ei, anchor, lt) = detect_pattern(arm)?;
+        let (ei, anchor, lt) = detect_pattern(arm, n_bsv)?;
         let MuRefAnchor::Theta(ti) = anchor else {
             // An NN-anchored class arm has no theta to shift.
             return None;
@@ -692,7 +705,7 @@ fn detect_mixture_pattern(
                 if k > n_classes {
                     return None;
                 }
-                let ti = check_arm(then_e.as_ref(), &mut eta, &mut log_t)?;
+                let ti = check_arm(then_e.as_ref(), &mut eta, &mut log_t, n_bsv)?;
                 // First arm naming a class wins, as at eval time.
                 if by_class[k - 1].is_none() {
                     by_class[k - 1] = Some(ti);
@@ -700,7 +713,7 @@ fn detect_mixture_pattern(
                 cur = else_e.as_ref();
             }
             terminal => {
-                let ti = check_arm(terminal, &mut eta, &mut log_t)?;
+                let ti = check_arm(terminal, &mut eta, &mut log_t, n_bsv)?;
                 // The trailing `else` serves every class the chain never named.
                 for slot in by_class.iter_mut() {
                     if slot.is_none() {
@@ -738,7 +751,7 @@ fn detect_mixture_mu_refs(
         let Statement::Assign(name, expr) = s else {
             continue;
         };
-        let class_aware = detect_mixture_pattern(expr, n_classes);
+        let class_aware = detect_mixture_pattern(expr, n_classes, scan.n_bsv);
         let ordinary = match class_aware {
             None => scan.classify_assignment(stmts, &scope, at),
             Some(_) => None,
@@ -803,7 +816,8 @@ fn expr_uses_mixnum(expr: &Expression) -> bool {
 /// `(eta_idx, MuRef)`. Logit forms go first: `detect_pattern` cannot see
 /// `inv_logit(THETA + ETA)` (#918).
 fn classify_mu_ref<'a, V: RhsView<'a>>(
-    expr: V, theta_names: &[String], eta_names: &[String], nn_specs: &[(String, Vec<String>)],
+    expr: V, theta_names: &[String], eta_names: &[String], n_bsv: usize,
+    nn_specs: &[(String, Vec<String>)],
 ) -> Option<(usize, MuRef)> {
     if let Some((eta_idx, theta_idx, prob_scale)) = detect_logit_pattern(expr) {
         if eta_idx < eta_names.len() && theta_idx < theta_names.len() {
@@ -821,7 +835,7 @@ fn classify_mu_ref<'a, V: RhsView<'a>>(
         }
     }
 
-    let (eta_idx, anchor, log_transformed) = detect_pattern(expr)?;
+    let (eta_idx, anchor, log_transformed) = detect_pattern(expr, n_bsv)?;
     if eta_idx >= eta_names.len() {
         return None;
     }
@@ -2369,7 +2383,7 @@ struct ExprClass {
 
 /// Classify a single expression into an `ExprClass`, or return `None` if no ETA
 /// is present / no pattern recognised (caller handles `Custom` fallback).
-fn classify_expr(expr: &Expression, n_theta: usize) -> Option<ExprClass> {
+fn classify_expr(expr: &Expression, n_theta: usize, n_bsv: usize) -> Option<ExprClass> {
     use crate::types::{EtaParamType, ThetaTransform};
 
     // inv_logit(THETA + ETA) or inv_logit(logit(THETA) + ETA)
@@ -2412,7 +2426,7 @@ fn classify_expr(expr: &Expression, n_theta: usize) -> Option<ExprClass> {
     // TVCL * exp(ETA), exp(log(THETA) + ETA), TVCL + ETA, TYPICAL_PK.CL * exp(ETA).
     // NN-anchored variants are still classified as Lognormal/Additive — the
     // eta's *statistical* shape is the same; only the anchor differs.
-    if let Some((ei, anchor, log_transformed)) = detect_pattern(expr) {
+    if let Some((ei, anchor, log_transformed)) = detect_pattern(expr, n_bsv) {
         let valid = match anchor {
             MuRefAnchor::Theta(ti) => ti < n_theta,
             MuRefAnchor::NnOutput { .. } => true,
@@ -2444,7 +2458,7 @@ fn classify_expr(expr: &Expression, n_theta: usize) -> Option<ExprClass> {
     // detect_pattern already handles the Theta-anchored case, so this
     // only fires when anchors.len() != 1 but the expression is still
     // structurally log-normal.
-    if let Some(ei) = find_exp_eta_in_mul(expr) {
+    if let Some(ei) = find_exp_eta_in_mul(expr, n_bsv) {
         if !has_bare_eta(expr) {
             return Some(ExprClass {
                 eta_idx: ei,
@@ -2787,6 +2801,10 @@ fn classify_indiv_params(
 ) -> (Vec<crate::types::EtaParamInfo>, Vec<crate::types::ThetaTransform>) {
     use crate::types::{EtaParamInfo, ThetaTransform};
 
+    // `eta_names` is the BSV ηs, so its length is `classify_expr`'s `n_bsv`. Here that
+    // bound cannot change the result: the κ class it can let through has
+    // `eta_idx >= eta_names.len()`, which `apply_class` drops, leaving the same entries as
+    // no class (#1721 review r4, row B: `usize::MAX` survives every parser test).
     let n_theta = theta_names.len();
     let mut theta_transform = vec![ThetaTransform::Identity; n_theta];
     let mut eta_infos: Vec<EtaParamInfo> = Vec::new();
@@ -2813,7 +2831,7 @@ fn classify_indiv_params(
                 emit_eta_infos(
                     param_name,
                     &[expr],
-                    classify_expr(expr, n_theta),
+                    classify_expr(expr, n_theta, eta_names.len()),
                     &cx,
                     &mut theta_transform,
                     &mut eta_infos,
@@ -2827,8 +2845,10 @@ fn classify_indiv_params(
                 let candidate_names = collect_assigned_names_in_if(s);
                 for param_name in &candidate_names {
                     if let Some(exprs) = if_branch_exprs(s, param_name) {
-                        let classes: Vec<Option<ExprClass>> =
-                            exprs.iter().map(|e| classify_expr(e, n_theta)).collect();
+                        let classes: Vec<Option<ExprClass>> = exprs
+                            .iter()
+                            .map(|e| classify_expr(e, n_theta, eta_names.len()))
+                            .collect();
                         let unanimous = match classes.split_first() {
                             Some((Some(first), rest)) => rest.iter().all(|c| {
                                 c.as_ref().is_some_and(|c| {
@@ -3362,9 +3382,10 @@ const NON_PARAM_CONSUMER_BLOCKS: &[&str] = &[
     // `[individual_parameters]` statements that use it.
     "derived",
     "output",
-    // The block being classified, and the one desugared into it.
+    // The block being classified, and the ones desugared into it.
     "individual_parameters",
     "covariate_model",
+    "eta_shape",
     // Read θ, η, σ, covariates, states or observations, never a parameter.
     "error_model",
     "diffusion",
@@ -3416,6 +3437,8 @@ const NON_OUTSIDE_READER_BLOCKS: &[&str] = &[
     "parameters",
     "individual_parameters",
     "covariate_model",
+    // `[eta_shape]` likewise: desugared into `[individual_parameters]` (#1716).
+    "eta_shape",
     "covariate_nn",
     // Names θ, ω, σ and κ to put a prior on. The prior is a population term the
     // FOCE family adds to the objective and the covariance step adds to the θ
@@ -3447,17 +3470,23 @@ fn every_block_body(
     unnamed.chain(named)
 }
 
+/// The lines of a block of type `ty` that read the names they mention: all of them, but a
+/// `[mixture]` class-variance line, which names an ETA without reading it. The one filter
+/// behind every scan of what the other blocks read (`identifiers_of_blocks`, the
+/// `[eta_shape]` raw-read refusal).
+fn reading_lines(ty: &str, lines: &[String]) -> Vec<String> {
+    lines
+        .iter()
+        .filter(|l| ty != "mixture" || !is_mixture_class_variance_line(l))
+        .cloned()
+        .collect()
+}
+
 /// Upper-cased identifiers of every block in `kinds`, unnamed and named.
 fn identifiers_of_blocks(extracted: &ExtractedBlocks, kinds: &[&str]) -> HashSet<String> {
     let mut out = HashSet::new();
     for (ty, _, lines) in every_block_body(extracted).filter(|(ty, _, _)| kinds.contains(ty)) {
-        if ty == "mixture" {
-            let reads: Vec<String> =
-                lines.iter().filter(|l| !is_mixture_class_variance_line(l)).cloned().collect();
-            collect_referenced_identifiers(&reads, &mut out);
-        } else {
-            collect_referenced_identifiers(lines, &mut out);
-        }
+        collect_referenced_identifiers(&reading_lines(ty, lines), &mut out);
     }
     out
 }
@@ -4119,6 +4148,10 @@ pub fn parse_full_model_with(
     // line, which re-emits these very blocks — sees a plain classical model. A
     // twin built from un-desugared text would silently carry no covariate effect.
     let covariate_model = apply_covariate_model_block(&mut extracted, bindings)?;
+    // `[eta_shape]` desugaring (#1716), after `[covariate_model]` so the lines it
+    // generated are rewritten too, and before the absorption twin re-emits the
+    // blocks: everything below sees inline `boxcox(ETA, SHAPE)` calls.
+    apply_eta_shape_block(&mut extracted, bindings)?;
     let absorption_ode_equivalent_src: Option<String> =
         absorption_ode_equivalent_source(&extracted);
     // Keep the historical `blocks` binding for unnamed blocks so the rest of
@@ -6037,7 +6070,9 @@ pub fn parse_full_model_with(
                 }
                 _ => None,
             })
-            .filter(|(_, expr)| detect_mixture_pattern(expr, mix.n_classes).is_none())
+            .filter(|(_, expr)| {
+                detect_mixture_pattern(expr, mix.n_classes, model.eta_names.len()).is_none()
+            })
             .map(|(name, _)| name.clone())
             .collect();
         if !unmatched.is_empty() {
@@ -8104,6 +8139,60 @@ fn push_covariate_decl(
     }
     decls.push(CovariateDecl { name: name.to_string(), kind, levels });
     Ok(())
+}
+
+/// Desugar the optional `[eta_shape]` block (#1716) into inline shape calls,
+/// rewriting `[parameters]` and `[individual_parameters]` in place
+/// (`crate::parser::eta_shape::apply_eta_shape`). A no-op when the block is
+/// absent.
+fn apply_eta_shape_block(
+    extracted: &mut ExtractedBlocks, bindings: &ParseBindings,
+) -> Result<(), String> {
+    let Some(block_lines) = extracted.unnamed.remove("eta_shape") else {
+        return Ok(());
+    };
+    // `[parameters]` parsed once more for its η/κ/θ names, as
+    // `apply_covariate_model_block` does and for the same reason.
+    let param_lines =
+        extracted.unnamed.get("parameters").ok_or("Missing [parameters] block")?.clone();
+    let (thetas, _, _, _, _, eta_names, kappa_info, _, _, _, _) =
+        parse_parameters(&param_lines, &bindings.levels)?;
+    let theta_names: Vec<String> = thetas.into_iter().map(|t| t.name).collect();
+    let mut parameters = extracted.unnamed.remove("parameters").unwrap_or_default();
+    let mut individual_parameters = extracted
+        .unnamed
+        .remove("individual_parameters")
+        .ok_or("[eta_shape] needs an [individual_parameters] block to apply to")?;
+    let cx = crate::parser::eta_shape::EtaShapeContext {
+        eta_names: &eta_names,
+        kappa_names: &kappa_info.names_ordered,
+        theta_names: &theta_names,
+    };
+    // The other blocks whose text can carry an η into the objective, unnamed and named
+    // (`[event_model NAME]`, labelled with its name): a shaped ETA read raw there would see
+    // η, not h(η). Sorted, so the block a refusal names does not follow hash order.
+    let mut readers: Vec<(String, &str, Vec<String>)> = every_block_body(extracted)
+        .filter(|(ty, _, _)| OUTSIDE_READER_BLOCKS.contains(ty))
+        .map(|(ty, inst, lines)| {
+            let label = inst.map_or_else(|| ty.to_string(), |i| format!("{ty} {i}"));
+            (label, ty, reading_lines(ty, lines))
+        })
+        .collect();
+    readers.sort();
+    let readers: Vec<crate::parser::eta_shape::Reader<'_>> = readers
+        .iter()
+        .map(|(label, ty, lines)| crate::parser::eta_shape::Reader { label, ty, lines })
+        .collect();
+    let applied = crate::parser::eta_shape::apply_eta_shape(
+        &block_lines,
+        &mut parameters,
+        &mut individual_parameters,
+        &readers,
+        &cx,
+    );
+    extracted.unnamed.insert("parameters".to_string(), parameters);
+    extracted.unnamed.insert("individual_parameters".to_string(), individual_parameters);
+    applied
 }
 
 /// Desugar the optional `[covariate_model]` block (#1111), rewriting
@@ -17146,6 +17235,7 @@ const BLOCK_REGISTRY: &[(&str, BlockForm, Option<&str>)] = &[
     ("derived", BlockForm::Unnamed, None),
     ("diffusion", BlockForm::Unnamed, None),
     ("error_model", BlockForm::Unnamed, None),
+    ("eta_shape", BlockForm::Unnamed, None),
     ("event_model", BlockForm::Either, Some("survival")),
     ("fit_options", BlockForm::Unnamed, None),
     ("individual_parameters", BlockForm::Unnamed, None),
@@ -22169,6 +22259,9 @@ fn split_ipred_node(
                 BinOp::Mul => FOp::Mul,
                 BinOp::Div => FOp::Div,
                 BinOp::Mod => return Err(ipred_unsupported("`%`")),
+                // A random-effect shape transform (#1716) reads an η, which a residual
+                // magnitude may not.
+                BinOp::Shape(..) => return Err(ipred_unsupported("a shape transform")),
             },
         ),
         Expression::Power(b, x) => (vec![b, x], FOp::Pow),
@@ -23198,7 +23291,8 @@ const UNARY_FN_ARM_MISSING: &str =
 /// parser desugars plus the conditions-only `present`.
 fn supported_function_list() -> String {
     format!(
-        "{}, min(a, b), max(a, b), clamp(x, lo, hi), present(x) (conditions only)",
+        "{}, min(a, b), max(a, b), clamp(x, lo, hi), boxcox(eta, lambda), tdist(eta, nu), \
+         johndraper(eta, lambda), present(x) (conditions only)",
         SUPPORTED_UNARY_FNS.join(", ")
     )
 }
@@ -24108,6 +24202,12 @@ pub(crate) enum BinOp {
     Div,
     /// Euclidean remainder — result always non-negative for positive divisor.
     Mod,
+    /// A random-effect shape transform `h(l; r)` — `boxcox(η, λ)`,
+    /// `tdist(η, ν)`, `johndraper(η, λ)` — or, for the symbolic partials only,
+    /// one of its first derivatives (#1716). A binary operator rather than a
+    /// node of its own, so every walker that recurses into a `BinOp`'s operands
+    /// sees the η inside it; the kernel is `crate::parser::eta_shape::shape_g`.
+    Shape(crate::parser::eta_shape::ShapeKind, crate::parser::eta_shape::ShapeOut),
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -25670,6 +25770,11 @@ impl ProfileWalk<'_, '_> {
             }
             Expression::BinOp(_, BinOp::Mod, _) => {
                 fail(ProfileRouteBreak::Construct("a remainder (`mod`)".into()))
+            }
+            // Nonlinear in both arguments: the generic arm below would read
+            // `boxcox(β·WT, 0.5)` as a data-scaled β.
+            Expression::BinOp(_, BinOp::Shape(kind, _), _) => {
+                fail(ProfileRouteBreak::Construct(format!("`{}(...)`", kind.name())))
             }
             Expression::BinOp(l, op, r) => {
                 let (a, b) = (self.affine(l, at, site)?, self.affine(r, at, site)?);
@@ -27532,6 +27637,7 @@ fn eval_expr<E: EvalEnv>(
                         l.rem_euclid(r)
                     }
                 }
+                BinOp::Shape(kind, out) => crate::parser::eta_shape::shape_f64(*kind, *out, l, r),
             }
         }
         Expression::UnaryFn(name, arg) => {
@@ -27730,7 +27836,9 @@ enum Op {
     IsPresent,
     JumpIfFalse(u32), // pops top; jumps to bytecode index if value == 0.0
     Jump(u32),
-    Mod,   // rem_euclid (binary)
+    Mod, // rem_euclid (binary)
+    /// `h(a; b)`, a random-effect shape transform (binary; #1716).
+    Shape(crate::parser::eta_shape::ShapeKind),
     Floor, // unary
     Ceil,  // unary
     Round, // unary
@@ -27803,6 +27911,7 @@ fn ip_op_cost(op: &Op) -> u32 {
         | Op::Cos
         | Op::Pnorm => 20,
         Op::Div | Op::Mod => 4,
+        Op::Shape(_) => 30,
         _ => 1,
     }
 }
@@ -27863,6 +27972,7 @@ fn ip_deps_bytecode(bc: &Bytecode, d: &mut IpStmtDeps) {
             | Op::JumpIfFalse(_)
             | Op::Jump(_)
             | Op::Mod
+            | Op::Shape(_)
             | Op::Floor
             | Op::Ceil
             | Op::Round => {}
@@ -28033,6 +28143,7 @@ fn ip_op_pops(op: &Op) -> Option<usize> {
         | Op::Div
         | Op::Pow
         | Op::Mod
+        | Op::Shape(_)
         | Op::CmpLt
         | Op::CmpLe
         | Op::CmpGt
@@ -28682,6 +28793,7 @@ fn scan_stack_depth(ops: &[Op]) -> (i32, i32) {
             | Op::Mul
             | Op::Div
             | Op::Mod
+            | Op::Shape(_)
             | Op::Pow
             | Op::CmpLt
             | Op::CmpLe
@@ -28805,6 +28917,10 @@ fn compile_expr_into(bc: &mut Bytecode, expr: &Expression) {
                 BinOp::Mul => Op::Mul,
                 BinOp::Div => Op::Div,
                 BinOp::Mod => Op::Mod,
+                BinOp::Shape(kind, crate::parser::eta_shape::ShapeOut::Value) => Op::Shape(*kind),
+                // The partial nodes exist only in the symbolic
+                // `IndivParamPartials`, which nothing compiles (#145).
+                BinOp::Shape(_, out) => unreachable!("compile_bytecode: shape partial {out:?}"),
             });
         }
         Expression::Power(base, exp) => {
@@ -29055,6 +29171,7 @@ fn eval_bytecode_lanes<L: Lane>(
             Op::Div => binary!(|a, b| if b.abs() < 1e-30 { 0.0 } else { a / b }),
             Op::Pow => binary!(|b, e| b.powf(e)),
             Op::Mod => binary!(|a, b| if b.abs() < 1e-30 { 0.0 } else { a.rem_euclid(b) }),
+            Op::Shape(kind) => binary!(|eta, s| crate::parser::eta_shape::shape_g(kind, eta, s)),
             Op::Exp => unary!(|v| v.exp()),
             Op::Ln => unary!(|v| (if v >= 1e-30 { v } else { 1e-30 }).ln()),
             Op::Sqrt => unary!(|v| (if v >= 0.0 { v } else { 0.0 }).sqrt()),
@@ -29343,6 +29460,12 @@ fn eval_bytecode_range_g<T: crate::sens::num::vm::VmNum>(
                 let e = pop!();
                 let b = pop!();
                 push!(b.pow(e));
+            }
+            // The same kernel the `f64` VM runs, over `T`: exact jets (#1716).
+            Op::Shape(kind) => {
+                let s = pop!();
+                let eta = pop!();
+                push!(crate::parser::eta_shape::shape_g(kind, eta, s));
             }
             Op::Mod => {
                 let b = pop!();
@@ -31544,6 +31667,7 @@ fn bytecode_is_dynamic(bc: &Bytecode, dyn_vars: &[bool]) -> bool {
         | Op::JumpIfFalse(_)
         | Op::Jump(_)
         | Op::Mod
+        | Op::Shape(_)
         | Op::Floor
         | Op::Ceil
         | Op::Round => false,
@@ -33048,6 +33172,17 @@ fn differentiate_with_chain(
                     ),
                 }
             }
+            // ∂h(l; r) = ∂h/∂η · l' + ∂h/∂s · r', the partials being the kernel's
+            // own (`ShapeOut::DEta` / `DShape`). A partial node is a first
+            // derivative already, and nothing differentiates twice.
+            BinOp::Shape(kind, crate::parser::eta_shape::ShapeOut::Value) => {
+                use crate::parser::eta_shape::ShapeOut;
+                let part = |out| Expression::BinOp(l.clone(), BinOp::Shape(*kind, out), r.clone());
+                let dl = differentiate_with_chain(l, axis, chain);
+                let dr = differentiate_with_chain(r, axis, chain);
+                add(mul(part(ShapeOut::DEta), dl), mul(part(ShapeOut::DShape), dr))
+            }
+            BinOp::Shape(_, out) => unreachable!("differentiate: second derivative of {out:?}"),
         },
         Expression::UnaryFn(name, arg) => {
             let da = differentiate_with_chain(arg, axis, chain);
@@ -33240,7 +33375,7 @@ fn simplify_expr(expr: &Expression) -> Expression {
                         Expression::BinOp(Box::new(l), *op, Box::new(r))
                     }
                 }
-                BinOp::Mod => Expression::BinOp(Box::new(l), *op, Box::new(r)),
+                BinOp::Mod | BinOp::Shape(..) => Expression::BinOp(Box::new(l), *op, Box::new(r)),
             }
         }
         Expression::UnaryFn(name, arg) => {
@@ -34273,6 +34408,40 @@ fn parse_atom(
                 let func_name = name.to_lowercase();
                 let is_min_max = matches!(func_name.as_str(), "min" | "max");
                 let is_clamp = func_name == "clamp";
+                // A shape transform `boxcox(η, λ)` / `tdist(η, ν)` /
+                // `johndraper(η, λ)` (#1716): exactly two arguments, built as the
+                // `BinOp::Shape` its kernel evaluates.
+                if let Some(kind) = crate::parser::eta_shape::ShapeKind::from_name(&func_name) {
+                    let (arg, p) = parse_add_sub(tokens, pos + 2, ctx)?;
+                    let arity = || {
+                        format!(
+                            "`{func_name}` takes exactly two arguments: `{func_name}(eta, shape)`."
+                        )
+                    };
+                    if tokens.get(p) != Some(&Token::Comma) {
+                        return Err(arity());
+                    }
+                    let (shape, p) = parse_add_sub(tokens, p + 1, ctx)?;
+                    if tokens.get(p) != Some(&Token::RParen) {
+                        return Err(arity());
+                    }
+                    // One shape per random effect. This is also how an ETA that
+                    // `[eta_shape]` shapes *and* the model wraps inline is caught:
+                    // the desugaring nests the two calls.
+                    let mut nested = false;
+                    visit_expr_nodes(&arg, &mut |e| {
+                        nested |= matches!(e, Expression::BinOp(_, BinOp::Shape(..), _));
+                    });
+                    if nested {
+                        return Err(format!(
+                            "`{func_name}(...)` is applied to an expression that is already \
+                             shape-transformed — a random effect takes one shape, written \
+                             either inline or in [eta_shape], not both."
+                        ));
+                    }
+                    let op = BinOp::Shape(kind, crate::parser::eta_shape::ShapeOut::Value);
+                    return Ok((Expression::BinOp(Box::new(arg), op, Box::new(shape)), p + 1));
+                }
                 // Reject an unrecognised name here — *before* any argument is
                 // parsed (#1332). An unrecognised name used to become
                 // `UnaryFn(name, arg)`, which every consumer evaluated as the
@@ -34288,7 +34457,7 @@ fn parse_atom(
                 // sends the reader looking for an arity bug in a function ferx
                 // does not have. `min`/`max`/`clamp` are exempt because they are
                 // desugared below and never reach `UnaryFn`; they keep their own
-                // arity diagnostics.
+                // arity diagnostics. The shape transforms have returned above.
                 if !is_min_max && !is_clamp && !SUPPORTED_UNARY_FNS.contains(&func_name.as_str()) {
                     if func_name == "present" {
                         return Err(format!(

@@ -241,6 +241,11 @@ fn arms_that_miss_at_the_switch_are_not_exempt() {
         "d/dt(a) = -(if (tau > LAGT) tanh(a - 1200.0) else -1.0)\nd/dt(tau) = 1.0",
         // As can `exp`, whose term rounds away against the 1 until `a` passes 1200.
         "d/dt(a) = -(if (tau > LAGT) 1.0 + exp(0.4 * (a - 1200.0)) else 1.0)\nd/dt(tau) = 1.0",
+        // And a shape transform: Box-Cox at λ = 1 is `expm1`, so this term rounds away
+        // against the 1 until `a` is far past the sampled range (#1716).
+        "d/dt(a) = -(if (tau > LAGT) 1.0 + 1e-300 * (1.0 + boxcox(0.4 * (a - 1200.0), 1.0)) \
+         else 1.0)\n\
+         d/dt(tau) = 1.0",
         // A nested conditional can too.
         "d/dt(a) = -KE * (if (tau > LAGT) (if (LAGT > 1e9) 1.0 else 0.0) else 0.0)\n\
          d/dt(tau) = 1.0",

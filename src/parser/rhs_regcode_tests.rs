@@ -853,6 +853,7 @@ fn each_parsable_refusal_names_its_construct_and_statement() {
         ("  d/dt(x1) = sin(x1)", "`sin`", "`d/dt(x1)`"),
         ("  d/dt(x1) = cos(x1)", "`cos`", "`d/dt(x1)`"),
         ("  d/dt(x1) = pnorm(x1)", "`pnorm`", "`d/dt(x1)`"),
+        ("  d/dt(x1) = -boxcox(x1, 0.5)", "`boxcox`", "`d/dt(x1)`"),
         // The site is the assignment, not the derivative that reads it.
         ("  E = tanh(A)\n  d/dt(x1) = -E * x1", "`tanh`", "the assignment to `E`"),
         // A later statement: the first refusal in program order is the one named.

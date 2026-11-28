@@ -656,7 +656,16 @@ fn drop_random_effect(
     // removed.
     let mut skip: Vec<usize> = decl_span.clone().collect();
     skip.extend(stale.iter().copied());
+    // An `[eta_shape]` line shaping it (#1716) is no reader: it goes with the declaration.
+    let shape_lines: Vec<usize> = text
+        .logical_lines("eta_shape")
+        .into_iter()
+        .filter(|(_, code)| code.split('~').next().is_some_and(|l| l.trim() == name))
+        .flat_map(|(span, _)| span)
+        .collect();
+    skip.extend(shape_lines.iter().copied());
     if !text.identifiers_excluding(&skip).contains(&name) {
+        stale.extend(shape_lines);
         if in_block {
             let names = block_names(&kind.block_re().captures(&decl_code).expect("a block")[2]);
             let keep: Vec<usize> = (0..names.len()).filter(|k| names[*k] != name).collect();
@@ -1374,6 +1383,18 @@ pub(crate) fn read_error_spec(text: &ModelText) -> Result<Option<ErrorSpecText>,
 fn seed_inits(text: &mut ModelText, fit: &FitResult) -> Result<(), String> {
     let theta: HashMap<&str, f64> =
         fit.theta_names.iter().map(|s| s.as_str()).zip(fit.theta.iter().copied()).collect();
+    // An auto-declared shape θ (`ETA_CL ~ boxcox()` → `LAMBDA_ETA_CL`, #1716) has no
+    // `theta` line to rewrite: name it on the `[eta_shape]` line and declare it with its
+    // fitted value, so the edited model starts where the fit ended rather than at λ = 0.01.
+    for (span, code) in text.logical_lines("eta_shape") {
+        let init_of = |n: &str| theta.get(n).copied().filter(|v| v.is_finite()).map(num);
+        let Some((line, decl)) = crate::parser::eta_shape::pin_auto_theta(&code, init_of) else {
+            continue;
+        };
+        let stale = text.set_span(&span, &line);
+        text.delete_lines(stale);
+        text.append_to_block("parameters", &decl);
+    }
     let eta_index: HashMap<&str, usize> =
         fit.eta_names.iter().enumerate().map(|(i, n)| (n.as_str(), i)).collect();
     let sigma: HashMap<&str, f64> =

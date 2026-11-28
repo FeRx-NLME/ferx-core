@@ -674,6 +674,7 @@ fn refused_construct(op: Op) -> Option<RhsConstruct> {
         Op::Cos => RhsConstruct::Function("cos"),
         Op::Pnorm => RhsConstruct::Function("pnorm"),
         Op::Mod => RhsConstruct::Function("mod"),
+        Op::Shape(kind) => RhsConstruct::Function(kind.name()),
         Op::PushTheta(_) => RhsConstruct::Read("a θ"),
         Op::PushThetaGather(_) => RhsConstruct::Read("a θ level"),
         Op::PushEta(_) => RhsConstruct::Read("an η"),
@@ -1702,8 +1703,8 @@ impl Builder {
             // reads the RHS is not handed (θ, η, covariates, gathers, network outputs, the
             // mixture class), an out-of-range variable, and the ops whose `f64` meaning the
             // generic primitives do not reproduce bit for bit (`InvLogit`, `Logit`, `Tanh`,
-            // `Softplus`, `Sin`, `Cos`, `Pnorm`, `Mod`). Listed one by one: a new `Op`
-            // must be decided here, not swallowed by a wildcard.
+            // `Softplus`, `Sin`, `Cos`, `Pnorm`, `Mod`, `Shape`). Listed one by one: a new
+            // `Op` must be decided here, not swallowed by a wildcard.
             (
                 Op::PushVar(_)
                 | Op::PushTime
@@ -1721,6 +1722,7 @@ impl Builder {
                 | Op::Cos
                 | Op::Pnorm
                 | Op::Mod
+                | Op::Shape(_)
                 | Op::Jump(_),
                 _,
             ) => return Err(refused_construct(ops[pc]).unwrap_or(SHAPE)),

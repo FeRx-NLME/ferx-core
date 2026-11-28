@@ -22,6 +22,7 @@ Notes for language models and coding agents:
 - [Model file reference](https://ferx-nlme.org/ferx-core/model-file/index.html): the `[section]` blocks of a `.ferx` file
 - [Parameters](https://ferx-nlme.org/ferx-core/model-file/parameters.html): `theta`, `omega`, `block_omega`, `sigma`, bounds and fixing
 - [Individual parameters](https://ferx-nlme.org/ferx-core/model-file/individual-parameters.html): the expression language
+- [Random-effect shapes](https://ferx-nlme.org/ferx-core/model-file/eta-shape.html): `boxcox` / `tdist` / `johndraper` transforms of an ETA and the `[eta_shape]` block
 - [Structural model](https://ferx-nlme.org/ferx-core/model-file/structural-model.html): the analytical PK models
 - [ODE models](https://ferx-nlme.org/ferx-core/model-file/ode-models.html): `[odes]` blocks and solver choice
 - [Error model](https://ferx-nlme.org/ferx-core/model-file/error-model.html): additive, proportional and combined residual error

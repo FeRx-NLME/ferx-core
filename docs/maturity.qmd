@@ -62,6 +62,7 @@ on their reference page:
 | Error model (additive / proportional / combined) | **stable** | [Error Model](model-file/error-model.qmd) |
 | Simulation | **stable** | [Simulation](model-file/simulation.qmd) |
 | Individual parameters DSL | **beta** | [Individual Parameters](model-file/individual-parameters.qmd) |
+| Random-effect shape transforms (`boxcox` / `tdist` / `johndraper`, `[eta_shape]`) | **experimental** | [Random-Effect Shapes](model-file/eta-shape.qmd) |
 | BLOQ / censored observations (M3) | **beta** | [BLOQ](model-file/bloq.qmd) |
 | ODE models (Dormand-Prince RK45) | **beta** | [ODE Models](model-file/ode-models.qmd) |
 | Stiff ODE steppers (`ode_method` = Rosenbrock23 / Rodas4 / Rodas5P) | **beta** | [Stiff systems](model-file/ode-models.qmd#stiff-systems) |

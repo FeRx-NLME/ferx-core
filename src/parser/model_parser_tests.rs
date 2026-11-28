@@ -16821,7 +16821,7 @@ fn dm_reference(e: &Expression, vars: &[Dm], covs: &[f64], time: f64) -> Dm {
                 BinOp::Mul => a * b,
                 BinOp::Div if b.value.abs() < 1e-30 => Dm::constant(0.0),
                 BinOp::Div => a / b,
-                BinOp::Mod => unreachable!("not used by these fixtures"),
+                BinOp::Mod | BinOp::Shape(..) => unreachable!("not used by these fixtures"),
             }
         }
         Expression::UnaryFn(name, arg) if name == "exp" => {
@@ -27950,11 +27950,11 @@ fn the_pattern_three_pair_straddles_the_old_gate() {
         Expression::BinOp(Box::new(Expression::Theta(1)), BinOp::Add, Box::new(Expression::Eta(1)));
     let three = Expression::BinOp(Box::new(two.clone()), BinOp::Add, Box::new(Expression::Eta(2)));
     assert_eq!(
-        classify_expr(&two, 4).map(|c| c.param_type),
+        classify_expr(&two, 4, 4).map(|c| c.param_type),
         Some(Additive),
         "twin 1 must be the old Pattern 3"
     );
-    assert_eq!(classify_expr(&three, 4), None, "twin 2 must miss every pattern");
+    assert_eq!(classify_expr(&three, 4, 4), None, "twin 2 must miss every pattern");
 
     let base = "  CL = TVCL * exp(ETA_CL)\n";
     let m1 = eta_scale_model(&format!("{base}  V = TVV + ETA_V"), "");
@@ -29585,8 +29585,8 @@ fn assert_inliner_matches_eager(
         n += 1;
         changed += usize::from(format!("{raw:?}") != format!("{want:?}"));
         assert_eq!(
-            format!("{:?}", classify_mu_ref(view, tn, en, &[])),
-            format!("{:?}", classify_mu_ref(want, tn, en, &[])),
+            format!("{:?}", classify_mu_ref(view, tn, en, en.len(), &[])),
+            format!("{:?}", classify_mu_ref(want, tn, en, en.len(), &[])),
             "{label}: `{name}` mu-ref"
         );
         // A group's typical value compares by value: the program keeps each
@@ -33511,8 +33511,8 @@ fn profile_accepts_every_affine_route_with_a_data_coefficient() {
     parse_full_model(&f1).unwrap_or_else(|e| panic!("F1: {e}"));
 }
 
-/// Through a function, a power, a remainder or an inline `if`: the construct and
-/// the site are named.
+/// Through a function, a power, a remainder, a shape transform or an inline `if`: the
+/// construct and the site are named.
 #[test]
 fn profile_refuses_a_route_through_a_function_power_or_inline_if() {
     for (indiv, y, construct, at) in [
@@ -33532,6 +33532,14 @@ fn profile_refuses_a_route_through_a_function_power_or_inline_if() {
             "  BASE = TVE0 + ETA_E0 + ETA_EM",
             "BASE + PLACEBO[STUDY] mod 2",
             "a remainder (`mod`)",
+            "in the `y` readout",
+        ),
+        // Nonlinear, but its second argument is data, which the generic binary
+        // arm reads as a data coefficient (#1716).
+        (
+            "  BASE = TVE0 + ETA_E0 + ETA_EM",
+            "BASE + boxcox(PLACEBO[STUDY], 0.5)",
+            "`boxcox(...)`",
             "in the `y` readout",
         ),
         (
@@ -34858,7 +34866,7 @@ fn a_log_normal_pattern_is_resolved_by_use() {
     );
     for e in [&mul, &sum] {
         assert_eq!(
-            classify_expr(e, 4).map(|c| c.param_type),
+            classify_expr(e, 4, 4).map(|c| c.param_type),
             Some(LogNormal),
             "{e:?} must be a log-normal pattern"
         );
@@ -36444,6 +36452,69 @@ fn mstep_optimizer_accepts_newton_and_names_it_in_the_error() {
     assert_eq!(opts.mstep_optimizer, MstepOptimizer::Newton);
     let err = apply_fit_option(&mut opts, "mstep_optimizer", "adam").unwrap_err();
     assert!(err.contains("bobyqa/lbfgs/newton"), "{err}");
+}
+
+// ── #1716: symbolic partials through a shape transform ──────────────────────
+
+/// The symbolic `IndivParamPartials` of a shaped parameter match FD of
+/// `pk_param_fn`, for every θ (the shape θ included) and every η: the
+/// `differentiate_with_chain` arm `∂h = ∂h/∂η·l' + ∂h/∂s·r'`.
+/// Dies under: the `DEta`/`DShape` partial nodes swapped, or either term of the
+/// chain dropped.
+#[test]
+fn indiv_partials_through_shape_transforms_match_fd() {
+    let model_str = "
+[parameters]
+  theta TVCL(7.5)
+  theta TVV(75.0)
+  theta TVKA(1.05)
+  theta LAMBDA(0.4)
+  theta NU(6.0)
+  theta LJD(0.7)
+  omega ETA_CL ~ 0.135
+  omega ETA_V  ~ 0.135
+  omega ETA_KA ~ 0.225
+  sigma EPS ~ 0.245
+
+[individual_parameters]
+  CL = TVCL * exp(boxcox(ETA_CL, LAMBDA))
+  V  = TVV  * exp(tdist(ETA_V, NU))
+  KA = TVKA * exp(johndraper(ETA_KA, LJD))
+
+[structural_model]
+  pk one_cpt_oral(cl=CL, v=V, ka=KA)
+
+[error_model]
+  DV ~ proportional(EPS)
+";
+    let parsed = super::parse_full_model(model_str).unwrap();
+    let m = &parsed.model;
+    let partials = &m.indiv_param_partials;
+    assert_eq!(partials.names, vec!["CL", "V", "KA"]);
+    let theta = &[7.5, 75.0, 1.05, 0.4, 6.0, 0.7];
+    let cov: HashMap<String, f64> = HashMap::new();
+    for eta in [[0.3, -0.25, 0.4], [-0.35, 0.2, -0.15]] {
+        for i in 0..3 {
+            for k in 0..theta.len() {
+                let sym = eval_partial(partials, i, DiffAxis::Theta(k), theta, &eta, &cov);
+                let fd = fd_d_theta(m, i, k, theta, &eta, &cov);
+                assert!(
+                    (sym - fd).abs() < 1e-6 * sym.abs().max(fd.abs()).max(1e-8),
+                    "∂{}/∂θ_{k} at {eta:?}: sym={sym}, fd={fd}",
+                    partials.names[i],
+                );
+            }
+            for k in 0..3 {
+                let sym = eval_partial(partials, i, DiffAxis::Eta(k), theta, &eta, &cov);
+                let fd = fd_d_eta(m, i, k, theta, &eta, &cov);
+                assert!(
+                    (sym - fd).abs() < 1e-6 * sym.abs().max(fd.abs()).max(1e-8),
+                    "∂{}/∂η_{k} at {eta:?}: sym={sym}, fd={fd}",
+                    partials.names[i],
+                );
+            }
+        }
+    }
 }
 
 // ---- residual magnitudes that read the prediction (#3121) ------------------------------

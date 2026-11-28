@@ -283,7 +283,7 @@ const SWITCH_ARM_SHRINK: f64 = 1e-6;
 const SWITCH_ARM_CEILING: f64 = 1e-7;
 
 /// The names an expression reads, or `None` when it holds anything this proof cannot sample:
-/// a nested conditional, or any function but `log` and `sqrt`, since a step, a kink or a term
+/// a nested conditional, or any function but `log` and `sqrt` (a shape transform included), since a step, a kink or a term
 /// like `tanh(y - 1200)` or `exp(y - 1200)`, which rounds away across the sampled range, could
 /// hold its jump outside it; and what has no free value here (θ, η, `MIXNUM`, a network output,
 /// a level block).
@@ -294,7 +294,7 @@ fn sampled_names(e: &Expression, names: &mut BTreeSet<String>) -> Option<()> {
             names.insert(v.clone());
         }
         Expression::Literal(_) | Expression::Time | Expression::Power(..) => {}
-        Expression::BinOp(_, op, _) => ok &= !matches!(op, BinOp::Mod),
+        Expression::BinOp(_, op, _) => ok &= !matches!(op, BinOp::Mod | BinOp::Shape(..)),
         Expression::UnaryFn(f, _) => ok &= matches!(f.as_str(), "log" | "ln" | "sqrt"),
         _ => ok = false,
     });
